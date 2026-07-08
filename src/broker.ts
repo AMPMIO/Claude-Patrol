@@ -12,8 +12,17 @@
  *   bun src/broker.ts
  */
 import { Database } from "bun:sqlite";
+import { statSync } from "node:fs";
 import { getSecret, TOKEN_HEADER } from "../shared/auth.ts";
-import { computeCosts, projectDirName, attributeSeatsToSessions } from "./costs.ts";
+import {
+  priceFor,
+  projectDirName,
+  sessionFiles,
+  parseFileTail,
+  resolveTokenToSession,
+  findSessionIdByHeuristic,
+} from "./costs.ts";
+import { SEAT_TOKEN_RE } from "../shared/types.ts";
 import type {
   RegisterRequest,
   RegisterResponse,
@@ -24,15 +33,26 @@ import type {
   PollMessagesRequest,
   PollMessagesResponse,
   UnregisterRequest,
+  ObserveSessionRequest,
   CostsRequest,
   CostsResponse,
+  CostRow,
   Seat,
 } from "../shared/types.ts";
 
 const PORT = parseInt(process.env.CLAUDE_PATROL_PORT ?? "7900", 10);
 const DB_PATH = process.env.CLAUDE_PATROL_DB ?? `${process.env.HOME}/.claude-patrol.db`;
-const PROJECTS_ROOT = process.env.CLAUDE_PATROL_PROJECTS_ROOT; // undefined -> costs.ts default
+const PROJECTS_ROOT = process.env.CLAUDE_PATROL_PROJECTS_ROOT; // undefined -> default below
+const ROOT = PROJECTS_ROOT ?? `${process.env.HOME}/.claude/projects`;
+// Background cost-index cadence. Low in tests so /costs reflects a just-written
+// fixture within a poll; ~12s in production (mirrors cleanStaleSeats).
+const INDEX_INTERVAL_MS = parseInt(process.env.CLAUDE_PATROL_INDEX_INTERVAL_MS ?? "12000", 10);
+const HOUR_MS = 3_600_000;
 const BROKER_START = new Date().toISOString();
+
+function log(msg: string) {
+  console.error(`[claude-patrol broker] ${msg}`);
+}
 
 // --- Database setup ---
 
@@ -78,6 +98,65 @@ db.run(`
   )
 `);
 
+// --- v0.2 cost attribution: durable seat-run history + a persisted ledger ---
+// seat_runs outlives the live `seats` row (ended_at set on dereg), so a killed
+// seat's spend still attributes; it also carries the token->session binding.
+db.run(`
+  CREATE TABLE IF NOT EXISTS seat_runs (
+    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    seat_id TEXT NOT NULL,
+    session_id TEXT,
+    seat_token TEXT,
+    cwd TEXT NOT NULL,
+    role TEXT,
+    model TEXT,
+    profile TEXT,
+    registered_at TEXT NOT NULL,
+    ended_at TEXT
+  )
+`);
+db.run(`CREATE INDEX IF NOT EXISTS idx_seat_runs_session ON seat_runs(session_id)`);
+db.run(`CREATE INDEX IF NOT EXISTS idx_seat_runs_token ON seat_runs(seat_token)`);
+db.run(`CREATE INDEX IF NOT EXISTS idx_seat_runs_ended ON seat_runs(ended_at)`);
+
+// Per (session, model, hour-bucket) token totals, carrying the attribution
+// session (parent for subagents). /costs reads ONLY this table — no fs walk on
+// the request path. attr_session_id joins to seat_runs.session_id for seat_id.
+db.run(`
+  CREATE TABLE IF NOT EXISTS cost_ledger (
+    session_id TEXT NOT NULL,
+    attr_session_id TEXT NOT NULL,
+    model TEXT NOT NULL,
+    bucket_ts INTEGER NOT NULL,
+    input INTEGER NOT NULL DEFAULT 0,
+    output INTEGER NOT NULL DEFAULT 0,
+    cache_write INTEGER NOT NULL DEFAULT 0,
+    cache_read INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (session_id, model, bucket_ts)
+  )
+`);
+db.run(`CREATE INDEX IF NOT EXISTS idx_ledger_attr ON cost_ledger(attr_session_id)`);
+db.run(`CREATE INDEX IF NOT EXISTS idx_ledger_bucket ON cost_ledger(bucket_ts)`);
+
+// Per-file incremental cursor (bytes_parsed) + resume-rewrite dedupe. session_index
+// persists across broker restarts, so a restart resumes tails instead of re-reading
+// all history.
+db.run(`
+  CREATE TABLE IF NOT EXISTS session_index (
+    file_path TEXT PRIMARY KEY,
+    parent_session_id TEXT,
+    bytes_parsed INTEGER NOT NULL,
+    mtime_ms INTEGER NOT NULL
+  )
+`);
+db.run(`
+  CREATE TABLE IF NOT EXISTS seen_msgs (
+    session_id TEXT NOT NULL,
+    msg_id TEXT NOT NULL,
+    PRIMARY KEY (session_id, msg_id)
+  )
+`);
+
 // Liveness probe: signal 0 doesn't kill, just checks existence. EPERM means the
 // process EXISTS but is owned by another user, so it counts as alive (matches
 // the CLI's pidAlive; moot for same-user seats but correct either way).
@@ -96,6 +175,12 @@ function cleanStaleSeats() {
   for (const seat of seats) {
     if (!pidAlive(seat.pid)) {
       db.run("DELETE FROM seats WHERE id = ?", [seat.id]);
+      // A seat that died without a clean /unregister still gets its run bounded,
+      // so seat_runs.ended_at stays accurate for the /costs overlap join.
+      db.run("UPDATE seat_runs SET ended_at = ? WHERE seat_id = ? AND ended_at IS NULL", [
+        new Date().toISOString(),
+        seat.id,
+      ]);
       db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [seat.id]);
     }
   }
@@ -115,6 +200,25 @@ const insertSeat = db.prepare(`
 const updateLastSeen = db.prepare(`UPDATE seats SET last_seen = ? WHERE id = ?`);
 const updateSummary = db.prepare(`UPDATE seats SET summary = ? WHERE id = ?`);
 const deleteSeat = db.prepare(`DELETE FROM seats WHERE id = ?`);
+const insertSeatRun = db.prepare(`
+  INSERT INTO seat_runs (seat_id, session_id, seat_token, cwd, role, model, profile, registered_at, ended_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+`);
+const endSeatRun = db.prepare(`UPDATE seat_runs SET ended_at = ? WHERE seat_id = ? AND ended_at IS NULL`);
+const upsertLedger = db.prepare(`
+  INSERT INTO cost_ledger (session_id, attr_session_id, model, bucket_ts, input, output, cache_write, cache_read)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  ON CONFLICT(session_id, model, bucket_ts) DO UPDATE SET
+    input = input + excluded.input,
+    output = output + excluded.output,
+    cache_write = cache_write + excluded.cache_write,
+    cache_read = cache_read + excluded.cache_read,
+    attr_session_id = excluded.attr_session_id
+`);
+const seenGet = db.prepare(`SELECT 1 FROM seen_msgs WHERE session_id = ? AND msg_id = ?`);
+const seenIns = db.prepare(`INSERT OR IGNORE INTO seen_msgs (session_id, msg_id) VALUES (?, ?)`);
+const idxGet = db.prepare(`SELECT bytes_parsed, mtime_ms FROM session_index WHERE file_path = ?`);
+const idxSet = db.prepare(`INSERT OR REPLACE INTO session_index (file_path, parent_session_id, bytes_parsed, mtime_ms) VALUES (?, ?, ?, ?)`);
 const selectAllSeats = db.prepare(`SELECT * FROM seats`);
 const selectSeatsByDirectory = db.prepare(`SELECT * FROM seats WHERE cwd = ?`);
 const selectSeatsByGitRoot = db.prepare(`SELECT * FROM seats WHERE git_root = ?`);
@@ -148,7 +252,10 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   // Re-registration for the same PID replaces the prior row (deleted first, so
   // a seat reclaiming its own session_id below never collides with itself).
   const existing = db.query("SELECT id FROM seats WHERE pid = ?").get(body.pid) as { id: string } | null;
-  if (existing) deleteSeat.run(existing.id);
+  if (existing) {
+    endSeatRun.run(now, existing.id); // bound the replaced seat's run so its history stays consistent
+    deleteSeat.run(existing.id);
+  }
 
   // Uniqueness guard: a session_id already held by a LIVE seat must not be
   // claimed twice — two same-cwd seats racing the mtime heuristic would else
@@ -168,6 +275,16 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     body.role ?? null, body.model ?? null, body.profile ?? null, sessionId,
     now, now
   );
+
+  // Durable run row (survives dereg). session_id is the env-override/guarded
+  // fast path; when null the indexer resolves it later via the seat token
+  // (Layer 1) or heuristic (Layer 3). Invalid tokens degrade to null.
+  const seatToken = body.seat_token && SEAT_TOKEN_RE.test(body.seat_token) ? body.seat_token : null;
+  insertSeatRun.run(
+    id, sessionId, seatToken, body.cwd,
+    body.role ?? null, body.model ?? null, body.profile ?? null, now
+  );
+
   return rejected ? { id, session_id_rejected: true } : { id };
 }
 
@@ -220,22 +337,237 @@ function handleUnregister(body: UnregisterRequest): void {
     id = row?.id;
   }
   if (id) {
+    // Bound the run (keep the row + its token->session binding) BEFORE dropping
+    // the live seat, so the mapping survives for /costs history.
+    endSeatRun.run(new Date().toISOString(), id);
     deleteSeat.run(id);
     db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [id]);
   }
 }
 
+// v0.2 Layer 2 (exact; any seat incl. manual): a plugin SessionStart hook posts
+// what CC hands it. Bind the session to the live run whose claude pid matches
+// (seats.pid is now the claude pid — see seat-server), else the newest still-
+// unbound live run in the same cwd. Idempotent: re-binding the same value or a
+// run that already has a session is a no-op. Safe to ship unused (kill criterion
+// in types.ts) — nothing calls it until the hook lands in a later package.
+function handleObserveSession(body: ObserveSessionRequest): { ok: boolean } {
+  if (!body.session_id) return { ok: false };
+  const bind = (runId: number) => db.run("UPDATE seat_runs SET session_id = ? WHERE run_id = ?", [body.session_id, runId]);
+
+  const byPid = db.query(
+    "SELECT sr.run_id FROM seat_runs sr JOIN seats s ON s.id = sr.seat_id WHERE s.pid = ? AND sr.ended_at IS NULL ORDER BY sr.registered_at DESC"
+  ).get(body.claude_pid) as { run_id: number } | null;
+  if (byPid) {
+    bind(byPid.run_id);
+    return { ok: true };
+  }
+  const byCwd = db.query(
+    "SELECT run_id FROM seat_runs WHERE cwd = ? AND session_id IS NULL AND ended_at IS NULL ORDER BY registered_at DESC"
+  ).get(body.cwd) as { run_id: number } | null;
+  if (byCwd) {
+    bind(byCwd.run_id);
+    return { ok: true };
+  }
+  return { ok: false };
+}
+
+// Table reads ONLY — no filesystem walk on the request path (that O(all-history)
+// scan was the flagship-view latency bug). Spend is at most one index tick stale.
+// Window filtering is at hour-bucket granularity (the ledger's resolution): a
+// sub-hour `since`/`until` is floored/rounded to its bucket.
 function handleCosts(body: CostsRequest): CostsResponse {
-  const root = PROJECTS_ROOT ?? `${process.env.HOME}/.claude/projects`;
-  const seats = (selectAllSeats.all() as (Seat & { session_id: string | null })[]).filter((s) => pidAlive(s.pid));
-  // Attribution runs at query time (register-time session_id, if any, is the
-  // fast path inside): the session log reliably exists by now.
-  const seatSessions = attributeSeatsToSessions({
-    seats: seats.map((s) => ({ id: s.id, cwd: s.cwd, session_id: s.session_id, registered_at: s.registered_at })),
-    projectsRoot: root,
-  });
-  const projects = new Set(seats.map((s) => projectDirName(s.cwd)));
-  return computeCosts({ projectsRoot: root, since: body.since ?? BROKER_START, until: body.until, seatSessions, projects });
+  const sinceIso = body.since ?? BROKER_START;
+  const untilIso = body.until ?? null;
+  const sinceMs = Date.parse(sinceIso);
+  const sinceBucket = Number.isNaN(sinceMs) ? 0 : Math.floor(sinceMs / HOUR_MS) * HOUR_MS;
+  const untilMs = untilIso ? Date.parse(untilIso) : null;
+  const untilBucket = untilMs !== null && !Number.isNaN(untilMs) ? Math.floor(untilMs / HOUR_MS) * HOUR_MS : null;
+
+  // attr_session_id -> seat_id from runs overlapping [since, until], INCLUDING
+  // ended runs (killed-seat history still attributes). ISO-8601 UTC strings sort
+  // chronologically, so the overlap compares as plain string bounds. ASC + last
+  // write wins => a restarted session binds to its most recent run.
+  const runs = db.query(
+    `SELECT seat_id, session_id FROM seat_runs
+     WHERE session_id IS NOT NULL AND registered_at <= ? AND (ended_at IS NULL OR ended_at >= ?)
+     ORDER BY registered_at ASC`
+  ).all(untilIso ?? "9999", sinceIso) as { seat_id: string; session_id: string }[];
+  const seatBySession = new Map<string, string>();
+  for (const r of runs) seatBySession.set(r.session_id, r.seat_id);
+
+  const ledger = (
+    untilBucket !== null
+      ? db.query(
+          `SELECT session_id, attr_session_id, model, input, output, cache_write, cache_read
+           FROM cost_ledger WHERE bucket_ts >= ? AND bucket_ts <= ?`
+        ).all(sinceBucket, untilBucket)
+      : db.query(
+          `SELECT session_id, attr_session_id, model, input, output, cache_write, cache_read
+           FROM cost_ledger WHERE bucket_ts >= ?`
+        ).all(sinceBucket)
+  ) as {
+    session_id: string; attr_session_id: string; model: string;
+    input: number; output: number; cache_write: number; cache_read: number;
+  }[];
+
+  // collapse hour buckets into one row per (session, model), keeping the record's
+  // OWN session_id displayed while attributing via attr_session_id.
+  const tally = new Map<string, { session_id: string; attr: string; model: string; input: number; output: number; cache_write: number; cache_read: number }>();
+  for (const r of ledger) {
+    const key = `${r.session_id}\0${r.model}`;
+    let t = tally.get(key);
+    if (!t) {
+      t = { session_id: r.session_id, attr: r.attr_session_id, model: r.model, input: 0, output: 0, cache_write: 0, cache_read: 0 };
+      tally.set(key, t);
+    }
+    t.input += r.input;
+    t.output += r.output;
+    t.cache_write += r.cache_write;
+    t.cache_read += r.cache_read;
+  }
+
+  const rows: CostRow[] = [];
+  let total = 0;
+  for (const t of [...tally.values()].sort((a, b) => a.session_id.localeCompare(b.session_id))) {
+    const [pi, po, pcw, pcr] = priceFor(t.model);
+    const cost = (t.input * pi + t.output * po + t.cache_write * pcw + t.cache_read * pcr) / 1e6;
+    total += cost;
+    rows.push({
+      seat_id: seatBySession.get(t.attr) ?? null,
+      session_id: t.session_id,
+      model: t.model,
+      input: t.input,
+      output: t.output,
+      cache_write: t.cache_write,
+      cache_read: t.cache_read,
+      cost_usd: Math.round(cost * 1e4) / 1e4,
+    });
+  }
+  return { rows, total_usd: Math.round(total * 1e4) / 1e4 };
+}
+
+// --- Background cost indexer (keeps /costs off the fs) ---
+
+function hourBucket(tsMs: number | null): number {
+  if (tsMs === null || Number.isNaN(tsMs)) return 0;
+  return Math.floor(tsMs / HOUR_MS) * HOUR_MS;
+}
+
+// Project dirs worth scanning: live seats' dirs + any dir we've already indexed
+// (persisted across restarts). Non-fleet projects are never read, so the ledger
+// — and /costs — stays scoped to the fleet without a project filter downstream.
+function interestedProjects(): Set<string> {
+  const s = new Set<string>();
+  for (const row of db.query("SELECT DISTINCT cwd FROM seats").all() as { cwd: string }[]) {
+    s.add(projectDirName(row.cwd));
+  }
+  const prefix = ROOT.endsWith("/") ? ROOT : ROOT + "/";
+  for (const row of db.query("SELECT file_path FROM session_index").all() as { file_path: string }[]) {
+    if (row.file_path.startsWith(prefix)) {
+      const seg = row.file_path.slice(prefix.length).split("/")[0];
+      if (seg) s.add(seg);
+    }
+  }
+  return s;
+}
+
+// Index one file: skip if (size,mtime) unchanged; resume from the saved cursor;
+// on truncation/rewrite (size < cursor) wipe this file's sessions and reparse
+// from 0. seen_msgs makes accounting idempotent regardless of the cursor.
+function indexFile(file: string, parentSessionId: string | null) {
+  let st: { size: number; mtimeMs: number };
+  try {
+    st = statSync(file);
+  } catch {
+    return;
+  }
+  const size = st.size;
+  const mtime = Math.floor(st.mtimeMs);
+  const prev = idxGet.get(file) as { bytes_parsed: number; mtime_ms: number } | null;
+  let fromByte = prev?.bytes_parsed ?? 0;
+  let reset = false;
+  if (prev) {
+    if (size === prev.bytes_parsed && mtime === prev.mtime_ms) return; // unchanged
+    if (size < prev.bytes_parsed) {
+      fromByte = 0;
+      reset = true;
+    }
+  }
+  const { records, bytesParsed } = parseFileTail(file, fromByte);
+
+  db.transaction(() => {
+    if (reset) {
+      // The file shrank/was rewritten: drop its prior contribution, then re-add
+      // the full current content below (one file == one session's records).
+      for (const sid of new Set(records.map((r) => r.sessionId))) {
+        db.run("DELETE FROM cost_ledger WHERE session_id = ?", [sid]);
+        db.run("DELETE FROM seen_msgs WHERE session_id = ?", [sid]);
+      }
+    }
+    // aggregate this batch's deltas, deduping resume-rewrites via seen_msgs
+    const agg = new Map<string, { sid: string; attr: string; model: string; bucket: number; i: number; o: number; cw: number; cr: number }>();
+    for (const r of records) {
+      if (r.msgId) {
+        if (seenGet.get(r.sessionId, r.msgId)) continue; // already counted
+        seenIns.run(r.sessionId, r.msgId);
+      }
+      const attr = parentSessionId ?? r.sessionId;
+      const bucket = hourBucket(r.tsMs);
+      const key = `${r.sessionId}\0${r.model}\0${bucket}`;
+      let a = agg.get(key);
+      if (!a) {
+        a = { sid: r.sessionId, attr, model: r.model, bucket, i: 0, o: 0, cw: 0, cr: 0 };
+        agg.set(key, a);
+      }
+      a.i += r.input;
+      a.o += r.output;
+      a.cw += r.cache_write;
+      a.cr += r.cache_read;
+    }
+    for (const a of agg.values()) upsertLedger.run(a.sid, a.attr, a.model, a.bucket, a.i, a.o, a.cw, a.cr);
+    idxSet.run(file, parentSessionId, bytesParsed, mtime);
+  })();
+}
+
+// Resolve runs still missing a session_id. Launcher seats (have a token) bind
+// ONLY via Layer-1 content match — never the heuristic, which can't separate
+// same-cwd seats; manual seats (no token) fall to Layer-3. Cross-run uniqueness:
+// never bind a session another run already owns.
+function resolvePendingRuns() {
+  const pending = db.query(
+    "SELECT run_id, seat_token, cwd, registered_at FROM seat_runs WHERE session_id IS NULL AND ended_at IS NULL"
+  ).all() as { run_id: number; seat_token: string | null; cwd: string; registered_at: string }[];
+  for (const run of pending) {
+    let sid: string | null = null;
+    if (run.seat_token) {
+      sid = resolveTokenToSession({ cwd: run.cwd, projectsRoot: ROOT, token: run.seat_token });
+    } else {
+      sid = findSessionIdByHeuristic({ cwd: run.cwd, projectsRoot: ROOT, nowMs: Date.now() });
+    }
+    if (!sid) continue;
+    const owner = db.query("SELECT run_id FROM seat_runs WHERE session_id = ? AND run_id != ?").get(sid, run.run_id) as { run_id: number } | null;
+    if (owner) {
+      log(`token/heuristic resolved run ${run.run_id} to ${sid} but it is already owned — left unbound`);
+      continue;
+    }
+    db.run("UPDATE seat_runs SET session_id = ? WHERE run_id = ?", [sid, run.run_id]);
+  }
+}
+
+function indexTick() {
+  try {
+    for (const [file, , parent] of sessionFiles(ROOT, interestedProjects())) {
+      try {
+        indexFile(file, parent); // isolate: one unindexable file must not starve the rest
+      } catch (e) {
+        log(`index error on ${file}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+    resolvePendingRuns();
+  } catch (e) {
+    log(`index tick error: ${e instanceof Error ? e.message : String(e)}`);
+  }
 }
 
 // --- HTTP server ---
@@ -278,6 +610,8 @@ Bun.serve({
           return Response.json(handlePollMessages(body as PollMessagesRequest));
         case "/costs":
           return Response.json(handleCosts(body as CostsRequest));
+        case "/observe-session":
+          return Response.json(handleObserveSession(body as ObserveSessionRequest));
         case "/unregister":
           handleUnregister(body as UnregisterRequest);
           return Response.json({ ok: true });
@@ -290,4 +624,9 @@ Bun.serve({
   },
 });
 
-console.error(`[claude-patrol broker] listening on 127.0.0.1:${PORT} (db: ${DB_PATH})`);
+// Warm the ledger from any previously-indexed files (cheap: unchanged tails are
+// skipped by the (size,mtime) guard), then poll for new spend on an interval.
+indexTick();
+setInterval(indexTick, INDEX_INTERVAL_MS);
+
+log(`listening on 127.0.0.1:${PORT} (db: ${DB_PATH})`);
