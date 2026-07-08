@@ -157,6 +157,28 @@ stale recorded pid is actually yours). The broker daemon stays up (it's
 cheap and holds cost history); to stop it too:
 `kill $(lsof -ti :7900)`.
 
+## Telemetry
+
+```bash
+patrol stats                       # window: since broker start
+patrol stats --since 2026-07-08T00:00:00Z --until 2026-07-09T00:00:00Z
+patrol stats --json                # raw StatsResponse, for scripting
+```
+
+`patrol stats` is the evidence layer behind the README's cost claims: a
+per-seat table of live/bound-via (which attribution layer resolved the
+seat — token/observe/heuristic/env), WAKES (paid notification wake-ups) vs
+MSGS (messages delivered inside them), the MSG/WAKE coalescing ratio, and
+CACHE R/W (cache_read/cache_write — the standing-seat reuse number). Totals
+and a "coalescing saved ~N wake-ups" line follow the table. If the broker is
+unreachable or the route errors, it prints to stderr and exits 1 rather than
+showing zeros.
+
+During your test week, run `patrol stats --json > stats-$(date +%F).json`
+daily to accumulate evidence. Keep the files — they're the raw data behind
+any future benchmark writeup, and `--since`/`--until` let you re-slice them
+after the fact instead of re-running against a broker that's moved on.
+
 ## Known limits in this build (v0.2)
 
 - The channel capability is a Claude Code **research preview** — the
