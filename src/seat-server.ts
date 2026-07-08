@@ -18,7 +18,6 @@ import {
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { getSecret, TOKEN_HEADER } from "../shared/auth.ts";
-import { findSessionIdByHeuristic } from "./costs.ts";
 import { SEAT_TOKEN_ENV, SEAT_TOKEN_RE } from "../shared/types.ts";
 import type {
   SeatId,
@@ -60,8 +59,17 @@ async function isBrokerAlive(): Promise<boolean> {
 async function ensureBroker(): Promise<void> {
   if (await isBrokerAlive()) return;
   log("Starting broker daemon...");
-  const proc = Bun.spawn(["bun", BROKER_SCRIPT], { stdio: ["ignore", "ignore", "inherit"] });
-  proc.unref(); // survive this server exiting
+  // Detach fully so the broker outlives THIS seat's teardown. A plain
+  // Bun.spawn child inherits the tmux pane's process group + controlling tty,
+  // so `patrol down` (tmux kill-session) SIGHUPs it and the "persistent" broker
+  // dies with the fleet. nohup (ignore SIGHUP) + background + orphan reparents
+  // it to launchd, escaping the pane's group and tty. macOS ships no `setsid`,
+  // so nohup+&+orphan is the portable detach. The script path goes via $1 so
+  // an install path containing spaces still launches.
+  const proc = Bun.spawn(["sh", "-c", 'nohup bun "$1" >/dev/null 2>&1 &', "sh", BROKER_SCRIPT], {
+    stdio: ["ignore", "ignore", "ignore"],
+  });
+  proc.unref();
   for (let i = 0; i < 30; i++) {
     await new Promise((r) => setTimeout(r, 200));
     if (await isBrokerAlive()) {
@@ -94,21 +102,16 @@ function getTty(): string | null {
   }
 }
 
-// Best-effort CC session-id discovery for exact cost attribution. Claude Code
-// generates the session id internally after launch and does not hand it to
-// spawned MCP servers, so we infer it: the one session log freshly touched in
-// this seat's project dir. Ambiguity (0 or >1 fresh logs) degrades to null and
-// the broker's fallback attribution takes over — never misattribute. An env
-// override wins if CC ever exposes it directly.
-function discoverSessionId(cwd: string): string | null {
-  const override = process.env.CLAUDE_PATROL_SESSION_ID;
-  if (override) return override;
-  const projectsRoot = process.env.CLAUDE_PATROL_PROJECTS_ROOT ?? `${process.env.HOME}/.claude/projects`;
-  try {
-    return findSessionIdByHeuristic({ cwd, projectsRoot, nowMs: Date.now() });
-  } catch {
-    return null;
-  }
+// Session id at REGISTER time comes ONLY from an explicit env override (for if
+// CC ever hands the id to spawned MCP servers directly). We deliberately do NOT
+// run a register-time mtime heuristic: at register a seat's own jsonl is often
+// the only fresh log in its project dir, so the heuristic "succeeds" by luck —
+// and the broker then stamps that binding bound_via="env", conflating a real
+// env override with heuristic luck. Returning null lets the broker's indexTick
+// bind the run honestly: via the seat_token (bound_via="token", Layer 1) or,
+// tokenless, via its own mtime heuristic (bound_via="heuristic", Layer 3).
+function discoverSessionId(): string | null {
+  return process.env.CLAUDE_PATROL_SESSION_ID ?? null;
 }
 
 // --- State ---
@@ -309,7 +312,7 @@ async function main() {
     role: process.env.CLAUDE_PATROL_ROLE ?? null,
     model: process.env.CLAUDE_PATROL_MODEL ?? null,
     profile: process.env.CLAUDE_PATROL_PROFILE ?? null,
-    session_id: discoverSessionId(cwd),
+    session_id: discoverSessionId(),
     seat_token: seatToken,
   });
   myId = reg.id;
