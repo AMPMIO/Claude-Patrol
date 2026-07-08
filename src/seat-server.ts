@@ -18,6 +18,7 @@ import {
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { getSecret, TOKEN_HEADER } from "../shared/auth.ts";
+import { findSessionIdByHeuristic } from "./costs.ts";
 import type {
   SeatId,
   RegisterResponse,
@@ -91,17 +92,21 @@ function getTty(): string | null {
   }
 }
 
-// Best-effort CC session-id discovery. Claude Code does not document a session
-// id passed to spawned MCP servers, so this only succeeds when a launcher
-// exports it (W2 can set CLAUDE_PATROL_SESSION_ID). Null -> the broker falls
-// back to project-dir + time-window cost attribution (acceptable for v0.1).
-function discoverSessionId(): string | null {
-  return (
-    process.env.CLAUDE_PATROL_SESSION_ID ??
-    process.env.CLAUDE_SESSION_ID ??
-    process.env.CLAUDE_CODE_SESSION_ID ??
-    null
-  );
+// Best-effort CC session-id discovery for exact cost attribution. Claude Code
+// generates the session id internally after launch and does not hand it to
+// spawned MCP servers, so we infer it: the one session log freshly touched in
+// this seat's project dir. Ambiguity (0 or >1 fresh logs) degrades to null and
+// the broker's fallback attribution takes over — never misattribute. An env
+// override wins if CC ever exposes it directly.
+function discoverSessionId(cwd: string): string | null {
+  const override = process.env.CLAUDE_PATROL_SESSION_ID;
+  if (override) return override;
+  const projectsRoot = process.env.CLAUDE_PATROL_PROJECTS_ROOT ?? `${process.env.HOME}/.claude/projects`;
+  try {
+    return findSessionIdByHeuristic({ cwd, projectsRoot, nowMs: Date.now() });
+  } catch {
+    return null;
+  }
 }
 
 // --- State ---
@@ -237,7 +242,10 @@ async function main() {
   const gitRoot = await getGitRoot(cwd);
   const tty = getTty();
 
-  const reg = await brokerFetch<RegisterResponse>("/register", {
+  // Local intersection: shared RegisterResponse is frozen as { id }. The broker
+  // additionally returns session_id_rejected when the uniqueness guard fires; we
+  // read it here without touching the frozen contract type.
+  const reg = await brokerFetch<RegisterResponse & { session_id_rejected?: boolean }>("/register", {
     pid: process.pid,
     cwd,
     git_root: gitRoot,
@@ -246,10 +254,13 @@ async function main() {
     role: process.env.CLAUDE_PATROL_ROLE ?? null,
     model: process.env.CLAUDE_PATROL_MODEL ?? null,
     profile: process.env.CLAUDE_PATROL_PROFILE ?? null,
-    session_id: discoverSessionId(),
+    session_id: discoverSessionId(cwd),
   });
   myId = reg.id;
   log(`Registered as seat ${myId} (cwd: ${cwd})`);
+  if (reg.session_id_rejected) {
+    log("session_id claim rejected (another live seat holds it) — this seat's costs will be unattributed");
+  }
 
   await mcp.connect(new StdioServerTransport());
   log("MCP connected");

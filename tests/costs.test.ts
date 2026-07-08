@@ -5,10 +5,10 @@
  * 0.087 to 0.06 — this test fails.
  */
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { computeCosts, priceFor, projectDirName } from "../src/costs.ts";
+import { computeCosts, priceFor, projectDirName, findSessionIdByHeuristic } from "../src/costs.ts";
 import { PRICES, DEFAULT_PRICE } from "../shared/types.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "patrol-costs-"));
@@ -109,4 +109,40 @@ test("priceFor: substring match, else default", () => {
 test("projectDirName matches CC's encoding", () => {
   expect(projectDirName("/Users/me/Fable Hijack")).toBe("-Users-me-Fable-Hijack");
   expect(projectDirName("/tmp/projA")).toBe("-tmp-projA");
+});
+
+// --- session-id register-time heuristic ---
+
+function heurFixture(cwd: string, files: Array<[name: string, ageMs: number]>, now: number): string {
+  const d = mkdtempSync(join(tmpdir(), "patrol-heur-"));
+  const projDir = join(d, projectDirName(cwd));
+  mkdirSync(projDir, { recursive: true });
+  for (const [name, ageMs] of files) {
+    const f = join(projDir, name);
+    writeFileSync(f, "{}");
+    const sec = (now - ageMs) / 1000;
+    utimesSync(f, sec, sec);
+  }
+  return d;
+}
+
+test("session heuristic: exactly one fresh log yields that session id", () => {
+  const now = Date.now();
+  const d = heurFixture("/tmp/heurA", [["sess-1111.jsonl", 5_000]], now);
+  expect(findSessionIdByHeuristic({ cwd: "/tmp/heurA", projectsRoot: d, nowMs: now })).toBe("sess-1111");
+  rmSync(d, { recursive: true, force: true });
+});
+
+test("session heuristic: two fresh logs yield null (ambiguous, never misattribute)", () => {
+  const now = Date.now();
+  const d = heurFixture("/tmp/heurB", [["sess-a.jsonl", 3_000], ["sess-b.jsonl", 4_000]], now);
+  expect(findSessionIdByHeuristic({ cwd: "/tmp/heurB", projectsRoot: d, nowMs: now })).toBeNull();
+  rmSync(d, { recursive: true, force: true });
+});
+
+test("session heuristic: a stale log outside the window yields null", () => {
+  const now = Date.now();
+  const d = heurFixture("/tmp/heurC", [["sess-old.jsonl", 300_000]], now); // 5 min old, window 120s
+  expect(findSessionIdByHeuristic({ cwd: "/tmp/heurC", projectsRoot: d, nowMs: now })).toBeNull();
+  rmSync(d, { recursive: true, force: true });
 });

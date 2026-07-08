@@ -8,7 +8,7 @@
  * below MUST stay. Dedupe on (sessionId, message id) because session resumes
  * rewrite prior assistant lines.
  */
-import { readdirSync, readFileSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { PRICES, DEFAULT_PRICE, type CostRow, type CostsResponse } from "../shared/types.ts";
 
@@ -154,6 +154,38 @@ export function computeCosts(opts: ComputeCostsOptions = {}): CostsResponse {
     });
   }
   return { rows, total_usd: Math.round(total * 1e4) / 1e4 };
+}
+
+// Best-effort seat -> session-id mapping at register time. Looks in the seat's
+// project dir for a session log touched within windowMs. Returns the id ONLY
+// when exactly one candidate is fresh: zero or several must degrade to null,
+// because a WRONG per-seat cost attribution is worse than an absent one (two
+// seats in the same cwd racing is exactly the several-candidates case).
+export function findSessionIdByHeuristic(opts: {
+  cwd: string;
+  projectsRoot: string;
+  nowMs: number;
+  windowMs?: number;
+}): string | null {
+  const window = opts.windowMs ?? 120_000;
+  const dir = join(opts.projectsRoot, projectDirName(opts.cwd));
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return null; // no project dir yet
+  }
+  const fresh: string[] = [];
+  for (const e of entries) {
+    if (!e.endsWith(".jsonl")) continue;
+    try {
+      if (opts.nowMs - statSync(join(dir, e)).mtimeMs <= window) fresh.push(e);
+    } catch {
+      // vanished between readdir and stat — ignore
+    }
+  }
+  if (fresh.length !== 1) return null;
+  return fresh[0]!.slice(0, -".jsonl".length);
 }
 
 // Derive the ~/.claude/projects directory-name encoding for a working dir.

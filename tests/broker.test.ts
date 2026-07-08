@@ -178,3 +178,27 @@ test("unregister by pid deregisters the seat (SessionEnd hook path)", async () =
   // idempotent: a second dereg (or one after stale cleanup) still returns ok
   expect(((await (await post("/unregister", { pid: process.pid })).json()) as { ok: boolean }).ok).toBe(true);
 });
+
+test("session_id uniqueness guard: a duplicate live claim is stored as null", async () => {
+  // Seat A claims dupSess with a definitely-live pid (the broker subprocess).
+  const regA = await post("/register", {
+    pid: broker.pid, cwd: "/tmp/dup", git_root: null, tty: null,
+    summary: "A", role: null, model: null, session_id: "dupSess",
+  });
+  const aResp = (await regA.json()) as { id: string; session_id_rejected?: boolean };
+  expect(aResp.session_id_rejected).toBeUndefined(); // first claim wins
+  const idA = aResp.id;
+
+  // Seat B (different live pid) claims the same session_id -> rejected -> null.
+  const regB = await post("/register", {
+    pid: process.pid, cwd: "/tmp/dup", git_root: null, tty: null,
+    summary: "B", role: null, model: null, session_id: "dupSess",
+  });
+  const bResp = (await regB.json()) as { id: string; session_id_rejected?: boolean };
+  expect(bResp.session_id_rejected).toBe(true);
+  const idB = bResp.id;
+
+  const seats = (await (await post("/list-seats", { scope: "machine", cwd: "/", git_root: null })).json()) as Array<{ id: string; session_id: string | null }>;
+  expect(seats.find((s) => s.id === idA)!.session_id).toBe("dupSess");
+  expect(seats.find((s) => s.id === idB)!.session_id).toBeNull();
+});

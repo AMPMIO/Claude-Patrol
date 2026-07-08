@@ -132,18 +132,41 @@ function generateId(): string {
 
 // --- Handlers ---
 
-function handleRegister(body: RegisterRequest): RegisterResponse {
+function handleRegister(body: RegisterRequest): RegisterResponse & { session_id_rejected?: boolean } {
   const id = generateId();
   const now = new Date().toISOString();
-  // Re-registration for the same PID replaces the prior row.
+  // Re-registration for the same PID replaces the prior row (deleted first, so
+  // a seat reclaiming its own session_id below never collides with itself).
   const existing = db.query("SELECT id FROM seats WHERE pid = ?").get(body.pid) as { id: string } | null;
   if (existing) deleteSeat.run(existing.id);
+
+  // Uniqueness guard: a session_id already held by a LIVE seat must not be
+  // claimed twice — two same-cwd seats racing the mtime heuristic would else
+  // misattribute costs. Ambiguity degrades to null (dark spend beats wrong spend).
+  let sessionId = body.session_id ?? null;
+  let rejected = false;
+  if (sessionId) {
+    const holders = db.query("SELECT pid FROM seats WHERE session_id = ?").all(sessionId) as { pid: number }[];
+    const liveHeld = holders.some((h) => {
+      try {
+        process.kill(h.pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    if (liveHeld) {
+      sessionId = null;
+      rejected = true;
+    }
+  }
+
   insertSeat.run(
     id, body.pid, body.cwd, body.git_root, body.tty, body.summary,
-    body.role ?? null, body.model ?? null, body.profile ?? null, body.session_id ?? null,
+    body.role ?? null, body.model ?? null, body.profile ?? null, sessionId,
     now, now
   );
-  return { id };
+  return rejected ? { id, session_id_rejected: true } : { id };
 }
 
 function handleListSeats(body: ListSeatsRequest): Seat[] {
