@@ -185,6 +185,11 @@ after the fact instead of re-running against a broker that's moved on.
   `--dangerously-load-development-channels` flag is required and the API may
   change between CC releases. If push breaks, seats still receive on the
   `check_messages` tool (ask a seat to call it) — degraded, not dead.
+- **Watch signal for the pid-join assumption:** when you kill a seat, it
+  should vanish from `patrol status` within a second or two (SessionEnd
+  dereg). If a killed seat always lingers ~30s (stale-sweep timing), the
+  hook's `$PPID` isn't the pid the seat registered — report it, because the
+  same join backs exact attribution for manually-opened sessions.
 - `bg` (headless) seats: channel-flag support under `claude --bg` is
   untested — if a bg seat never wakes on send, that's the first suspect;
   report it (tmux seats are the verified path).
