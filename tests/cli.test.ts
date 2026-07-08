@@ -2,6 +2,7 @@ import { test, expect, beforeAll, afterAll } from "bun:test";
 import status from "../src/commands/status.ts";
 import list from "../src/commands/list.ts";
 import send from "../src/commands/send.ts";
+import { bgPidState } from "../src/commands/down.ts";
 import { relTime, truncate, usd, renderTable, secretPermsOk, parseClaudeHelp, pidAlive } from "../src/commands/_client.ts";
 import type { Seat, CostsResponse } from "../shared/types.ts";
 
@@ -9,6 +10,7 @@ const TOKEN = "test-token";
 let server: ReturnType<typeof Bun.serve>;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let lastSend: any = null;
+let costsFail = false; // when true the mock /costs returns 500, to prove status degrades
 
 const NOW = Date.now();
 const SEATS: Seat[] = [
@@ -56,11 +58,16 @@ beforeAll(async () => {
       const url = new URL(req.url);
       if (url.pathname === "/health") return new Response("ok");
       if (req.headers.get("x-patrol-token") !== TOKEN) return new Response("unauthorized", { status: 401 });
-      const body = await req.json().catch(() => ({}));
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const body = (await req.json().catch(() => ({}))) as any;
       if (url.pathname === "/list-seats") return Response.json(SEATS);
-      if (url.pathname === "/costs") return Response.json(COSTS);
+      if (url.pathname === "/costs") {
+        if (costsFail) return new Response("costs scan wedged", { status: 500 });
+        return Response.json(COSTS);
+      }
       if (url.pathname === "/send-message") {
         lastSend = body;
+        if (body.to_id === "ghost") return Response.json({ ok: false, error: 'no live seat "ghost"' });
         return Response.json({ ok: true });
       }
       return new Response("not found", { status: 404 });
@@ -118,6 +125,36 @@ test("send without a message is a usage error (exit 2)", async () => {
   const r = await capture(() => send([]));
   expect(r.code).toBe(2);
   expect(r.err).toContain("usage:");
+});
+
+test("send reports {ok:false} as a failure (exit 1, no false 'sent')", async () => {
+  const r = await capture(() => send(["ghost", "hello"]));
+  expect(r.code).toBe(1);
+  expect(r.err).toContain('no live seat "ghost"');
+  expect(r.out).not.toContain("sent to");
+});
+
+test("status renders the board even when /costs fails", async () => {
+  costsFail = true;
+  try {
+    const r = await capture(() => status([]));
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("executor-1"); // board still rendered
+    expect(r.out).toContain("spend unavailable"); // spend degraded, not hidden
+    expect(r.out).not.toContain("total spend");
+  } finally {
+    costsFail = false;
+  }
+});
+
+test("bgPidState: live non-claude pid is 'other', absent pid is 'gone'", () => {
+  const proc = Bun.spawn(["sleep", "30"]);
+  try {
+    expect(bgPidState(proc.pid)).toBe("other"); // alive, argv has no 'claude'
+    expect(bgPidState(2 ** 30)).toBe("gone"); // no such process
+  } finally {
+    proc.kill();
+  }
 });
 
 // ---- pure helpers ----

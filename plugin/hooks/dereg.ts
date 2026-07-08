@@ -1,9 +1,11 @@
 #!/usr/bin/env bun
 // SessionEnd: deregister this seat from the broker via the frozen /unregister
-// route (UnregisterRequest {id?, pid?}). The hook's parent process ($PPID) IS
-// the registered Claude session pid, so we unregister by pid — no seat-id env
-// needed. Best-effort: the broker's stale-PID sweep is the real guarantee, so
-// any failure here (broker down, timeout) is ignored.
+// route (UnregisterRequest {id?, pid?}). Contract: $PPID here IS the claude
+// process, and the seat-server registers that SAME pid (v0.2 switched seat
+// registration from the server's own pid to the claude pid so this join works),
+// so we unregister by pid — no seat-id env needed. Best-effort: the broker's
+// stale-PID sweep is the real guarantee, so any failure here (broker down,
+// timeout) is ignored.
 // Self-contained on purpose (no cross-dir import) so it survives packaging.
 
 const port = process.env.CLAUDE_PATROL_PORT || "7900";

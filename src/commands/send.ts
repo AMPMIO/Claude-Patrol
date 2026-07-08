@@ -11,7 +11,14 @@ export default async function send(args: string[]): Promise<number> {
   }
   try {
     const body: SendMessageRequest = { from_id: "cli", to_id: to, text };
-    await brokerPost<unknown>("/send-message", body);
+    // The broker replies HTTP 200 with {ok:false, error} for app-level failures
+    // (e.g. no such seat) — brokerPost only throws on transport/HTTP errors, so
+    // a bare await here would report success on a message that was never queued.
+    const res = await brokerPost<{ ok: boolean; error?: string }>("/send-message", body);
+    if (!res.ok) {
+      console.error(res.error ?? `send to ${to} failed`);
+      return 1;
+    }
     console.log(`sent to ${to}`);
     return 0;
   } catch (e) {

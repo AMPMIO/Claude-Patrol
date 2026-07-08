@@ -4,11 +4,18 @@
 // / up.ts. Keeping it pure is what makes tests/launcher.test.ts able to assert
 // exact argv without a real tmux or claude.
 
-import type { PatrolConfig, SeatSpec } from "../../shared/types.ts";
+import { resolve } from "node:path";
+import { seatMarker, SEAT_TOKEN_ENV, type PatrolConfig, type SeatSpec } from "../../shared/types.ts";
 import { resolveProfile, buildSettingsOverlay, PRESET_NAMES, NAMED_PROFILES, type ResolvedProfile } from "../profiles.ts";
 
 export const TMUX_SESSION = "patrol";
 const EMPTY_MCP = '{"mcpServers":{}}';
+
+// A seat name becomes a filesystem path segment (per-seat overlay files) and a
+// tmux `-t patrol:<name>` target, so a name from a possibly-cloned untrusted
+// patrol.yaml is a path-traversal / target-injection vector. shQuote protects
+// the shell LINE but neither the join() nor the tmux target — hence this slug.
+const SEAT_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
 export interface SeatPlan {
   spec: SeatSpec;
@@ -33,6 +40,9 @@ export function validateConfig(config: PatrolConfig): void {
     const name = seat.name;
     if (!name || typeof name !== "string") {
       throw new Error("every seat needs a non-empty `name`");
+    }
+    if (!SEAT_NAME_RE.test(name) || name === "." || name === "..") {
+      throw new Error(`seat "${name}" has an invalid name — must match ${SEAT_NAME_RE} and not be "." or ".." (the name becomes a file path and tmux target)`);
     }
     if (seen.has(name)) {
       throw new Error(`duplicate seat name "${name}" (names must be unique — they become tmux window names)`);
@@ -64,7 +74,10 @@ export function planSeat(seat: SeatSpec, installedPlugins: Record<string, boolea
   return {
     spec: seat,
     role: seat.role ?? seat.name,
-    cwd: seat.cwd ?? configDir,
+    // A relative cwd is resolved against the config file's directory, not the
+    // process cwd — `patrol up ../other/patrol.yaml` must launch seats relative
+    // to that config, not wherever the user happened to run the command.
+    cwd: seat.cwd ? resolve(configDir, seat.cwd) : configDir,
     backend: seat.backend ?? "tmux",
     resolved,
     settingsOverlay,
@@ -83,7 +96,10 @@ export interface Composed {
 
 // Exact `claude` argv + patrol env for one planned seat. Order is fixed so
 // tests can assert it verbatim: model, name, [--bg], mcp flags, settings, prompt.
-export function composeSeat(plan: SeatPlan, paths: ComposePaths): Composed {
+// seatToken is the Layer-1 cost-attribution marker (see below); pass null (or
+// omit) to compose without one. Kept pure — the token is a parameter, never
+// generated here — so tests can assert the exact argv+env.
+export function composeSeat(plan: SeatPlan, paths: ComposePaths, seatToken: string | null = null): Composed {
   const { spec, resolved } = plan;
   const argv = ["claude", "--model", spec.model, "--name", spec.name];
 
@@ -99,7 +115,15 @@ export function composeSeat(plan: SeatPlan, paths: ComposePaths): Composed {
 
   if (paths.settingsFile) argv.push("--settings", paths.settingsFile);
 
-  if (spec.prompt) argv.push(spec.prompt);
+  // Layer-1 attribution: inject the seat token into BOTH the launch prompt (so
+  // it lands in the session jsonl the broker content-matches on) and the env.
+  // `silent` seats opt out of both and stay on Layer-3 heuristic attribution.
+  const marker = seatToken != null && spec.silent !== true ? seatMarker(seatToken) : null;
+  if (spec.prompt) {
+    argv.push(marker ? `${spec.prompt}\n\n${marker}` : spec.prompt);
+  } else if (marker) {
+    argv.push(`${marker} You are seat ${plan.role}. Await instructions.`);
+  }
 
   const env: Record<string, string> = {
     CLAUDE_PATROL_ROLE: plan.role,
@@ -108,6 +132,7 @@ export function composeSeat(plan: SeatPlan, paths: ComposePaths): Composed {
   if (spec.profile !== undefined) {
     env.CLAUDE_PATROL_PROFILE = typeof spec.profile === "string" ? spec.profile : "custom";
   }
+  if (marker) env[SEAT_TOKEN_ENV] = seatToken!;
   return { argv, env };
 }
 
@@ -171,6 +196,7 @@ export interface RecordedBgSeat {
   name: string;
   sessionId: string | null;
   pid: number | null;
+  token?: string | null; // Layer-1 seat token (null for silent seats); for inspection/attribution
 }
 export interface LiveAgent {
   pid: number;
@@ -178,17 +204,31 @@ export interface LiveAgent {
   name: string;
 }
 
-// Pids to kill on `patrol down`: match recorded bg seats against the live
-// `claude agents --json` list by sessionId first, then by name, so a recycled
-// pid is never killed by mistake.
-export function selectBgPidsToKill(recorded: RecordedBgSeat[], live: LiveAgent[]): number[] {
-  const pids: number[] = [];
+// Split of `patrol down` kill candidates. Pids that still match a live `claude
+// agents --json` entry are `verified` and safe to signal. Pids that only survive
+// as a recorded value (their agent is gone from the live list) are `unverified`:
+// the OS may have recycled the pid onto an unrelated process, so the caller must
+// confirm it still looks like our claude before signalling.
+export interface BgKillPlan {
+  verified: number[];
+  unverified: number[];
+}
+
+// Match recorded bg seats against the live `claude agents --json` list by
+// sessionId first, then by name. A live match is verified; a recorded-pid
+// fallback is unverified (recycle risk) so `patrol down` never blindly kills it.
+export function selectBgPidsToKill(recorded: RecordedBgSeat[], live: LiveAgent[]): BgKillPlan {
+  const verified: number[] = [];
+  const unverified: number[] = [];
   for (const rec of recorded) {
     const hit =
       (rec.sessionId && live.find((a) => a.sessionId === rec.sessionId)) ||
       live.find((a) => a.name === rec.name);
-    if (hit) pids.push(hit.pid);
-    else if (rec.pid) pids.push(rec.pid); // fallback: agent already gone from list
+    if (hit) verified.push(hit.pid);
+    else if (rec.pid) unverified.push(rec.pid);
   }
-  return [...new Set(pids)];
+  const uniq = (xs: number[]) => [...new Set(xs)];
+  const v = uniq(verified);
+  const vset = new Set(v);
+  return { verified: v, unverified: uniq(unverified).filter((p) => !vset.has(p)) };
 }
