@@ -113,6 +113,14 @@ export function composeSeat(plan: SeatPlan, paths: ComposePaths, seatToken: stri
     argv.push("--strict-mcp-config", "--mcp-config", paths.mcpConfigFile);
   } // mcp === "full" or no profile -> inherit configured MCP servers, no flags
 
+  // Channel push is a research-preview CC capability: without this flag the
+  // seat's MCP tools still work but inbound messages never wake the session
+  // (delivery silently degrades to the manual check_messages fallback). The
+  // "patrol" entry name matches both patrolMcpConfig and the plugin .mcp.json.
+  if (mcp !== "none") {
+    argv.push("--dangerously-load-development-channels", "server:patrol");
+  }
+
   if (paths.settingsFile) argv.push("--settings", paths.settingsFile);
 
   // Layer-1 attribution: inject the seat token into BOTH the launch prompt (so
