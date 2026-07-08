@@ -6,7 +6,7 @@ per-seat cost tracking, and a profile-aware fleet launcher.
 
 ```
 patrol up          # boot a whole fleet from patrol.yaml — one command
-patrol status      # who's running, what role, what model, WHAT IT COSTS
+patrol status      # who's running, what role, what model, what it costs
 patrol send <id> "review the diff in ~/proj/x"
 patrol down        # tear it all down
 ```
@@ -26,40 +26,39 @@ Both passed the same quality gate; output tokens were near-identical. The
 difference is overhead: every subagent spawn re-buys the standing context as
 cache *writes* (~100–150k tokens on a plugin-heavy config), while a standing
 seat wrote it once and reads it back at 1/12.5 the price. Standing seats
-amortize after roughly **one** task.
+amortize after roughly one task.
 
-Patrol exists to make that topology cheap to run and trivial to operate.
+Patrol exists to make that topology cheap to run and easy to operate.
 
 ## What Patrol does that raw terminals don't
 
 1. **One command, N pre-profiled seats.** `patrol up` reads `patrol.yaml` and
    boots each seat with its own model, role, working dir, backend (tmux
-   window or headless `claude --bg`), and boot profile — including per-seat
-   plugin subsets. No more 10 manual steps per fleet.
+   window or headless `claude --bg`), and boot profile, including per-seat
+   plugin subsets. That replaces about ten manual steps per fleet.
 2. **A hard boot guard.** A seat cannot launch without an explicit model.
    Booting a seat on an expensive default model costs real money before it
    does any work (measured: $3.6–4.9 per accidental boot, three times in one
-   evening). Patrol makes that mistake structurally impossible.
+   evening). Patrol refuses the launch instead.
 3. **Per-seat cost tracking — the feature no peer tool has.** `patrol status`
-   shows live spend per seat, computed from Claude Code's own session logs,
-   *including subagent transcripts rolled up to their parent seat* (omitting
-   those undercounted real runs by 63% before we caught it). v0.2 made
-   attribution exact for the standard case: every launched seat carries a
-   `[patrol-seat: cp-…]` token in its boot prompt, content-matched to its
-   session log — N seats in one repo each get THEIR number, and history
-   survives seat teardown and broker restarts in a durable SQLite ledger.
-   Fleet economics stop being vibes.
+   shows live spend per seat, computed from Claude Code's own session logs.
+   Subagent spend rolls up to the seat that spawned it; leaving subagent
+   transcripts out undercounted real runs by 63% before we caught it. Every
+   launched seat carries a `[patrol-seat: cp-…]` token in its boot prompt,
+   content-matched to its session log, so ten seats working in one repo each
+   get their own number rather than a shared guess. The history lives in a
+   SQLite ledger that survives seat teardown and broker restarts.
 4. **Coalesced wake-ups.** Every push notification wakes the receiving
    session for a full turn at full context price. Patrol delivers each poll
-   batch as ONE notification, however many messages queued — N messages
+   batch as one notification, however many messages queued — N messages
    never cost N turns.
 5. **An authenticated broker with fenced delivery.** Without auth, any local
-   process can POST text into your Claude sessions framed as a teammate — a
-   prompt-injection surface. Patrol gates the broker with a 0600
-   shared-secret file (symlink/uid/perms-checked at every read), validates
-   every request's shape and size, and (v0.2) wraps each delivered message
-   body in a per-notification random fence — a body cannot forge a sibling
-   `[from …]` header or speak with another seat's authority.
+   process can POST text into your Claude sessions framed as a teammate.
+   Patrol gates the broker with a 0600 shared-secret file (symlink, owner,
+   and permission checks on every read) and validates every request's shape
+   and size. Since v0.2, each delivered message body is wrapped in a
+   per-notification random fence, so a body can't forge a `[from …]` header
+   or borrow another seat's authority.
 6. **Seats that describe themselves.** Role/model/profile ride along at
    registration (`CLAUDE_PATROL_*` env, set by the launcher). Orchestrators
    route work by the seat list instead of burning a round-trip asking every
@@ -85,7 +84,7 @@ Patrol is a ground-up rewrite informed by running
 | Boot latency | LLM auto-summary API call (up to 3s, external dep) | opt-in only; seats self-describe |
 | Message table | grows forever | delivered messages purged after 7 days |
 | Packaging | manual clone + .mcp.json | Claude Code plugin (commands, skill, hook, MCP) + CLI/daemon |
-| Tests | none | 60+ across broker, costs, launcher, CLI |
+| Tests | none | 110 across broker, costs, launcher, CLI, integration |
 
 ## Quickstart
 
@@ -142,16 +141,18 @@ plugin subset:
   seat. All POSTs authenticated.
 - **Seat server**: minimal stdio MCP per session — registers, polls, pushes
   coalesced `claude/channel` notifications. Everything else is the CLI.
-- **Costs**: parsed from `~/.claude/projects` session logs; exact attribution
-  via discovered session ids, window-based fallback otherwise.
+- **Costs**: a background indexer parses `~/.claude/projects` session logs
+  into an hour-bucketed SQLite ledger. Attribution tries the launch-token
+  content match first, then the SessionStart hook, then a window heuristic
+  that reports "unattributed" rather than guess wrong.
 
 ## Status / caveats
 
-v0.2 — the differentiator is real now: exact multi-seat-same-repo cost
-attribution (3 layers: launch-token content match → SessionStart hook →
-never-misattribute window heuristic), durable cost history, `/costs` served
-from an incrementally-indexed ledger (no log walk on the status path),
-provenance-fenced message delivery, validated broker input. 110 tests.
+v0.2. Cost attribution now survives the case that broke it in v0.1: several
+seats working in the same repo. It also keeps history across seat teardown
+and broker restarts, serves `/costs` from an incrementally indexed ledger
+instead of walking every log on request, fences delivered messages against
+header forgery, and validates all broker input. 110 tests.
 
 Single-machine by design. The `claude/channel` capability is a
 research-preview Claude Code feature (`--dangerously-load-development-channels`);
