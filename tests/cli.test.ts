@@ -2,15 +2,19 @@ import { test, expect, beforeAll, afterAll } from "bun:test";
 import status from "../src/commands/status.ts";
 import list from "../src/commands/list.ts";
 import send from "../src/commands/send.ts";
+import stats from "../src/commands/stats.ts";
 import { bgPidState } from "../src/commands/down.ts";
 import { relTime, truncate, usd, renderTable, secretPermsOk, parseClaudeHelp, pidAlive } from "../src/commands/_client.ts";
-import type { Seat, CostsResponse } from "../shared/types.ts";
+import type { Seat, CostsResponse, StatsResponse } from "../shared/types.ts";
 
 const TOKEN = "test-token";
 let server: ReturnType<typeof Bun.serve>;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let lastSend: any = null;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let lastStats: any = null;
 let costsFail = false; // when true the mock /costs returns 500, to prove status degrades
+let statsDown = false; // when true the mock /stats returns 404, to prove stats refuses to fabricate
 
 const NOW = Date.now();
 const SEATS: Seat[] = [
@@ -48,6 +52,39 @@ const COSTS: CostsResponse = {
   ],
   total_usd: 2.58,
 };
+const STATS: StatsResponse = {
+  seats: [
+    {
+      seat_id: "aaaa1111bbbb2222",
+      role: "executor-1",
+      model: "opus",
+      live: true,
+      bound_via: "token",
+      notifications: 4,
+      messages: 12,
+      input: 10_000,
+      output: 4_000,
+      cache_write: 100,
+      cache_read: 800,
+      cost_usd: 1.2,
+    },
+    {
+      seat_id: "cccc3333dddd4444",
+      role: "orch",
+      model: "sonnet",
+      live: false,
+      bound_via: null,
+      notifications: 0,
+      messages: 0,
+      input: 0,
+      output: 0,
+      cache_write: 0,
+      cache_read: 0,
+      cost_usd: 0.1,
+    },
+  ],
+  totals: { notifications: 4, messages: 12, cost_usd: 1.3, unattributed_usd: 0.05 },
+};
 
 beforeAll(async () => {
   const secretFile = `${process.env.TMPDIR ?? "/tmp"}/patrol-cli-test-${process.pid}.secret`;
@@ -69,6 +106,11 @@ beforeAll(async () => {
         lastSend = body;
         if (body.to_id === "ghost") return Response.json({ ok: false, error: 'no live seat "ghost"' });
         return Response.json({ ok: true });
+      }
+      if (url.pathname === "/stats") {
+        if (statsDown) return new Response("not found", { status: 404 });
+        lastStats = body;
+        return Response.json(STATS);
       }
       return new Response("not found", { status: 404 });
     },
@@ -145,6 +187,44 @@ test("status renders the board even when /costs fails", async () => {
   } finally {
     costsFail = false;
   }
+});
+
+test("stats renders per-seat table with coalescing ratio, cache ratio, and the saved-wakeups line", async () => {
+  const r = await capture(() => stats([]));
+  expect(r.code).toBe(0);
+  expect(r.out).toContain("executor-1");
+  expect(r.out).toContain("token"); // bound_via
+  expect(r.out).toContain("3.0"); // 12 msgs / 4 wakes
+  expect(r.out).toContain("8.0"); // 800 cache_read / 100 cache_write
+  expect(r.out).toContain("$1.20");
+  expect(r.out).toContain("-"); // dead seat: 0 wakes -> msg/wake "-"
+  expect(r.out).toContain("$1.30"); // totals spend
+  expect(r.out).toContain("$0.05"); // unattributed
+  expect(r.out).toContain("coalescing saved ~8 wake-ups (12 messages arrived in 4 notifications)");
+});
+
+test("stats --json emits parseable JSON deep-equal to the fixture", async () => {
+  const r = await capture(() => stats(["--json"]));
+  expect(r.code).toBe(0);
+  expect(JSON.parse(r.out)).toEqual(STATS);
+});
+
+test("stats: broker route missing -> exit 1, stderr non-empty, no fabricated zeros", async () => {
+  statsDown = true;
+  try {
+    const r = await capture(() => stats([]));
+    expect(r.code).toBe(1);
+    expect(r.err.length).toBeGreaterThan(0);
+    expect(r.out).toBe("");
+  } finally {
+    statsDown = false;
+  }
+});
+
+test("stats --since passes through to the /stats request body", async () => {
+  lastStats = null;
+  await capture(() => stats(["--since", "2026-07-01T00:00:00Z"]));
+  expect(lastStats?.since).toBe("2026-07-01T00:00:00Z");
 });
 
 test("bgPidState: live non-claude pid is 'other', absent pid is 'gone'", () => {
