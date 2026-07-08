@@ -8,7 +8,7 @@
  * below MUST stay. Dedupe on (sessionId, message id) because session resumes
  * rewrite prior assistant lines.
  */
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, statSync, openSync, readSync, closeSync } from "node:fs";
 import { join } from "node:path";
 import { PRICES, DEFAULT_PRICE, type CostRow, type CostsResponse } from "../shared/types.ts";
 
@@ -188,10 +188,88 @@ export function findSessionIdByHeuristic(opts: {
   return fresh[0]!.slice(0, -".jsonl".length);
 }
 
-// Derive the ~/.claude/projects directory-name encoding for a working dir.
-// CC replaces every non-alphanumeric run... actually each non-alnum char with
-// a dash: /Users/me/Fable Hijack -> -Users-me-Fable-Hijack. Used to scope
-// unattributed cost rows to the fleet's project dirs.
+// Read the first record timestamp (ms) from a session log, scanning only a
+// bounded prefix so a large active transcript isn't loaded whole. Null if no
+// timestamped record is found in the prefix.
+function firstTimestampMs(file: string): number | null {
+  let fd: number;
+  try {
+    fd = openSync(file, "r");
+  } catch {
+    return null;
+  }
+  try {
+    const buf = Buffer.alloc(65536);
+    const n = readSync(fd, buf, 0, buf.length, 0);
+    for (const line of buf.toString("utf8", 0, n).split("\n")) {
+      if (!line) continue;
+      try {
+        const d = JSON.parse(line);
+        if (d.timestamp) return Date.parse(d.timestamp);
+      } catch {
+        // truncated tail line of the prefix — stop scanning further
+        break;
+      }
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return null;
+}
+
+// Query-time attribution. The register-time mtime heuristic races log creation:
+// the MCP server registers during session init, but CC writes the session's
+// .jsonl seconds later (around the first message), so a normally-booted seat
+// registers with session_id null. By /costs time the file exists, so we anchor
+// on the log's FIRST record timestamp being within windowMs of the seat's
+// registered_at. Same never-misattribute rules: exactly-one-or-null per seat,
+// and a session claimed by more than one seat is dropped (cross-seat unique).
+export function attributeSeatsToSessions(opts: {
+  seats: Array<{ id: string; cwd: string; session_id: string | null; registered_at: string }>;
+  projectsRoot: string;
+  windowMs?: number;
+}): Map<string, string> {
+  const window = opts.windowMs ?? 120_000;
+  const claims: Array<{ seatId: string; sessionId: string }> = [];
+
+  for (const seat of opts.seats) {
+    if (seat.session_id) {
+      // register-time / env-override fast path (already uniqueness-guarded)
+      claims.push({ seatId: seat.id, sessionId: seat.session_id });
+      continue;
+    }
+    const registeredAt = Date.parse(seat.registered_at);
+    if (Number.isNaN(registeredAt)) continue;
+    const dir = join(opts.projectsRoot, projectDirName(seat.cwd));
+    let entries: string[];
+    try {
+      entries = readdirSync(dir);
+    } catch {
+      continue;
+    }
+    const hits: string[] = [];
+    for (const e of entries) {
+      if (!e.endsWith(".jsonl")) continue;
+      const ts = firstTimestampMs(join(dir, e));
+      if (ts !== null && Math.abs(ts - registeredAt) <= window) hits.push(e);
+    }
+    if (hits.length === 1) claims.push({ seatId: seat.id, sessionId: hits[0]!.slice(0, -".jsonl".length) });
+  }
+
+  // cross-seat uniqueness: a session claimed by >1 seat degrades to unattributed
+  const counts = new Map<string, number>();
+  for (const c of claims) counts.set(c.sessionId, (counts.get(c.sessionId) ?? 0) + 1);
+  const out = new Map<string, string>();
+  for (const c of claims) if (counts.get(c.sessionId) === 1) out.set(c.sessionId, c.seatId);
+  return out;
+}
+
+// Derive the ~/.claude/projects directory-name encoding for a working dir: CC
+// replaces each non-alphanumeric char with a dash, so /Users/me/.claude ->
+// -Users-me--claude (the /. becomes --). Verified against real project dirs on
+// this machine. Used only to scope UNATTRIBUTED cost rows to the fleet's
+// projects — if CC's encoding ever diverges, that scoping silently drops those
+// rows (exact-attributed rows are unaffected).
 export function projectDirName(cwd: string): string {
   return cwd.replace(/[^A-Za-z0-9]/g, "-");
 }

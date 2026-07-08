@@ -8,7 +8,7 @@ import { test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { computeCosts, priceFor, projectDirName, findSessionIdByHeuristic } from "../src/costs.ts";
+import { computeCosts, priceFor, projectDirName, findSessionIdByHeuristic, attributeSeatsToSessions } from "../src/costs.ts";
 import { PRICES, DEFAULT_PRICE } from "../shared/types.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "patrol-costs-"));
@@ -144,5 +144,54 @@ test("session heuristic: a stale log outside the window yields null", () => {
   const now = Date.now();
   const d = heurFixture("/tmp/heurC", [["sess-old.jsonl", 300_000]], now); // 5 min old, window 120s
   expect(findSessionIdByHeuristic({ cwd: "/tmp/heurC", projectsRoot: d, nowMs: now })).toBeNull();
+  rmSync(d, { recursive: true, force: true });
+});
+
+// --- query-time attribution (register-time race fix) ---
+
+function attrLog(d: string, cwd: string, file: string, tsMs: number) {
+  const pd = join(d, projectDirName(cwd));
+  mkdirSync(pd, { recursive: true });
+  writeFileSync(
+    join(pd, file),
+    JSON.stringify({ type: "assistant", sessionId: file.replace(".jsonl", ""), timestamp: new Date(tsMs).toISOString(), message: { id: "x" } })
+  );
+}
+
+test("attributeSeatsToSessions: matches by start-time, honors fast path, skips stale", () => {
+  const now = Date.now();
+  const nowIso = new Date(now).toISOString();
+  const d = mkdtempSync(join(tmpdir(), "patrol-attr-"));
+  attrLog(d, "/tmp/attrA", "sA.jsonl", now); // first ts ~= registered_at -> matches
+  attrLog(d, "/tmp/attrB", "sB.jsonl", now - 10 * 60_000); // 10 min off -> outside window
+
+  const map = attributeSeatsToSessions({
+    projectsRoot: d,
+    seats: [
+      { id: "seatA", cwd: "/tmp/attrA", session_id: null, registered_at: nowIso },
+      { id: "seatB", cwd: "/tmp/attrB", session_id: null, registered_at: nowIso },
+      { id: "seatC", cwd: "/whatever", session_id: "explicit", registered_at: nowIso }, // register-time fast path
+    ],
+  });
+  expect(map.get("sA")).toBe("seatA");
+  expect(map.has("sB")).toBe(false);
+  expect(map.get("explicit")).toBe("seatC");
+  rmSync(d, { recursive: true, force: true });
+});
+
+test("attributeSeatsToSessions: a session two seats both match is dropped (cross-seat unique)", () => {
+  const now = Date.now();
+  const nowIso = new Date(now).toISOString();
+  const d = mkdtempSync(join(tmpdir(), "patrol-attr2-"));
+  attrLog(d, "/tmp/shared", "shared.jsonl", now);
+
+  const map = attributeSeatsToSessions({
+    projectsRoot: d,
+    seats: [
+      { id: "s1", cwd: "/tmp/shared", session_id: null, registered_at: nowIso },
+      { id: "s2", cwd: "/tmp/shared", session_id: null, registered_at: nowIso },
+    ],
+  });
+  expect(map.has("shared")).toBe(false); // claimed by 2 seats -> unattributed, never misattributed
   rmSync(d, { recursive: true, force: true });
 });

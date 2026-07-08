@@ -13,7 +13,7 @@
  */
 import { Database } from "bun:sqlite";
 import { getSecret, TOKEN_HEADER } from "../shared/auth.ts";
-import { computeCosts, projectDirName } from "./costs.ts";
+import { computeCosts, projectDirName, attributeSeatsToSessions } from "./costs.ts";
 import type {
   RegisterRequest,
   RegisterResponse,
@@ -78,13 +78,23 @@ db.run(`
   )
 `);
 
+// Liveness probe: signal 0 doesn't kill, just checks existence. EPERM means the
+// process EXISTS but is owned by another user, so it counts as alive (matches
+// the CLI's pidAlive; moot for same-user seats but correct either way).
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
 // Clean up seats whose PID is gone; cap delivered-message table growth.
 function cleanStaleSeats() {
   const seats = db.query("SELECT id, pid FROM seats").all() as { id: string; pid: number }[];
   for (const seat of seats) {
-    try {
-      process.kill(seat.pid, 0); // signal 0 = liveness probe, doesn't kill
-    } catch {
+    if (!pidAlive(seat.pid)) {
       db.run("DELETE FROM seats WHERE id = ?", [seat.id]);
       db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [seat.id]);
     }
@@ -132,7 +142,7 @@ function generateId(): string {
 
 // --- Handlers ---
 
-function handleRegister(body: RegisterRequest): RegisterResponse & { session_id_rejected?: boolean } {
+function handleRegister(body: RegisterRequest): RegisterResponse {
   const id = generateId();
   const now = new Date().toISOString();
   // Re-registration for the same PID replaces the prior row (deleted first, so
@@ -147,15 +157,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse & { session_id_
   let rejected = false;
   if (sessionId) {
     const holders = db.query("SELECT pid FROM seats WHERE session_id = ?").all(sessionId) as { pid: number }[];
-    const liveHeld = holders.some((h) => {
-      try {
-        process.kill(h.pid, 0);
-        return true;
-      } catch {
-        return false;
-      }
-    });
-    if (liveHeld) {
+    if (holders.some((h) => pidAlive(h.pid))) {
       sessionId = null;
       rejected = true;
     }
@@ -187,13 +189,9 @@ function handleListSeats(body: ListSeatsRequest): Seat[] {
   if (body.exclude_id) seats = seats.filter((s) => s.id !== body.exclude_id);
   // Drop seats whose process has died since last cleanup tick.
   return seats.filter((s) => {
-    try {
-      process.kill(s.pid, 0);
-      return true;
-    } catch {
-      deleteSeat.run(s.id);
-      return false;
-    }
+    if (pidAlive(s.pid)) return true;
+    deleteSeat.run(s.id);
+    return false;
   });
 }
 
@@ -228,20 +226,16 @@ function handleUnregister(body: UnregisterRequest): void {
 }
 
 function handleCosts(body: CostsRequest): CostsResponse {
-  const seats = selectAllSeats.all() as (Seat & { session_id: string | null })[];
-  const seatSessions = new Map<string, string>();
-  const projects = new Set<string>();
-  for (const s of seats) {
-    if (s.session_id) seatSessions.set(s.session_id, s.id);
-    projects.add(projectDirName(s.cwd));
-  }
-  return computeCosts({
-    projectsRoot: PROJECTS_ROOT,
-    since: body.since ?? BROKER_START,
-    until: body.until,
-    seatSessions,
-    projects,
+  const root = PROJECTS_ROOT ?? `${process.env.HOME}/.claude/projects`;
+  const seats = (selectAllSeats.all() as (Seat & { session_id: string | null })[]).filter((s) => pidAlive(s.pid));
+  // Attribution runs at query time (register-time session_id, if any, is the
+  // fast path inside): the session log reliably exists by now.
+  const seatSessions = attributeSeatsToSessions({
+    seats: seats.map((s) => ({ id: s.id, cwd: s.cwd, session_id: s.session_id, registered_at: s.registered_at })),
+    projectsRoot: root,
   });
+  const projects = new Set(seats.map((s) => projectDirName(s.cwd)));
+  return computeCosts({ projectsRoot: root, since: body.since ?? BROKER_START, until: body.until, seatSessions, projects });
 }
 
 // --- HTTP server ---

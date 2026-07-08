@@ -42,6 +42,7 @@ async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
     method: "POST",
     headers: { "Content-Type": "application/json", [TOKEN_HEADER]: getSecret() },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(2500), // a wedged broker must not hang a poll forever
   });
   if (!res.ok) throw new Error(`Broker error (${path}): ${res.status} ${await res.text()}`);
   return res.json() as Promise<T>;
@@ -111,6 +112,7 @@ function discoverSessionId(cwd: string): string | null {
 
 // --- State ---
 let myId: SeatId | null = null;
+let polling = false; // guards against overlapping poll ticks when the broker is slow
 
 // --- MCP server ---
 const mcp = new Server(
@@ -197,7 +199,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 // notification wakes the session for a full turn at full context price, so N
 // messages must not cost N turns. Sender context is joined by the broker.
 async function pollAndPushMessages() {
-  if (!myId) return;
+  // Skip if a prior tick is still in flight — a wedged broker plus a 1s interval
+  // would otherwise pile up unbounded concurrent polls.
+  if (!myId || polling) return;
+  polling = true;
   try {
     const { messages: msgs } = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
     if (msgs.length === 0) return;
@@ -232,6 +237,8 @@ async function pollAndPushMessages() {
     log(`Pushed ${msgs.length} message(s) in one notification`);
   } catch (e) {
     log(`Poll error: ${e instanceof Error ? e.message : String(e)}`);
+  } finally {
+    polling = false;
   }
 }
 
@@ -242,10 +249,7 @@ async function main() {
   const gitRoot = await getGitRoot(cwd);
   const tty = getTty();
 
-  // Local intersection: shared RegisterResponse is frozen as { id }. The broker
-  // additionally returns session_id_rejected when the uniqueness guard fires; we
-  // read it here without touching the frozen contract type.
-  const reg = await brokerFetch<RegisterResponse & { session_id_rejected?: boolean }>("/register", {
+  const reg = await brokerFetch<RegisterResponse>("/register", {
     pid: process.pid,
     cwd,
     git_root: gitRoot,

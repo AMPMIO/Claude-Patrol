@@ -202,3 +202,29 @@ test("session_id uniqueness guard: a duplicate live claim is stored as null", as
   expect(seats.find((s) => s.id === idA)!.session_id).toBe("dupSess");
   expect(seats.find((s) => s.id === idB)!.session_id).toBeNull();
 });
+
+test("query-time attribution: a seat registered before its jsonl exists still attributes", async () => {
+  // normal boot race: seat registers with NO session_id (log not written yet)
+  const reg = await post("/register", {
+    pid: process.pid,
+    cwd: "/tmp/late",
+    git_root: null,
+    tty: null,
+    summary: "late",
+    role: null,
+    model: null,
+  });
+  const id = ((await reg.json()) as { id: string }).id;
+
+  // the session log appears AFTER registration; first record ts within 120s of registered_at
+  const lateDir = join(PROJECTS_ROOT, "-tmp-late");
+  mkdirSync(lateDir, { recursive: true });
+  writeFileSync(
+    join(lateDir, "sessLate.jsonl"),
+    JSON.stringify({ type: "assistant", sessionId: "sessLate", timestamp: new Date().toISOString(), message: { id: "L1", model: "claude-opus-4-8", usage: { input_tokens: 1000, output_tokens: 1000 } } })
+  );
+
+  const res = await post("/costs", { since: "2000-01-01T00:00:00Z" });
+  const { rows } = (await res.json()) as { rows: Array<{ seat_id: string | null; session_id: string }> };
+  expect(rows.find((r) => r.session_id === "sessLate")!.seat_id).toBe(id);
+});
