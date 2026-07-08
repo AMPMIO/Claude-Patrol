@@ -4,14 +4,16 @@
  * including end-to-end cost attribution from a fixture session log.
  */
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { projectDirName } from "../src/costs.ts";
 
 const PORT = 17901;
 const URL_BASE = `http://127.0.0.1:${PORT}`;
-const dir = mkdtempSync(join(tmpdir(), "patrol-int-"));
+// realpath: macOS tmpdir is a /var → /private/var symlink; the seat process
+// reports its cwd as the realpath, and project-dir encoding must match it
+const dir = realpathSync(mkdtempSync(join(tmpdir(), "patrol-int-")));
 const SECRET_FILE = join(dir, "secret");
 const PROJECTS_ROOT = join(dir, "projects");
 const SEAT_CWD = join(dir, "seat-cwd");
