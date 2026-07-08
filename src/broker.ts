@@ -37,6 +37,10 @@ import type {
   CostsRequest,
   CostsResponse,
   CostRow,
+  StatsRequest,
+  StatsResponse,
+  SeatStats,
+  BoundVia,
   Seat,
 } from "../shared/types.ts";
 
@@ -119,6 +123,16 @@ db.run(`CREATE INDEX IF NOT EXISTS idx_seat_runs_session ON seat_runs(session_id
 db.run(`CREATE INDEX IF NOT EXISTS idx_seat_runs_token ON seat_runs(seat_token)`);
 db.run(`CREATE INDEX IF NOT EXISTS idx_seat_runs_ended ON seat_runs(ended_at)`);
 
+// Additive: which attribution layer bound this run's session_id (v0.2 telemetry).
+// Written only when a binding is established; NULL until (and if) that happens.
+for (const col of ["bound_via TEXT"]) {
+  try {
+    db.run(`ALTER TABLE seat_runs ADD COLUMN ${col}`);
+  } catch {
+    // column already exists
+  }
+}
+
 // Per (session, model, hour-bucket) token totals, carrying the attribution
 // session (parent for subagents). /costs reads ONLY this table — no fs walk on
 // the request path. attr_session_id joins to seat_runs.session_id for seat_id.
@@ -156,6 +170,20 @@ db.run(`
     PRIMARY KEY (session_id, msg_id)
   )
 `);
+
+// One row per DELIVERED notification (a non-empty poll batch). batch_size is the
+// coalesced message count in that single wake-up: messages/notifications is the
+// coalescing ratio the README claims. check_messages fallback polls flow through
+// the same handler and are logged too — they are paid context injections.
+db.run(`
+  CREATE TABLE IF NOT EXISTS delivery_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    to_id TEXT NOT NULL,
+    batch_size INTEGER NOT NULL,
+    delivered_at TEXT NOT NULL
+  )
+`);
+db.run(`CREATE INDEX IF NOT EXISTS idx_delivery_log ON delivery_log(to_id, delivered_at)`);
 
 // Liveness probe: signal 0 doesn't kill, just checks existence. EPERM means the
 // process EXISTS but is owned by another user, so it counts as alive (matches
@@ -201,10 +229,11 @@ const updateLastSeen = db.prepare(`UPDATE seats SET last_seen = ? WHERE id = ?`)
 const updateSummary = db.prepare(`UPDATE seats SET summary = ? WHERE id = ?`);
 const deleteSeat = db.prepare(`DELETE FROM seats WHERE id = ?`);
 const insertSeatRun = db.prepare(`
-  INSERT INTO seat_runs (seat_id, session_id, seat_token, cwd, role, model, profile, registered_at, ended_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+  INSERT INTO seat_runs (seat_id, session_id, seat_token, cwd, role, model, profile, registered_at, ended_at, bound_via)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
 `);
 const endSeatRun = db.prepare(`UPDATE seat_runs SET ended_at = ? WHERE seat_id = ? AND ended_at IS NULL`);
+const insertDelivery = db.prepare(`INSERT INTO delivery_log (to_id, batch_size, delivered_at) VALUES (?, ?, ?)`);
 const upsertLedger = db.prepare(`
   INSERT INTO cost_ledger (session_id, attr_session_id, model, bucket_ts, input, output, cache_write, cache_read)
   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -282,7 +311,9 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   const seatToken = body.seat_token && SEAT_TOKEN_RE.test(body.seat_token) ? body.seat_token : null;
   insertSeatRun.run(
     id, sessionId, seatToken, body.cwd,
-    body.role ?? null, body.model ?? null, body.profile ?? null, now
+    body.role ?? null, body.model ?? null, body.profile ?? null, now,
+    // session_id present at register-time == the env/session_id fast path bound it.
+    sessionId ? "env" : null
   );
 
   return rejected ? { id, session_id_rejected: true } : { id };
@@ -331,6 +362,10 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   const rows = selectUndelivered.all(body.id) as PollMessagesResponse["messages"];
   for (const m of rows) markDelivered.run(m.id);
+  // A non-empty batch is exactly one delivered notification == one paid wake-up;
+  // batch_size is the coalesced message count. Empty polls log nothing (no
+  // notification fired). This is the coalescing evidence /stats reports.
+  if (rows.length > 0) insertDelivery.run(body.id, rows.length, new Date().toISOString());
   // These rows were undelivered at SELECT and are delivered by this response;
   // report delivered=true (the DB int is 0 until markDelivered above runs).
   return { messages: rows.map((m) => ({ ...m, delivered: true })) };
@@ -362,7 +397,10 @@ function handleUnregister(body: UnregisterRequest): void {
 // in types.ts) — nothing calls it until the hook lands in a later package.
 function handleObserveSession(body: ObserveSessionRequest): { ok: boolean } {
   if (!body.session_id) return { ok: false };
-  const bind = (runId: number) => db.run("UPDATE seat_runs SET session_id = ? WHERE run_id = ?", [body.session_id, runId]);
+  // COALESCE keeps an already-set bound_via (a prior layer's binding wins the
+  // label); only a run bound HERE for the first time is tagged "observe".
+  const bind = (runId: number) =>
+    db.run("UPDATE seat_runs SET session_id = ?, bound_via = COALESCE(bound_via, 'observe') WHERE run_id = ?", [body.session_id, runId]);
 
   const byPid = db.query(
     "SELECT sr.run_id FROM seat_runs sr JOIN seats s ON s.id = sr.seat_id WHERE s.pid = ? AND sr.ended_at IS NULL ORDER BY sr.registered_at DESC"
@@ -381,11 +419,35 @@ function handleObserveSession(body: ObserveSessionRequest): { ok: boolean } {
   return { ok: false };
 }
 
-// Table reads ONLY — no filesystem walk on the request path (that O(all-history)
-// scan was the flagship-view latency bug). Spend is at most one index tick stale.
-// Window filtering is at hour-bucket granularity (the ledger's resolution): a
-// sub-hour `since`/`until` is floored/rounded to its bucket.
-function handleCosts(body: CostsRequest): CostsResponse {
+function round4(n: number): number {
+  return Math.round(n * 1e4) / 1e4;
+}
+
+// One (session, model) tally of ledger spend, carrying the attribution session
+// that maps it to a seat. Displayed by its OWN session_id; attributed by attr.
+interface LedgerTally {
+  session_id: string;
+  attr_session_id: string;
+  model: string;
+  input: number;
+  output: number;
+  cache_write: number;
+  cache_read: number;
+}
+
+// Shared window read for /costs AND /stats. Table reads ONLY — no filesystem
+// walk on the request path (that O(all-history) scan was the flagship-view
+// latency bug); spend is at most one index tick stale. Window filtering is at
+// hour-bucket granularity (the ledger's resolution): a sub-hour `since`/`until`
+// is floored to its bucket. Both endpoints MUST consume the same tallies + the
+// same attr_session_id -> seat_id map so /stats can never disagree with /costs
+// on a seat's spend (see handleStats).
+function readLedgerWindow(body: { since?: string; until?: string }): {
+  sinceIso: string;
+  untilIso: string | null;
+  tallies: LedgerTally[];
+  seatBySession: Map<string, string>;
+} {
   const sinceIso = body.since ?? BROKER_START;
   const untilIso = body.until ?? null;
   const sinceMs = Date.parse(sinceIso);
@@ -420,14 +482,13 @@ function handleCosts(body: CostsRequest): CostsResponse {
     input: number; output: number; cache_write: number; cache_read: number;
   }[];
 
-  // collapse hour buckets into one row per (session, model), keeping the record's
-  // OWN session_id displayed while attributing via attr_session_id.
-  const tally = new Map<string, { session_id: string; attr: string; model: string; input: number; output: number; cache_write: number; cache_read: number }>();
+  // collapse hour buckets into one tally per (session, model).
+  const tally = new Map<string, LedgerTally>();
   for (const r of ledger) {
     const key = `${r.session_id}\0${r.model}`;
     let t = tally.get(key);
     if (!t) {
-      t = { session_id: r.session_id, attr: r.attr_session_id, model: r.model, input: 0, output: 0, cache_write: 0, cache_read: 0 };
+      t = { session_id: r.session_id, attr_session_id: r.attr_session_id, model: r.model, input: 0, output: 0, cache_write: 0, cache_read: 0 };
       tally.set(key, t);
     }
     t.input += r.input;
@@ -435,25 +496,143 @@ function handleCosts(body: CostsRequest): CostsResponse {
     t.cache_write += r.cache_write;
     t.cache_read += r.cache_read;
   }
+  return { sinceIso, untilIso, tallies: [...tally.values()], seatBySession };
+}
 
+function costOf(t: { model: string; input: number; output: number; cache_write: number; cache_read: number }): number {
+  const [pi, po, pcw, pcr] = priceFor(t.model);
+  return (t.input * pi + t.output * po + t.cache_write * pcw + t.cache_read * pcr) / 1e6;
+}
+
+function handleCosts(body: CostsRequest): CostsResponse {
+  const { tallies, seatBySession } = readLedgerWindow(body);
   const rows: CostRow[] = [];
   let total = 0;
-  for (const t of [...tally.values()].sort((a, b) => a.session_id.localeCompare(b.session_id))) {
-    const [pi, po, pcw, pcr] = priceFor(t.model);
-    const cost = (t.input * pi + t.output * po + t.cache_write * pcw + t.cache_read * pcr) / 1e6;
+  for (const t of tallies.sort((a, b) => a.session_id.localeCompare(b.session_id))) {
+    const cost = costOf(t);
     total += cost;
     rows.push({
-      seat_id: seatBySession.get(t.attr) ?? null,
+      seat_id: seatBySession.get(t.attr_session_id) ?? null,
       session_id: t.session_id,
       model: t.model,
       input: t.input,
       output: t.output,
       cache_write: t.cache_write,
       cache_read: t.cache_read,
-      cost_usd: Math.round(cost * 1e4) / 1e4,
+      cost_usd: round4(cost),
     });
   }
-  return { rows, total_usd: Math.round(total * 1e4) / 1e4 };
+  return { rows, total_usd: round4(total) };
+}
+
+// The v0.2 evidence layer. Same window + same priced tallies as /costs, but
+// aggregated per SEAT (not per session) and joined to delivery_log wake-up
+// counts, seat liveness, and bound_via. Invariant vs /costs: attributed
+// cost_usd + unattributed_usd == /costs total_usd for the same window, because
+// both price the identical tallies from readLedgerWindow and partition them by
+// the identical seatBySession map (attributed = seat_id resolved, unattributed =
+// not). The only gap is 4th-decimal double-rounding (≤ $0.0001), the ledger's
+// noise floor.
+function handleStats(body: StatsRequest): StatsResponse {
+  const { sinceIso, untilIso, tallies, seatBySession } = readLedgerWindow(body);
+
+  // Priced ledger aggregated per resolved seat_id; spend no run claims pools
+  // into unattributed. seat_id resolution is byte-identical to /costs.
+  interface Agg { input: number; output: number; cache_write: number; cache_read: number; cost: number; }
+  const newAgg = (): Agg => ({ input: 0, output: 0, cache_write: 0, cache_read: 0, cost: 0 });
+  const bySeat = new Map<string, Agg>();
+  let unattributedCost = 0;
+  for (const t of tallies) {
+    const cost = costOf(t);
+    const seatId = seatBySession.get(t.attr_session_id) ?? null;
+    if (seatId === null) {
+      unattributedCost += cost;
+      continue;
+    }
+    let a = bySeat.get(seatId);
+    if (!a) { a = newAgg(); bySeat.set(seatId, a); }
+    a.input += t.input;
+    a.output += t.output;
+    a.cache_write += t.cache_write;
+    a.cache_read += t.cache_read;
+    a.cost += cost;
+  }
+
+  // Every seat_run overlapping the window (bound OR not) becomes a row — an
+  // unbound seat surfaces with bound_via null (the contract's "unattributed
+  // seat"). Merge multiple runs of one seat_id: most-recent run wins role/model;
+  // bound_via keeps the latest NON-null layer, so a later unbound re-register
+  // never erases how the seat's spend was actually attributed.
+  const allRuns = db.query(
+    `SELECT seat_id, role, model, bound_via FROM seat_runs
+     WHERE registered_at <= ? AND (ended_at IS NULL OR ended_at >= ?)
+     ORDER BY registered_at ASC`
+  ).all(untilIso ?? "9999", sinceIso) as { seat_id: string; role: string | null; model: string | null; bound_via: string | null }[];
+  interface Meta { role: string | null; model: string | null; bound_via: BoundVia | null; }
+  const metaBySeat = new Map<string, Meta>();
+  for (const r of allRuns) {
+    const prev = metaBySeat.get(r.seat_id);
+    metaBySeat.set(r.seat_id, {
+      role: r.role,
+      model: r.model,
+      bound_via: (r.bound_via as BoundVia | null) ?? prev?.bound_via ?? null,
+    });
+  }
+
+  // Live = a current seats-table row whose pid is alive.
+  const live = new Set<string>();
+  for (const s of db.query("SELECT id, pid FROM seats").all() as { id: string; pid: number }[]) {
+    if (pidAlive(s.pid)) live.add(s.id);
+  }
+
+  // Wake-ups: notifications = delivery_log rows, messages = SUM(batch_size), on
+  // the EXACT delivered_at (no hour bucket — delivery_log has full resolution).
+  const deliv = new Map<string, { notifications: number; messages: number }>();
+  const delivRows = (
+    untilIso !== null
+      ? db.query("SELECT to_id, COUNT(*) AS n, COALESCE(SUM(batch_size), 0) AS m FROM delivery_log WHERE delivered_at >= ? AND delivered_at <= ? GROUP BY to_id").all(sinceIso, untilIso)
+      : db.query("SELECT to_id, COUNT(*) AS n, COALESCE(SUM(batch_size), 0) AS m FROM delivery_log WHERE delivered_at >= ? GROUP BY to_id").all(sinceIso)
+  ) as { to_id: string; n: number; m: number }[];
+  for (const d of delivRows) deliv.set(d.to_id, { notifications: d.n, messages: d.m });
+
+  const seats: SeatStats[] = [];
+  let totNotifications = 0;
+  let totMessages = 0;
+  let attributedCost = 0;
+  for (const [seatId, meta] of metaBySeat) {
+    const a = bySeat.get(seatId);
+    const d = deliv.get(seatId);
+    const notifications = d?.notifications ?? 0;
+    const messages = d?.messages ?? 0;
+    totNotifications += notifications;
+    totMessages += messages;
+    if (a) attributedCost += a.cost;
+    seats.push({
+      seat_id: seatId,
+      role: meta.role,
+      model: meta.model,
+      live: live.has(seatId),
+      bound_via: meta.bound_via,
+      notifications,
+      messages,
+      input: a?.input ?? 0,
+      output: a?.output ?? 0,
+      cache_write: a?.cache_write ?? 0,
+      cache_read: a?.cache_read ?? 0,
+      cost_usd: round4(a?.cost ?? 0),
+    });
+  }
+  seats.sort((x, y) => x.seat_id.localeCompare(y.seat_id));
+
+  return {
+    seats,
+    totals: {
+      notifications: totNotifications,
+      messages: totMessages,
+      cost_usd: round4(attributedCost),
+      unattributed_usd: round4(unattributedCost),
+    },
+  };
 }
 
 // --- Background cost indexer (keeps /costs off the fs) ---
@@ -549,6 +728,9 @@ function resolvePendingRuns() {
   ).all() as { run_id: number; seat_token: string | null; cwd: string; registered_at: string }[];
   for (const run of pending) {
     let sid: string | null = null;
+    // The branch taken IS the attribution layer: token content-match (Layer 1)
+    // vs the mtime heuristic (Layer 3).
+    const via: BoundVia = run.seat_token ? "token" : "heuristic";
     if (run.seat_token) {
       sid = resolveTokenToSession({ cwd: run.cwd, projectsRoot: ROOT, token: run.seat_token });
     } else {
@@ -560,7 +742,7 @@ function resolvePendingRuns() {
       log(`token/heuristic resolved run ${run.run_id} to ${sid} but it is already owned — left unbound`);
       continue;
     }
-    db.run("UPDATE seat_runs SET session_id = ? WHERE run_id = ?", [sid, run.run_id]);
+    db.run("UPDATE seat_runs SET session_id = ?, bound_via = ? WHERE run_id = ?", [sid, via, run.run_id]);
   }
 }
 
@@ -646,6 +828,7 @@ export function validate(path: string, body: unknown): string | null {
       return null;
     }
     case "/costs":
+    case "/stats":
       if (!isOptIso(b.since)) return "since must be an ISO timestamp";
       if (!isOptIso(b.until)) return "until must be an ISO timestamp";
       return null;
@@ -718,6 +901,8 @@ Bun.serve({
           return Response.json(handlePollMessages(body as PollMessagesRequest));
         case "/costs":
           return Response.json(handleCosts(body as CostsRequest));
+        case "/stats":
+          return Response.json(handleStats(body as StatsRequest));
         case "/observe-session":
           return Response.json(handleObserveSession(body as ObserveSessionRequest));
         case "/unregister":

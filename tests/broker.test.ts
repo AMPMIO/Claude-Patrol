@@ -30,6 +30,25 @@ async function post(path: string, body: unknown, token = TOKEN) {
 
 type CostsBody = { rows: Array<{ seat_id: string | null; session_id: string; input: number; output: number; cost_usd: number }>; total_usd: number };
 
+type StatsSeat = {
+  seat_id: string;
+  role: string | null;
+  model: string | null;
+  live: boolean;
+  bound_via: string | null;
+  notifications: number;
+  messages: number;
+  input: number;
+  output: number;
+  cache_write: number;
+  cache_read: number;
+  cost_usd: number;
+};
+type StatsBody = {
+  seats: StatsSeat[];
+  totals: { notifications: number; messages: number; cost_usd: number; unattributed_usd: number };
+};
+
 // /costs is served from a ledger the broker fills on a background tick, so a
 // just-written fixture appears within a tick or two — poll instead of racing it.
 async function pollCosts(reqBody: unknown, until: (c: CostsBody) => boolean, tries = 60): Promise<CostsBody> {
@@ -409,4 +428,107 @@ test("queue-depth cap: /send-message returns 429 once the target backlog hits th
   await post("/poll-messages", { id });
   const after = await post("/send-message", { from_id: "cli", to_id: id, text: "ok again" });
   expect(after.status).toBe(200);
+});
+
+// --- v0.2 telemetry: /stats + delivery_log coalescing evidence ---
+
+const SINCE_ALL = "2000-01-01T00:00:00Z";
+
+test("delivery_log: one row per non-empty poll batch, batch_size = coalesced count (the coalescing evidence)", async () => {
+  // An UNBOUND seat (no session_id) still surfaces in /stats via its run, with
+  // bound_via null — the wake-up ledger doesn't need attribution.
+  const reg = await post("/register", { pid: process.pid, cwd: "/tmp/deliv", git_root: null, tty: null, summary: "D", role: "recv", model: "sonnet" });
+  const id = ((await reg.json()) as { id: string }).id;
+
+  const meNow = async (): Promise<StatsSeat> => {
+    const s = (await (await post("/stats", { since: SINCE_ALL })).json()) as StatsBody;
+    return s.seats.find((x) => x.seat_id === id)!;
+  };
+
+  // 3 queued messages, ONE poll -> exactly one notification carrying all 3.
+  for (const t of ["a", "b", "c"]) await post("/send-message", { from_id: "cli", to_id: id, text: t });
+  await post("/poll-messages", { id });
+  let me = await meNow();
+  expect(me.notifications).toBe(1);
+  expect(me.messages).toBe(3);
+  expect(me.bound_via).toBeNull(); // unbound seat, still counted
+  expect(me.live).toBe(true);
+
+  // 2 more, a SECOND poll -> a second row (two distinct wake-ups).
+  for (const t of ["d", "e"]) await post("/send-message", { from_id: "cli", to_id: id, text: t });
+  await post("/poll-messages", { id });
+  me = await meNow();
+  expect(me.notifications).toBe(2);
+  expect(me.messages).toBe(5);
+
+  // Empty poll -> no notification fired -> no new row.
+  await post("/poll-messages", { id });
+  me = await meNow();
+  expect(me.notifications).toBe(2);
+  expect(me.messages).toBe(5);
+});
+
+test("/stats: token-bound seat reports bound_via=token and cost equal to /costs for the same window", async () => {
+  const CWD = "/tmp/stats-token";
+  const TOK = "cp-44440000";
+  // opus 3000 in + 1000 out = (3000*5 + 1000*25)/1e6 = $0.04
+  seatLog(CWD, "stats-sess-1", TOK, { i: 3000, o: 1000 });
+
+  const reg = await post("/register", { pid: process.pid, cwd: CWD, git_root: null, tty: null, summary: "S", role: "worker", model: "opus", seat_token: TOK });
+  const seatId = ((await reg.json()) as { id: string }).id;
+
+  // wait for the Layer-1 token binding to land
+  await pollCosts({ since: SINCE_ALL }, (c) => c.rows.some((r) => r.session_id === "stats-sess-1" && r.seat_id === seatId));
+
+  const costs = (await (await post("/costs", { since: SINCE_ALL })).json()) as CostsBody;
+  const stats = (await (await post("/stats", { since: SINCE_ALL })).json()) as StatsBody;
+
+  const me = stats.seats.find((s) => s.seat_id === seatId)!;
+  expect(me.bound_via).toBe("token"); // the attribution differentiator actually fired
+  expect(me.model).toBe("opus");
+  expect(me.cost_usd).toBeCloseTo(0.04, 4);
+
+  // /stats and /costs cannot disagree: the seat's stats cost == the sum of its
+  // /costs rows (same priced tallies, same seat resolution).
+  const seatCostFromCosts = costs.rows.filter((r) => r.seat_id === seatId).reduce((a, r) => a + r.cost_usd, 0);
+  expect(me.cost_usd).toBeCloseTo(seatCostFromCosts, 4);
+});
+
+test("/stats: unattributed_usd captures orphan spend; totals reconcile with /costs", async () => {
+  const CWD = "/tmp/stats-orphan";
+  const projDir = join(PROJECTS_ROOT, projectDirName(CWD));
+  mkdirSync(projDir, { recursive: true });
+
+  // A live seat in this dir bound (env) to a DIFFERENT session, so the dir is
+  // indexed but the seat can't claim the orphan below.
+  const holderReg = await post("/register", { pid: broker.pid, cwd: CWD, git_root: null, tty: null, summary: "holder", role: null, model: null, session_id: "orphan-holder" });
+  const holderId = ((await holderReg.json()) as { id: string }).id;
+
+  // Orphan spend: a session in the (now scanned) dir that no run owns.
+  // opus 2000 in = 2000*5/1e6 = $0.01
+  writeFileSync(
+    join(projDir, "orphanS.jsonl"),
+    JSON.stringify({ type: "assistant", sessionId: "orphanS", timestamp: new Date().toISOString(), message: { id: "o1", model: "claude-opus-4-8", usage: { input_tokens: 2000, output_tokens: 0 } } }) + "\n"
+  );
+
+  // wait until the orphan is visible in /costs as unattributed (seat_id null)
+  const costs = await pollCosts({ since: SINCE_ALL }, (c) => c.rows.some((r) => r.session_id === "orphanS" && r.seat_id === null));
+  const stats = (await (await post("/stats", { since: SINCE_ALL })).json()) as StatsBody;
+
+  const attrFromCosts = costs.rows.filter((r) => r.seat_id !== null).reduce((a, r) => a + r.cost_usd, 0);
+  const unattrFromCosts = costs.rows.filter((r) => r.seat_id === null).reduce((a, r) => a + r.cost_usd, 0);
+
+  // register-time session_id fast path is labelled bound_via=env
+  expect(stats.seats.find((s) => s.seat_id === holderId)!.bound_via).toBe("env");
+
+  expect(stats.totals.unattributed_usd).toBeGreaterThan(0);
+  expect(stats.totals.unattributed_usd).toBeCloseTo(unattrFromCosts, 3);
+  expect(stats.totals.cost_usd).toBeCloseTo(attrFromCosts, 3);
+  // The load-bearing invariant: /costs total == /stats attributed + unattributed.
+  expect(stats.totals.cost_usd + stats.totals.unattributed_usd).toBeCloseTo(costs.total_usd, 3);
+});
+
+test("/stats is auth-gated and validates since", async () => {
+  expect((await post("/stats", {}, "wrong")).status).toBe(401);
+  expect((await post("/stats", { since: "not-a-date" })).status).toBe(400);
 });
