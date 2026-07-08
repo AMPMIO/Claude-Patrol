@@ -54,6 +54,17 @@ export interface CostRow {
 // Port: CLAUDE_PATROL_PORT, default 7900 (coexists with legacy claude-peers on 7899)
 // DB: CLAUDE_PATROL_DB, default ~/.claude-patrol.db
 // Secret: CLAUDE_PATROL_SECRET_FILE, default ~/.claude-patrol.secret (0600, auto-created)
+//
+// FROZEN ROUTE MAP (request → response, all POST unless noted):
+//   /register       RegisterRequest      → RegisterResponse
+//   /heartbeat      HeartbeatRequest     → { ok: true }
+//   /set-summary    SetSummaryRequest    → { ok: true }
+//   /list-seats     ListSeatsRequest     → Seat[]            (raw array, no wrapper)
+//   /send-message   SendMessageRequest   → { ok: boolean; error?: string }
+//   /poll-messages  PollMessagesRequest  → PollMessagesResponse
+//   /unregister     UnregisterRequest    → { ok: true }
+//   /costs          CostsRequest         → CostsResponse
+//   GET /health     (no auth)            → { status: "ok"; seats: number }
 
 export interface RegisterRequest {
   pid: number;
@@ -90,6 +101,12 @@ export interface SendMessageRequest {
 }
 export interface PollMessagesRequest {
   id: SeatId;
+}
+// Dereg by id (seat-server shutdown) or by pid (SessionEnd hook: the hook's
+// $PPID is the registered Claude process pid). Exactly one required.
+export interface UnregisterRequest {
+  id?: SeatId;
+  pid?: number;
 }
 export interface PollMessagesResponse {
   messages: DeliveredMessage[];
