@@ -5,6 +5,7 @@
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { existsSync } from "node:fs";
+export { secretPermsOk } from "../../shared/auth.ts";
 
 export function brokerBase(): string {
   const port = process.env.CLAUDE_PATROL_PORT || "7900";
@@ -99,11 +100,6 @@ export function renderTable(headers: string[], rows: string[][], rightAlign: Set
   };
   const fmt = (cells: string[]) => cells.map(pad).join("  ").trimEnd();
   return [fmt(headers), ...rows.map(fmt)].join("\n");
-}
-
-// 0600 exactly: owner rw, no group/other bits (file-type bits in mode ignored)
-export function secretPermsOk(mode: number): boolean {
-  return (mode & 0o077) === 0 && (mode & 0o600) === 0o600;
 }
 
 export function parseClaudeHelp(help: string): { bg: boolean; tmux: boolean } {
