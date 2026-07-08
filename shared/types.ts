@@ -79,6 +79,9 @@ export interface RegisterRequest {
 }
 export interface RegisterResponse {
   id: SeatId;
+  // set when the broker's uniqueness guard nulled a session_id claim already
+  // held by a live seat (the claimant's costs stay unattributed)
+  session_id_rejected?: boolean;
 }
 
 export interface HeartbeatRequest {
