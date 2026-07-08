@@ -313,6 +313,15 @@ function handleListSeats(body: ListSeatsRequest): Seat[] {
 }
 
 function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
+  // Identity partial (security Fix 5-lite): a from_id that isn't a LIVE seat or
+  // the literal "cli" is forged provenance — reject explicitly instead of
+  // delivering with silently blank sender metadata (the LEFT JOIN case).
+  if (body.from_id !== "cli") {
+    const sender = db.query("SELECT pid FROM seats WHERE id = ?").get(body.from_id) as { pid: number } | null;
+    if (!sender || !pidAlive(sender.pid)) {
+      return { ok: false, error: `from_id ${body.from_id} is not a live seat (or "cli")` };
+    }
+  }
   const target = db.query("SELECT id FROM seats WHERE id = ?").get(body.to_id) as { id: string } | null;
   if (!target) return { ok: false, error: `Seat ${body.to_id} not found` };
   insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
@@ -570,6 +579,87 @@ function indexTick() {
   }
 }
 
+// --- Runtime request validation (security Fix 2) ---
+// `body as X` casts are compile-time fiction at a trust boundary: any local
+// process with the secret can POST arbitrary JSON. Shape/size checks protect
+// the DB and the cost metric (one oversized body wakes a seat at full-context
+// price and bloats SQLite). Returns a terse error string, or null when valid.
+
+const SLUG_RE = /^[a-z0-9]{8}$/;
+const MAX_TEXT_BYTES = 8 * 1024;
+const MAX_SUMMARY = 500;
+const MAX_PATH = 1024;
+const MAX_LABEL = 128;
+const QUEUE_DEPTH_CAP = 100;
+
+function isStr(v: unknown, max: number, min = 0): v is string {
+  return typeof v === "string" && v.length >= min && v.length <= max;
+}
+function isOptStr(v: unknown, max: number): boolean {
+  return v == null || isStr(v, max);
+}
+function isPosInt(v: unknown): v is number {
+  return typeof v === "number" && Number.isInteger(v) && v > 0 && v <= 2 ** 31;
+}
+function isSlug(v: unknown): v is string {
+  return typeof v === "string" && SLUG_RE.test(v);
+}
+function isOptIso(v: unknown): boolean {
+  return v == null || (isStr(v, 64) && !Number.isNaN(Date.parse(v)));
+}
+
+export function validate(path: string, body: unknown): string | null {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) return "body must be a JSON object";
+  const b = body as Record<string, unknown>;
+  switch (path) {
+    case "/register":
+      if (!isPosInt(b.pid)) return "pid must be a positive integer";
+      if (!isStr(b.cwd, MAX_PATH, 1)) return "cwd must be a non-empty string";
+      if (!isOptStr(b.git_root, MAX_PATH)) return "git_root too long or not a string";
+      if (!isOptStr(b.tty, MAX_LABEL)) return "tty too long or not a string";
+      if (!isStr(b.summary, MAX_SUMMARY)) return `summary must be a string ≤${MAX_SUMMARY} chars`;
+      for (const k of ["role", "model", "profile"]) {
+        if (!isOptStr(b[k], MAX_LABEL)) return `${k} too long or not a string`;
+      }
+      if (!isOptStr(b.session_id, 256)) return "session_id too long or not a string";
+      if (b.seat_token != null && !(typeof b.seat_token === "string" && SEAT_TOKEN_RE.test(b.seat_token)))
+        return "seat_token must match cp-<8hex>";
+      return null;
+    case "/heartbeat":
+    case "/poll-messages":
+      return isSlug(b.id) ? null : "id must be an 8-char [a-z0-9] slug";
+    case "/set-summary":
+      if (!isSlug(b.id)) return "id must be an 8-char [a-z0-9] slug";
+      return isStr(b.summary, MAX_SUMMARY) ? null : `summary must be a string ≤${MAX_SUMMARY} chars`;
+    case "/send-message": {
+      if (b.from_id !== "cli" && !isSlug(b.from_id)) return 'from_id must be a seat slug or "cli"';
+      if (!isSlug(b.to_id)) return "to_id must be an 8-char [a-z0-9] slug";
+      if (typeof b.text !== "string" || Buffer.byteLength(b.text, "utf8") > MAX_TEXT_BYTES)
+        return `text must be a string ≤${MAX_TEXT_BYTES} bytes`;
+      return null;
+    }
+    case "/unregister": {
+      const hasId = b.id != null, hasPid = b.pid != null;
+      if (hasId === hasPid) return "exactly one of id or pid required";
+      if (hasId && !isSlug(b.id)) return "id must be an 8-char [a-z0-9] slug";
+      if (hasPid && !isPosInt(b.pid)) return "pid must be a positive integer";
+      return null;
+    }
+    case "/costs":
+      if (!isOptIso(b.since)) return "since must be an ISO timestamp";
+      if (!isOptIso(b.until)) return "until must be an ISO timestamp";
+      return null;
+    case "/observe-session":
+      if (!isStr(b.session_id, 256, 1)) return "session_id must be a non-empty string";
+      if (!isStr(b.transcript_path, MAX_PATH, 1)) return "transcript_path must be a non-empty string";
+      if (!isStr(b.cwd, MAX_PATH, 1)) return "cwd must be a non-empty string";
+      if (!isPosInt(b.claude_pid)) return "claude_pid must be a positive integer";
+      return null;
+    default:
+      return null; // unknown route 404s below
+  }
+}
+
 // --- HTTP server ---
 
 const SECRET = getSecret();
@@ -577,6 +667,8 @@ const SECRET = getSecret();
 Bun.serve({
   port: PORT,
   hostname: "127.0.0.1",
+  // Reject oversized POSTs before req.json() ever buffers them.
+  maxRequestBodySize: 64 * 1024,
   async fetch(req) {
     const path = new URL(req.url).pathname;
 
@@ -593,6 +685,8 @@ Bun.serve({
 
     try {
       const body = await req.json();
+      const invalid = validate(path, body);
+      if (invalid) return Response.json({ error: invalid }, { status: 400 });
       switch (path) {
         case "/register":
           return Response.json(handleRegister(body as RegisterRequest));
@@ -604,8 +698,22 @@ Bun.serve({
           return Response.json({ ok: true });
         case "/list-seats":
           return Response.json(handleListSeats(body as ListSeatsRequest));
-        case "/send-message":
-          return Response.json(handleSendMessage(body as SendMessageRequest));
+        case "/send-message": {
+          const b = body as SendMessageRequest;
+          // Queue-depth cap: an unread backlog this deep means the receiver is
+          // gone or the sender is looping; more rows only bloat SQLite and the
+          // eventual context bill.
+          const depth = (
+            db.query("SELECT COUNT(*) AS c FROM messages WHERE to_id = ? AND delivered = 0").get(b.to_id) as { c: number }
+          ).c;
+          if (depth >= QUEUE_DEPTH_CAP) {
+            return Response.json(
+              { ok: false, error: `queue for ${b.to_id} is full (${depth} undelivered)` },
+              { status: 429 }
+            );
+          }
+          return Response.json(handleSendMessage(b));
+        }
         case "/poll-messages":
           return Response.json(handlePollMessages(body as PollMessagesRequest));
         case "/costs":

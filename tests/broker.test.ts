@@ -139,7 +139,12 @@ test("poll joins sender context onto messages", async () => {
 });
 
 test("send to unknown seat fails cleanly", async () => {
-  const res = await post("/send-message", { from_id: "cli", to_id: "nope", text: "x" });
+  // malformed to_id is rejected at the validation layer (v0.2)...
+  const malformed = await post("/send-message", { from_id: "cli", to_id: "nope", text: "x" });
+  expect(malformed.status).toBe(400);
+  // ...a well-formed slug that doesn't exist is an app-level {ok:false}
+  const res = await post("/send-message", { from_id: "cli", to_id: "zzzzzzzz", text: "x" });
+  expect(res.status).toBe(200);
   expect(((await res.json()) as { ok: boolean; error?: string }).ok).toBe(false);
 });
 
@@ -357,4 +362,51 @@ test("indexer incremental resume: appended records add once; a rewrite/truncate 
   writeFileSync(file, a("r3", 200));
   got = await pollCosts(win, (c) => (sess(c)?.input ?? 0) === 200);
   expect(sess(got)!.input).toBe(200); // stale 1500 wiped, only r3 remains
+});
+
+// --- v0.2 security: validation layer + queue depth + identity partial ---
+
+test("validation: oversized text is rejected 400", async () => {
+  const reg = await post("/register", { pid: process.pid, cwd: "/tmp/val", git_root: null, tty: null, summary: "v", role: null, model: null });
+  const id = ((await reg.json()) as { id: string }).id;
+  const res = await post("/send-message", { from_id: "cli", to_id: id, text: "x".repeat(9000) });
+  expect(res.status).toBe(400);
+});
+
+test("validation: malformed pid and wrong types are rejected 400", async () => {
+  expect((await post("/register", { pid: -1, cwd: "/tmp/val", git_root: null, tty: null, summary: "" })).status).toBe(400);
+  expect((await post("/register", { pid: "123", cwd: "/tmp/val", git_root: null, tty: null, summary: "" })).status).toBe(400);
+  expect((await post("/register", { pid: process.pid, cwd: "", git_root: null, tty: null, summary: "" })).status).toBe(400);
+  expect((await post("/register", { pid: process.pid, cwd: "/tmp/val", git_root: null, tty: null, summary: "s".repeat(501) })).status).toBe(400);
+  expect((await post("/register", { pid: process.pid, cwd: "/tmp/val", git_root: null, tty: null, summary: "", seat_token: "not-a-token" })).status).toBe(400);
+  expect((await post("/heartbeat", { id: "../../x" })).status).toBe(400);
+  expect((await post("/unregister", { id: "aaaaaaaa", pid: 42 })).status).toBe(400); // exactly one
+  expect((await post("/unregister", {})).status).toBe(400);
+  expect((await post("/costs", { since: "not-a-date" })).status).toBe(400);
+});
+
+test("validation: from_id that is not a live seat (or cli) is rejected", async () => {
+  const reg = await post("/register", { pid: process.pid, cwd: "/tmp/val2", git_root: null, tty: null, summary: "v2", role: null, model: null });
+  const id = ((await reg.json()) as { id: string }).id;
+  // well-formed slug, but nothing registered under it -> forged provenance
+  const res = await post("/send-message", { from_id: "deadbeef", to_id: id, text: "hi" });
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { ok: boolean; error?: string };
+  expect(body.ok).toBe(false);
+  expect(body.error).toContain("not a live seat");
+});
+
+test("queue-depth cap: /send-message returns 429 once the target backlog hits the cap", async () => {
+  const reg = await post("/register", { pid: process.pid, cwd: "/tmp/val3", git_root: null, tty: null, summary: "v3", role: null, model: null });
+  const id = ((await reg.json()) as { id: string }).id;
+  for (let i = 0; i < 100; i++) {
+    const r = await post("/send-message", { from_id: "cli", to_id: id, text: `m${i}` });
+    expect(r.status).toBe(200);
+  }
+  const over = await post("/send-message", { from_id: "cli", to_id: id, text: "overflow" });
+  expect(over.status).toBe(429);
+  // draining the queue frees it again
+  await post("/poll-messages", { id });
+  const after = await post("/send-message", { from_id: "cli", to_id: id, text: "ok again" });
+  expect(after.status).toBe(200);
 });
