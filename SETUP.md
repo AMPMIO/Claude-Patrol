@@ -21,8 +21,11 @@ bun install
 bun link          # registers the `patrol` bin globally
 ```
 
-**Check:** `patrol` with no args prints the usage block. If `bun link` didn't
-put it on PATH, use `alias patrol="bun ~/Claude-Patrol/src/cli.ts"` instead.
+**Check:** `patrol` with no args prints the usage block. Note `bun link` prints
+`Registered "claude-patrol"` and suggests running `bun link claude-patrol` in a
+project — ignore that suggestion; it still symlinks the `patrol` bin onto your
+PATH (`which patrol` → `~/.bun/bin/patrol`). If `bun link` didn't put it on
+PATH, use `alias patrol="bun ~/Claude-Patrol/src/cli.ts"` instead.
 
 ## 2. Health check
 
@@ -32,8 +35,10 @@ patrol doctor
 
 **Expect:** `broker not responding` (FAIL) and `secret file missing` (FAIL) —
 both are created on first fleet start, so these two are normal right now.
-`bun`, `tmux`, and `claude supports --bg and --tmux` should PASS. Fix anything
-else it flags before continuing.
+`bun`, `tmux`, and `claude supports --bg and --tmux` should PASS. If you also
+run the legacy `claude-peers` broker, doctor prints a benign
+`WARN legacy claude-peers broker on :7899` — patrol uses :7900, the two
+coexist, ignore it. Fix anything else it flags before continuing.
 
 ## 3. Write your fleet config
 
@@ -41,6 +46,12 @@ else it flags before continuing.
 cp patrol.yaml.example patrol.yaml
 $EDITOR patrol.yaml
 ```
+
+`patrol.yaml` is gitignored, so a copy inside this repo won't dirty the tree.
+But a seat's default `cwd` is the yaml file's directory — keep the config (and
+therefore the fleet) OUT of a real project you don't want seats running in.
+For a throwaway first test, put the yaml in a scratch dir and launch it by path
+(`patrol up /tmp/patrol-test/patrol.yaml`).
 
 Minimal two-seat starter (good for the first test):
 
@@ -89,12 +100,30 @@ seat-server autostarts the broker on `127.0.0.1:7900`, creates
 tmux attach -t patrol      # see your seats; C-b <n> switches windows
 ```
 
-**Expect inside each seat window (first run only):** Claude Code shows a
-consent prompt for the patrol MCP server and the development-channel entry —
-approve them. A dim `Channels (experimental) … server:patrol` notice below
-the banner confirms push delivery is live. Seats with a `prompt:` will show a
-`[patrol-seat: cp-xxxxxxxx]` marker at the end of their briefing — that's the
-cost-attribution token; the seat is instructed to ignore it.
+**Expect inside each seat window (first run only), in this order:**
+1. A **workspace-trust** prompt — *"Is this a project you created or one you
+   trust?"* Choose **Yes, I trust this folder** (this is why step 3 says keep
+   the fleet cwd somewhere you're happy to trust).
+2. A **development-channels** warning listing `Channels: server:patrol` —
+   choose **I am using this for local development**.
+
+There is no separate "patrol MCP server" consent prompt — the seat server is
+wired via `--mcp-config`, not an interactive trust. After the banner you'll see
+a dim `Channels (experimental) … server:patrol inject directly in this session`
+notice (that confirms push is live) followed by
+`server:patrol · no MCP server configured with that name` — **this second line
+is benign**: `server:patrol` is the push *channel*, which is a different thing
+from the MCP *server* (named `patrol`); push works regardless.
+
+Seats with a `prompt:` show a `[patrol-seat: cp-xxxxxxxx]` marker at the end of
+their briefing — the cost-attribution token; the seat is told to ignore it.
+
+**Heads-up — per-command approvals:** launched seats start in the normal
+ask-for-approval mode, so a seat will pause for a **Bash approval** every time
+it runs a `patrol` CLI command (`patrol list`, `patrol send`) and for each
+patrol MCP tool (`check_messages`). For an autonomous fleet, either approve
+them as they appear, or pre-allow the patrol CLI in the seat project's
+`.claude/settings.json` (`permissions.allow: ["Bash(patrol *)"]`).
 
 **Check:** `patrol doctor` now passes broker + secret; `patrol list` shows
 every seat with role/model.
@@ -108,8 +137,10 @@ patrol send k3x9p2q1 "ping — reply with your role via patrol send"
 
 **Check:** the target seat wakes within ~1–2s (watch its tmux window), sees a
 fenced message (`⟦patrol:msg …⟧` wrapper — that's the injection fencing), and
-can reply using `patrol send` through Bash. `patrol send` to a nonexistent id
-must exit nonzero with an error (that's the v0.2 false-success fix).
+can reply using `patrol send` through Bash. `patrol send` to a bad id must exit
+nonzero with the broker's real reason (that's the v0.2 false-success fix): a
+malformed id prints `... to_id must be an 8-char [a-z0-9] slug`, and a
+well-formed id that isn't live prints `Seat <id> not found`.
 
 ## 6. Prove per-seat cost attribution (the differentiator)
 
@@ -153,8 +184,10 @@ patrol down            # kills tmux session, SIGTERMs bg seats (pid-verified)
 ```
 
 `patrol down --force` overrides the recycled-pid guard (only if you know a
-stale recorded pid is actually yours). The broker daemon stays up (it's
-cheap and holds cost history); to stop it too:
+stale recorded pid is actually yours). The broker daemon **survives `patrol
+down`** — it's launched detached (nohup + orphaned to launchd), so tearing down
+the fleet leaves it running to hold cost history and keep indexing. Confirm
+with `curl -s 127.0.0.1:7900/health`. To stop it too:
 `kill $(lsof -ti :7900)`.
 
 ## Telemetry
@@ -173,6 +206,22 @@ CACHE R/W (cache_read/cache_write — the standing-seat reuse number). Totals
 and a "coalescing saved ~N wake-ups" line follow the table. If the broker is
 unreachable or the route errors, it prints to stderr and exits 1 rather than
 showing zeros.
+
+**Reading the BOUND column:** a launcher seat should resolve as `token` (Layer
+1 — its `cp-` token content-matched its session log; this is the exact,
+multi-seat-safe path). `heuristic` means a tokenless or manually-opened session
+was bound by the mtime fallback. `env` means *only* that
+`CLAUDE_PATROL_SESSION_ID` was set explicitly — it is NOT the normal path, so a
+launcher seat showing `env` is a red flag worth reporting. `-`/blank means the
+seat's spend hasn't bound yet (give the indexer a tick) or is genuinely
+unattributed.
+
+**Unattributed on a busy machine:** `patrol stats`/`status` sweep every Claude
+session's cost in the window and bucket anything that isn't a fleet seat as
+`unattributed`. On a box where you also run standalone `claude` sessions (or
+other agents), expect a large `unattributed` figure — that's *correct*, not a
+leak: it's your non-fleet spend, and it is never mis-charged to a seat. On a
+quiet single-fleet machine `unattributed` should sit near zero.
 
 During your test week, run `patrol stats --json > stats-$(date +%F).json`
 daily to accumulate evidence. Keep the files — they're the raw data behind

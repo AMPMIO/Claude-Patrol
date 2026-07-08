@@ -45,7 +45,17 @@ export async function brokerPost<T>(path: string, body: unknown): Promise<T> {
     throw new BrokerError(`broker unreachable at ${brokerBase()} — is it running? try: patrol doctor`);
   }
   if (!res.ok) {
-    throw new BrokerError(`broker ${path} failed: ${res.status} ${res.statusText}`);
+    // The broker returns its real reason as JSON {error} (e.g. "to_id must be
+    // an 8-char [a-z0-9] slug"); surface it instead of a bare "400 Bad Request".
+    const detail = await res.json().then(
+      (j) => (j && typeof j === "object" && "error" in j && typeof (j as { error: unknown }).error === "string"
+        ? (j as { error: string }).error
+        : ""),
+      () => ""
+    );
+    throw new BrokerError(
+      detail ? `broker ${path} failed (${res.status}): ${detail}` : `broker ${path} failed: ${res.status} ${res.statusText}`
+    );
   }
   return (await res.json()) as T;
 }
