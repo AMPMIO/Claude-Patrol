@@ -19,6 +19,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { getSecret, TOKEN_HEADER } from "../shared/auth.ts";
 import { findSessionIdByHeuristic } from "./costs.ts";
+import { SEAT_TOKEN_ENV, SEAT_TOKEN_RE } from "../shared/types.ts";
 import type {
   SeatId,
   RegisterResponse,
@@ -249,8 +250,17 @@ async function main() {
   const gitRoot = await getGitRoot(cwd);
   const tty = getTty();
 
+  // Register the PARENT (claude) process, not this MCP server: broker liveness
+  // must track the actual claude process, and the SessionEnd hook deregisters
+  // by its $PPID = the claude pid. Registering process.pid (the MCP server)
+  // instead left the hook's dereg-by-pid join with nothing to match. Fall back
+  // to our own pid if ppid is unavailable (0/undefined).
+  const claudePid = process.ppid || process.pid;
+  const envToken = process.env[SEAT_TOKEN_ENV];
+  const seatToken = envToken && SEAT_TOKEN_RE.test(envToken) ? envToken : null;
+
   const reg = await brokerFetch<RegisterResponse>("/register", {
-    pid: process.pid,
+    pid: claudePid,
     cwd,
     git_root: gitRoot,
     tty,
@@ -259,6 +269,7 @@ async function main() {
     model: process.env.CLAUDE_PATROL_MODEL ?? null,
     profile: process.env.CLAUDE_PATROL_PROFILE ?? null,
     session_id: discoverSessionId(cwd),
+    seat_token: seatToken,
   });
   myId = reg.id;
   log(`Registered as seat ${myId} (cwd: ${cwd})`);
