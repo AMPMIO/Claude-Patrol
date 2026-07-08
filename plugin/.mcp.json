@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "patrol": {
+      "command": "bun",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/../src/seat-server.ts"]
+    }
+  }
+}

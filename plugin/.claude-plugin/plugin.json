@@ -1,0 +1,7 @@
+{
+  "name": "claude-patrol",
+  "description": "Standing-seat fleet coordination for Claude Code: authenticated broker, coalesced push notifications, and per-seat cost tracking. This plugin is the Claude-Code-facing half (MCP seat server + slash commands + briefing skill + SessionEnd dereg); it pairs with the `patrol` CLI and broker daemon, installed separately (npm/binary — a plugin cannot host an always-on process).",
+  "version": "0.1.0",
+  "author": { "name": "ampm.io" },
+  "keywords": ["claude-code", "multi-agent", "fleet", "broker", "cost-tracking", "peers"]
+}
