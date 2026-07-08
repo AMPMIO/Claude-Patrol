@@ -65,6 +65,7 @@ export interface CostRow {
 //   /unregister       UnregisterRequest      → { ok: true }
 //   /costs            CostsRequest           → CostsResponse
 //   /observe-session  ObserveSessionRequest  → { ok: boolean }   (v0.2 Layer 2; see kill criterion)
+//   /stats            StatsRequest           → StatsResponse     (v0.2 telemetry)
 //   GET /health       (no auth)              → { status: "ok"; seats: number }
 
 // --- v0.2 cost attribution: launcher-issued seat token (Layer 1, primary) ---
@@ -152,6 +153,42 @@ export interface CostsRequest {
 export interface CostsResponse {
   rows: CostRow[];
   total_usd: number;
+}
+
+// --- v0.2 telemetry (/stats) — the evidence layer for the cost claims ---
+// Wake-ups are the unit that costs money: every delivered notification wakes
+// the seat for a full turn at full context price. messages/notifications is
+// the coalescing ratio the README claims; bound_via measures which
+// attribution layer actually fired in practice.
+
+export type BoundVia = "token" | "observe" | "heuristic" | "env";
+
+export interface StatsRequest {
+  since?: string; // ISO; default: since broker start
+  until?: string;
+}
+export interface SeatStats {
+  seat_id: SeatId;
+  role: string | null;
+  model: string | null;
+  live: boolean;
+  bound_via: BoundVia | null; // null = session never bound (unattributed seat)
+  notifications: number; // paid wake-ups (poll batches delivered)
+  messages: number; // messages inside those batches
+  input: number;
+  output: number;
+  cache_write: number;
+  cache_read: number;
+  cost_usd: number;
+}
+export interface StatsResponse {
+  seats: SeatStats[];
+  totals: {
+    notifications: number;
+    messages: number;
+    cost_usd: number;
+    unattributed_usd: number; // spend in window no seat claimed
+  };
 }
 
 // --- patrol.yaml (launcher config) ---
