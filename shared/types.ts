@@ -144,6 +144,10 @@ export interface PollMessagesResponse {
 export interface CostsRequest {
   since?: string; // ISO; default: since broker start
   until?: string;
+  // NOTE: /costs reads the hour-bucketed ledger, so since/until are effectively
+  // floored to the hour (boundary hour over-included). Record-exact windows live
+  // in the pure computeCosts path; ledger is rebuildable if finer buckets are
+  // ever needed.
 }
 export interface CostsResponse {
   rows: CostRow[];
