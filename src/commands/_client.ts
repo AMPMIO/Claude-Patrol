@@ -37,8 +37,10 @@ export async function brokerPost<T>(path: string, body: unknown): Promise<T> {
       method: "POST",
       headers: { "content-type": "application/json", "x-patrol-token": token },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(3000), // wedged broker (port open, no response) must not hang the CLI
     });
   } catch {
+    // network error OR AbortError (timeout) — both are "can't reach a working broker"
     throw new BrokerError(`broker unreachable at ${brokerBase()} — is it running? try: patrol doctor`);
   }
   if (!res.ok) {
@@ -49,7 +51,7 @@ export async function brokerPost<T>(path: string, body: unknown): Promise<T> {
 
 export async function brokerHealthy(): Promise<boolean> {
   try {
-    const res = await fetch(brokerBase() + "/health");
+    const res = await fetch(brokerBase() + "/health", { signal: AbortSignal.timeout(3000) });
     return res.ok;
   } catch {
     return false;
