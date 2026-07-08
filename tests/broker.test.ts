@@ -153,3 +153,28 @@ test("/costs is auth-gated and attributes via a registered session_id", async ()
   expect(rows.find((r) => r.session_id === "sessA")!.seat_id).toBe(seatId);
   expect(rows.find((r) => r.session_id === "subX")!.seat_id).toBeNull();
 });
+
+test("unregister by pid deregisters the seat (SessionEnd hook path)", async () => {
+  const reg = await post("/register", {
+    pid: process.pid,
+    cwd: "/tmp/ending",
+    git_root: null,
+    tty: null,
+    summary: "about to end",
+    role: null,
+    model: null,
+  });
+  const id = ((await reg.json()) as { id: string }).id;
+
+  const seatsBefore = (await (await post("/list-seats", { scope: "machine", cwd: "/", git_root: null })).json()) as Array<{ id: string }>;
+  expect(seatsBefore.some((s) => s.id === id)).toBe(true);
+
+  const u = await post("/unregister", { pid: process.pid });
+  expect(((await u.json()) as { ok: boolean }).ok).toBe(true);
+
+  const seatsAfter = (await (await post("/list-seats", { scope: "machine", cwd: "/", git_root: null })).json()) as Array<{ id: string }>;
+  expect(seatsAfter.some((s) => s.id === id)).toBe(false);
+
+  // idempotent: a second dereg (or one after stale cleanup) still returns ok
+  expect(((await (await post("/unregister", { pid: process.pid })).json()) as { ok: boolean }).ok).toBe(true);
+});

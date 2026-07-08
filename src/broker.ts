@@ -23,6 +23,7 @@ import type {
   SendMessageRequest,
   PollMessagesRequest,
   PollMessagesResponse,
+  UnregisterRequest,
   CostsRequest,
   CostsResponse,
   Seat,
@@ -188,6 +189,21 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   return { messages: rows.map((m) => ({ ...m, delivered: true })) };
 }
 
+// Idempotent dereg: by explicit id (seat-server shutdown) or by pid (SessionEnd
+// hook, which knows only its $PPID). A no-match is not an error — the hook may
+// fire after stale-PID cleanup already removed the row.
+function handleUnregister(body: UnregisterRequest): void {
+  let id = body.id;
+  if (!id && body.pid != null) {
+    const row = db.query("SELECT id FROM seats WHERE pid = ?").get(body.pid) as { id: string } | null;
+    id = row?.id;
+  }
+  if (id) {
+    deleteSeat.run(id);
+    db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [id]);
+  }
+}
+
 function handleCosts(body: CostsRequest): CostsResponse {
   const seats = selectAllSeats.all() as (Seat & { session_id: string | null })[];
   const seatSessions = new Map<string, string>();
@@ -246,7 +262,7 @@ Bun.serve({
         case "/costs":
           return Response.json(handleCosts(body as CostsRequest));
         case "/unregister":
-          deleteSeat.run((body as { id: string }).id);
+          handleUnregister(body as UnregisterRequest);
           return Response.json({ ok: true });
         default:
           return Response.json({ error: "not found" }, { status: 404 });
