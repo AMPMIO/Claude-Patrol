@@ -1,0 +1,31 @@
+# patrol.yaml — a fleet of standing Claude Code seats.
+# Launch with: patrol up   (or: patrol up path/to/patrol.yaml)
+#
+# Every seat MUST name a model — a seat never boots on the default model
+# (that leaks the expensive Fable default; the launcher hard-errors on it).
+
+seats:
+  # Visible orchestrator in a tmux window. `full` = everything on (ccl full).
+  - name: orchestrator
+    role: lead
+    model: opus
+    backend: tmux
+    profile: full
+    prompt: "You are the fleet orchestrator. Delegate to executor and scout; judge, don't implement."
+
+  # Visible executor with a per-seat plugin SUBSET (the R3 feature ccl lacks):
+  # only caveman + ponytail enabled, everything else off, plus the patrol seat
+  # server for coordination.
+  - name: executor
+    model: opus
+    backend: tmux
+    profile:
+      plugins: [caveman, ponytail]
+      mcp: patrol
+
+  # Headless scout via `claude --bg`. `peer` = no plugins + patrol MCP only
+  # (ccl peer), the lean coordinating seat.
+  - name: scout
+    model: sonnet
+    backend: bg
+    profile: peer
