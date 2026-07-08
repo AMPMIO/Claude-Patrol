@@ -82,6 +82,7 @@ beforeAll(async () => {
       CLAUDE_PATROL_SECRET_FILE: SECRET_FILE,
       CLAUDE_PATROL_PROJECTS_ROOT: PROJECTS_ROOT,
       CLAUDE_PATROL_INDEX_INTERVAL_MS: "80", // /costs reads a background ledger; keep ticks fast for tests
+      CLAUDE_PATROL_TOKEN_SCAN_CAP: "3", // abandon a never-landing token scan after 3 misses (test the cap fast)
     },
     stdio: ["ignore", "ignore", "inherit"],
   });
@@ -531,4 +532,51 @@ test("/stats: unattributed_usd captures orphan spend; totals reconcile with /cos
 test("/stats is auth-gated and validates since", async () => {
   expect((await post("/stats", {}, "wrong")).status).toBe(401);
   expect((await post("/stats", { since: "not-a-date" })).status).toBe(400);
+});
+
+// --- v0.2 perf: bound the token re-scan for a marker that never lands ---
+
+test("token scan is abandoned after the cap; the run stays bindable via observe", async () => {
+  const CWD = "/tmp/abandon-tokenscan";
+  const TOK = "cp-99990000"; // a launch marker that never reaches the log
+  const projDir = join(PROJECTS_ROOT, projectDirName(CWD));
+  mkdirSync(projDir, { recursive: true });
+  // A decoy log WITHOUT the token: the dir is scannable but never matches.
+  writeFileSync(
+    join(projDir, "decoy.jsonl"),
+    JSON.stringify({ type: "user", sessionId: "decoy", message: { role: "user", content: "no marker here" } }) + "\n"
+  );
+
+  const reg = await post("/register", { pid: process.pid, cwd: CWD, git_root: null, tty: null, summary: "silent", role: "worker", model: "opus", seat_token: TOK });
+  const seatId = ((await reg.json()) as { id: string }).id;
+
+  const meNow = async (): Promise<StatsSeat | undefined> => {
+    const s = (await (await post("/stats", { since: SINCE_ALL })).json()) as StatsBody;
+    return s.seats.find((x) => x.seat_id === seatId);
+  };
+
+  // Well past the cap (3 misses ≈ 240ms at an 80ms tick): the token scan gives up.
+  await new Promise((r) => setTimeout(r, 700));
+  // The marker lands NOW — but the scan is abandoned, so it must NOT rebind. A
+  // still-live token scan would bind here; that it doesn't is the "stopped
+  // re-scanning" proof.
+  writeFileSync(
+    join(projDir, `${TOK}-sess.jsonl`),
+    JSON.stringify({ type: "user", sessionId: "late-sess", message: { role: "user", content: `late ${seatMarker(TOK)}` } }) + "\n"
+  );
+  await new Promise((r) => setTimeout(r, 400)); // ~5 more ticks with the marker present
+  expect((await meNow())?.bound_via).toBeNull(); // abandoned: the late marker is ignored
+
+  // Layer-2 observe can STILL bind the abandoned run. claude_pid 999999 owns no
+  // seat, so observe falls to the unique-cwd path and binds THIS run.
+  const obs = await post("/observe-session", { session_id: "observed-sess", transcript_path: "/tmp/t.jsonl", cwd: CWD, claude_pid: 999999 });
+  expect(((await obs.json()) as { ok: boolean }).ok).toBe(true);
+
+  let bound: StatsSeat | undefined;
+  for (let i = 0; i < 40; i++) {
+    bound = await meNow();
+    if (bound?.bound_via) break;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  expect(bound?.bound_via).toBe("observe"); // bound by observe, never by the abandoned token scan
 });

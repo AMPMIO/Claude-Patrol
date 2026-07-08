@@ -261,7 +261,18 @@ export function parseFileTail(
 // filename stem) ONLY when EXACTLY one log contains the token: zero => not
 // written yet (retry next tick), several => ambiguous (leave unbound). Scans
 // only top-level logs; the marker rides the main prompt, not subagent files.
-export function resolveTokenToSession(opts: { cwd: string; projectsRoot: string; token: string }): string | null {
+//
+// scanCache (optional, caller-owned per run): filePath -> (size, mtimeMs) at
+// which the file was read and found NOT to contain the token. On a re-scan an
+// unchanged entry is skipped rather than re-read whole — this is what stops a
+// never-landing token from re-reading a whole project dir on every index tick.
+// New or changed files are always read; a match clears its entry. Correctness is
+// unchanged: a skipped entry is a known non-match, so exactly-one-match-or-null
+// still holds over the full current file set.
+export function resolveTokenToSession(
+  opts: { cwd: string; projectsRoot: string; token: string },
+  scanCache?: Map<string, { size: number; mtimeMs: number }>
+): string | null {
   const dir = join(opts.projectsRoot, projectDirName(opts.cwd));
   let entries: string[];
   try {
@@ -272,13 +283,27 @@ export function resolveTokenToSession(opts: { cwd: string; projectsRoot: string;
   const hits: string[] = [];
   for (const e of entries) {
     if (!e.endsWith(".jsonl")) continue;
+    const full = join(dir, e);
+    let st: { size: number; mtimeMs: number };
+    try {
+      st = statSync(full);
+    } catch {
+      continue; // vanished between readdir and stat
+    }
+    const cached = scanCache?.get(full);
+    if (cached && cached.size === st.size && cached.mtimeMs === st.mtimeMs) continue; // known miss, unchanged
     let text: string;
     try {
-      text = readFileSync(join(dir, e), "utf8");
+      text = readFileSync(full, "utf8");
     } catch {
       continue;
     }
-    if (text.includes(opts.token)) hits.push(e.slice(0, -".jsonl".length));
+    if (text.includes(opts.token)) {
+      hits.push(e.slice(0, -".jsonl".length));
+      scanCache?.delete(full); // no longer a miss
+    } else {
+      scanCache?.set(full, { size: st.size, mtimeMs: st.mtimeMs });
+    }
   }
   return hits.length === 1 ? hits[0]! : null;
 }

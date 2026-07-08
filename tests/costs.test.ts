@@ -5,7 +5,7 @@
  * 0.087 to 0.06 — this test fails.
  */
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { computeCosts, priceFor, projectDirName, findSessionIdByHeuristic, attributeSeatsToSessions, resolveTokenToSession, parseFileTail } from "../src/costs.ts";
@@ -248,6 +248,60 @@ test("resolveTokenToSession: token in more than one file -> null (ambiguous, nev
   const t = "cp-abcabc12";
   const d = tokenFixture("/tmp/dup", [["a.jsonl", seatMarker(t)], ["b.jsonl", seatMarker(t)]]);
   expect(resolveTokenToSession({ cwd: "/tmp/dup", projectsRoot: d, token: t })).toBeNull();
+  rmSync(d, { recursive: true, force: true });
+});
+
+// --- Layer 1 scan cache: an unchanged file must not be re-read every tick ---
+
+test("resolveTokenToSession: an unchanged (size,mtime) file is skipped on re-scan", () => {
+  const t = "cp-5555aaaa";
+  const marker = seatMarker(t);
+  const filler = "x".repeat(marker.length); // same byte length as the marker
+  const line = (mid: string) => jl({ type: "user", message: { role: "user", content: `pre ${mid} post` } }) + "\n";
+  const d = mkdtempSync(join(tmpdir(), "patrol-tokcache-"));
+  const projDir = join(d, projectDirName("/tmp/cache1"));
+  mkdirSync(projDir, { recursive: true });
+  const f = join(projDir, "sess-c.jsonl");
+
+  // Whole-second mtime so the (size,mtime) guard compares exact integers (no
+  // float round-trip from utimes).
+  const fixedSec = Math.floor(Date.now() / 1000) - 100;
+  writeFileSync(f, line(filler)); // NO marker
+  utimesSync(f, fixedSec, fixedSec);
+  const st = statSync(f);
+
+  const cache = new Map<string, { size: number; mtimeMs: number }>();
+  expect(resolveTokenToSession({ cwd: "/tmp/cache1", projectsRoot: d, token: t }, cache)).toBeNull();
+  expect(cache.has(f)).toBe(true); // miss recorded
+
+  // Rewrite to CONTAIN the marker at the SAME byte length, and restore the same
+  // whole-second mtime → (size,mtime) unchanged. A cache-aware scan must SKIP it,
+  // so the now-present marker is NOT seen (proves the file was not re-read).
+  writeFileSync(f, line(marker));
+  utimesSync(f, fixedSec, fixedSec);
+  expect(statSync(f).size).toBe(st.size);
+  expect(statSync(f).mtimeMs).toBe(st.mtimeMs);
+  expect(resolveTokenToSession({ cwd: "/tmp/cache1", projectsRoot: d, token: t }, cache)).toBeNull();
+
+  // A cold cache re-reads and finds it — proves the file genuinely matches and the
+  // earlier null was the skip, not a bad fixture.
+  expect(resolveTokenToSession({ cwd: "/tmp/cache1", projectsRoot: d, token: t }, new Map())).toBe("sess-c");
+  rmSync(d, { recursive: true, force: true });
+});
+
+test("resolveTokenToSession: a newly appearing file is scanned and binds even with a warm cache", () => {
+  const t = "cp-6666bbbb";
+  const d = mkdtempSync(join(tmpdir(), "patrol-toknew-"));
+  const projDir = join(d, projectDirName("/tmp/cache2"));
+  mkdirSync(projDir, { recursive: true });
+  writeFileSync(join(projDir, "decoy.jsonl"), jl({ type: "user", message: { role: "user", content: "no marker" } }) + "\n");
+
+  const cache = new Map<string, { size: number; mtimeMs: number }>();
+  expect(resolveTokenToSession({ cwd: "/tmp/cache2", projectsRoot: d, token: t }, cache)).toBeNull(); // decoy cached as a miss
+
+  // The seat's real log appears later; the warm cache must not hide the new file.
+  writeFileSync(join(projDir, "sess-new.jsonl"), jl({ type: "user", message: { role: "user", content: `go ${seatMarker(t)}` } }) + "\n");
+  expect(resolveTokenToSession({ cwd: "/tmp/cache2", projectsRoot: d, token: t }, cache)).toBe("sess-new");
   rmSync(d, { recursive: true, force: true });
 });
 
