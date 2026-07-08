@@ -9,7 +9,7 @@ import {
   validateConfig, planSeat, composeSeat, shQuote, seatShellLine, tmuxCommands,
   selectBgPidsToKill, patrolMcpConfig, type SeatPlan, type ComposePaths,
 } from "../src/launcher/compose.ts";
-import type { PatrolConfig, SeatSpec } from "../shared/types.ts";
+import { seatMarker, SEAT_TOKEN_ENV, type PatrolConfig, type SeatSpec } from "../shared/types.ts";
 
 const INSTALLED = {
   "caveman@caveman": true,
@@ -100,6 +100,14 @@ describe("validateConfig", () => {
     expect(() => validateConfig(cfg([
       { name: "a", model: "opus", profile: "turbo" },
     ]))).toThrow(/unknown profile/);
+  });
+  test("rejects path-traversal / injection seat names, accepts normal ones", () => {
+    for (const bad of ["../x", "/abs", "a;b", ".", "..", "a b", "a/b", "-lead", "café"]) {
+      expect(() => validateConfig(cfg([{ name: bad, model: "opus" }]))).toThrow(/invalid name/);
+    }
+    for (const ok of ["orchestrator", "worker-1", "a", "seat.1", "A_b-2"]) {
+      expect(() => validateConfig(cfg([{ name: ok, model: "opus" }]))).not.toThrow();
+    }
   });
 });
 
@@ -207,6 +215,55 @@ describe("composeSeat argv+env", () => {
   });
 });
 
+// --- Layer-1 seat-token marker injection -----------------------------------
+
+describe("composeSeat seat-token marker", () => {
+  const TOKEN = "cp-0375a012";
+  const MARKER = seatMarker(TOKEN);
+
+  test("appends marker to an existing prompt and sets SEAT_TOKEN_ENV", () => {
+    const p = plan({ name: "orchestrator", role: "lead", model: "opus", profile: "full", prompt: "go" });
+    const { argv, env } = composeSeat(p, pathsFor(p), TOKEN);
+    expect(argv).toEqual(["claude", "--model", "opus", "--name", "orchestrator", `go\n\n${MARKER}`]);
+    expect(env[SEAT_TOKEN_ENV]).toBe(TOKEN);
+  });
+
+  test("synthesizes a minimal prompt when the seat has none", () => {
+    const p = plan({ name: "worker-1", role: "worker", model: "sonnet" });
+    const { argv, env } = composeSeat(p, pathsFor(p), TOKEN);
+    expect(argv).toEqual(["claude", "--model", "sonnet", "--name", "worker-1", `${MARKER} You are seat worker. Await instructions.`]);
+    expect(env[SEAT_TOKEN_ENV]).toBe(TOKEN);
+  });
+
+  test("silent seat skips BOTH marker and env even when a token is passed", () => {
+    const p = plan({ name: "quiet", model: "opus", prompt: "hi", silent: true });
+    const { argv, env } = composeSeat(p, pathsFor(p), TOKEN);
+    expect(argv).toEqual(["claude", "--model", "opus", "--name", "quiet", "hi"]);
+    expect(env[SEAT_TOKEN_ENV]).toBeUndefined();
+  });
+
+  test("no token passed -> no marker, no env (back-compat)", () => {
+    const p = plan({ name: "bare", model: "opus", prompt: "hi" });
+    const { argv, env } = composeSeat(p, pathsFor(p));
+    expect(argv).toEqual(["claude", "--model", "opus", "--name", "bare", "hi"]);
+    expect(env[SEAT_TOKEN_ENV]).toBeUndefined();
+  });
+});
+
+// --- cwd resolution against the config directory ---------------------------
+
+describe("planSeat cwd", () => {
+  test("relative cwd resolves against the config dir, not process cwd", () => {
+    expect(planSeat({ name: "a", model: "opus", cwd: "pkg/api" }, INSTALLED, "/cfg").cwd).toBe("/cfg/pkg/api");
+  });
+  test("absolute cwd is kept as-is", () => {
+    expect(planSeat({ name: "a", model: "opus", cwd: "/abs/here" }, INSTALLED, "/cfg").cwd).toBe("/abs/here");
+  });
+  test("omitted cwd defaults to the config dir", () => {
+    expect(planSeat({ name: "a", model: "opus" }, INSTALLED, "/cfg").cwd).toBe("/cfg");
+  });
+});
+
 // --- shell quoting + tmux ---------------------------------------------------
 
 describe("shQuote", () => {
@@ -245,20 +302,27 @@ describe("selectBgPidsToKill", () => {
     { pid: 100, sessionId: "s1", name: "scout" },
     { pid: 101, sessionId: "s2", name: "probe" },
   ];
-  test("matches by sessionId first", () => {
-    expect(selectBgPidsToKill([{ name: "x", sessionId: "s2", pid: null }], live)).toEqual([101]);
+  test("matches by sessionId first -> verified", () => {
+    expect(selectBgPidsToKill([{ name: "x", sessionId: "s2", pid: null }], live)).toEqual({ verified: [101], unverified: [] });
   });
-  test("falls back to name when sessionId unknown", () => {
-    expect(selectBgPidsToKill([{ name: "scout", sessionId: null, pid: null }], live)).toEqual([100]);
+  test("falls back to name when sessionId unknown -> verified", () => {
+    expect(selectBgPidsToKill([{ name: "scout", sessionId: null, pid: null }], live)).toEqual({ verified: [100], unverified: [] });
   });
-  test("falls back to recorded pid when agent gone from list", () => {
-    expect(selectBgPidsToKill([{ name: "ghost", sessionId: "gone", pid: 999 }], live)).toEqual([999]);
+  test("recorded pid whose agent is gone -> unverified (recycle risk)", () => {
+    expect(selectBgPidsToKill([{ name: "ghost", sessionId: "gone", pid: 999 }], live)).toEqual({ verified: [], unverified: [999] });
   });
-  test("dedups", () => {
+  test("mixed fleet splits verified from unverified", () => {
+    expect(selectBgPidsToKill([
+      { name: "scout", sessionId: "s1", pid: 55 },   // live -> verified 100
+      { name: "ghost", sessionId: "gone", pid: 999 }, // gone -> unverified 999
+    ], live)).toEqual({ verified: [100], unverified: [999] });
+  });
+  test("dedups and never lists a verified pid as unverified", () => {
     expect(selectBgPidsToKill([
       { name: "scout", sessionId: "s1", pid: null },
       { name: "scout", sessionId: null, pid: null },
-    ], live)).toEqual([100]);
+      { name: "gone-but-same-pid", sessionId: "x", pid: 100 }, // recycled onto a verified pid
+    ], live)).toEqual({ verified: [100], unverified: [] });
   });
 });
 

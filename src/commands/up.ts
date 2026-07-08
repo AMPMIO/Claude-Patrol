@@ -8,6 +8,8 @@
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, dirname } from "node:path";
+import { randomBytes } from "node:crypto";
+import { SEAT_TOKEN_RE } from "../../shared/types.ts";
 import { parsePatrolConfig } from "../launcher/yaml.ts";
 import {
   validateConfig, planSeat, composeSeat, patrolMcpConfig,
@@ -28,6 +30,15 @@ export interface FleetState {
   started_at: string;
   tmux: boolean;
   bg: RecordedBgSeat[];
+}
+
+// Layer-1 attribution token: "cp-" + 8 lowercase hex. The format contract lives
+// in shared/types.ts (SEAT_TOKEN_RE) — generate here, then verify against it so a
+// drift can never silently ship a token the broker won't content-match.
+function genSeatToken(): string {
+  const token = "cp-" + randomBytes(4).toString("hex");
+  if (!SEAT_TOKEN_RE.test(token)) throw new Error(`bug: generated malformed seat token "${token}"`);
+  return token;
 }
 
 function readInstalledPlugins(): Record<string, boolean> {
@@ -88,9 +99,11 @@ export default async function up(args: string[]): Promise<number> {
   mkdirSync(PROFILE_DIR, { recursive: true });
 
   // Compose everything before launching so a compose error aborts cleanly.
+  // One fresh token per non-silent seat; silent seats pass null (Layer-3 only).
   const composed = plans.map((plan) => {
     const paths = materialize(plan);
-    return { plan, ...composeSeat(plan, paths) };
+    const token = plan.spec.silent ? null : genSeatToken();
+    return { plan, token, ...composeSeat(plan, paths, token) };
   });
 
   // tmux seats
@@ -113,7 +126,7 @@ export default async function up(args: string[]): Promise<number> {
     const fresh = listAgents().filter((a) => !before.has(a.sessionId));
     for (const c of bgComposed) {
       const hit = fresh.find((a) => a.name === c.plan.spec.name);
-      bgRecorded.push({ name: c.plan.spec.name, sessionId: hit?.sessionId ?? null, pid: hit?.pid ?? null });
+      bgRecorded.push({ name: c.plan.spec.name, sessionId: hit?.sessionId ?? null, pid: hit?.pid ?? null, token: c.token });
     }
     console.log(`patrol up: ${bgComposed.length} bg seat(s) dispatched — list with \`claude agents --json\``);
   }
