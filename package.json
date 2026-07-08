@@ -1,6 +1,6 @@
 {
   "name": "claude-patrol",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Standing-seat fleet coordination for Claude Code: authenticated broker, coalesced push, per-seat cost tracking, profile-aware launcher",
   "type": "module",
   "scripts": {

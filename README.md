@@ -42,15 +42,24 @@ Patrol exists to make that topology cheap to run and trivial to operate.
    evening). Patrol makes that mistake structurally impossible.
 3. **Per-seat cost tracking — the feature no peer tool has.** `patrol status`
    shows live spend per seat, computed from Claude Code's own session logs,
-   *including subagent transcripts* (omitting those undercounted real runs by
-   63% before we caught it). Fleet economics stop being vibes.
+   *including subagent transcripts rolled up to their parent seat* (omitting
+   those undercounted real runs by 63% before we caught it). v0.2 made
+   attribution exact for the standard case: every launched seat carries a
+   `[patrol-seat: cp-…]` token in its boot prompt, content-matched to its
+   session log — N seats in one repo each get THEIR number, and history
+   survives seat teardown and broker restarts in a durable SQLite ledger.
+   Fleet economics stop being vibes.
 4. **Coalesced wake-ups.** Every push notification wakes the receiving
    session for a full turn at full context price. Patrol delivers each poll
    batch as ONE notification, however many messages queued — N messages
    never cost N turns.
-5. **An authenticated broker.** Without auth, any local process can POST
-   text into your Claude sessions framed as a teammate — a prompt-injection
-   surface. Patrol gates the broker with a 0600 shared-secret file.
+5. **An authenticated broker with fenced delivery.** Without auth, any local
+   process can POST text into your Claude sessions framed as a teammate — a
+   prompt-injection surface. Patrol gates the broker with a 0600
+   shared-secret file (symlink/uid/perms-checked at every read), validates
+   every request's shape and size, and (v0.2) wraps each delivered message
+   body in a per-notification random fence — a body cannot forge a sibling
+   `[from …]` header or speak with another seat's authority.
 6. **Seats that describe themselves.** Role/model/profile ride along at
    registration (`CLAUDE_PATROL_*` env, set by the launcher). Orchestrators
    route work by the seat list instead of burning a round-trip asking every
@@ -80,11 +89,14 @@ Patrol is a ground-up rewrite informed by running
 
 ## Quickstart
 
+Full step-by-step (with a verification per step): **[SETUP.md](SETUP.md)**.
+The short version:
+
 ```bash
-bun install
+bun install && bun link
 cp patrol.yaml.example patrol.yaml   # edit seats
-bun src/cli.ts up                    # or link the bin: `patrol up`
-bun src/cli.ts status
+patrol up
+patrol status
 ```
 
 `patrol.yaml`:
@@ -135,7 +147,13 @@ plugin subset:
 
 ## Status / caveats
 
-v0.1. Single-machine by design. The `claude/channel` capability is a
+v0.2 — the differentiator is real now: exact multi-seat-same-repo cost
+attribution (3 layers: launch-token content match → SessionStart hook →
+never-misattribute window heuristic), durable cost history, `/costs` served
+from an incrementally-indexed ledger (no log walk on the status path),
+provenance-fenced message delivery, validated broker input. 110 tests.
+
+Single-machine by design. The `claude/channel` capability is a
 research-preview Claude Code feature (`--dangerously-load-development-channels`);
 if it changes, delivery degrades to the `check_messages` fallback. Warp-native
 launch backend is planned (tmux and headless cover today). If Anthropic ships
