@@ -14,7 +14,8 @@ patrol down        # tear it all down
 ## Why standing seats at all
 
 Measured on real workloads (July 2026, identical fixed-spec dev task, same
-model mix, cost from session logs at list prices):
+model mix, cost from session logs at list prices — **one run per topology so
+far; read it as ~2–3× until the repeat runs land**, tracked for v0.2):
 
 | topology | cost | wall-clock |
 |---|---|---|

@@ -7,7 +7,9 @@ Every decision below carries its kill criterion; re-litigate only when one fires
 ## Premise (confirmed, with reversal condition)
 
 Independent standing terminal seats, coordinated by a local broker. This is
-where the measured ~2.9× cost edge over subagent spawning lives, and it is
+where the measured cost edge over subagent spawning lives (~2.9× on single
+unrepeated runs, one per topology — repeat + matrix cells pending, see
+orchestration.md items 39–42 in the Fable Hijack repo), and it is
 exactly what first-party Agent Teams does NOT do (session-scoped,
 lead-spawned; Anthropic issue #28300 requests our model = unshipped).
 **Reverses if:** Anthropic ships persistent cross-session teams — then Patrol
