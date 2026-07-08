@@ -25,6 +25,7 @@ const ENV = {
   CLAUDE_PATROL_DB: join(dir, "test.db"),
   CLAUDE_PATROL_SECRET_FILE: SECRET_FILE,
   CLAUDE_PATROL_PROJECTS_ROOT: PROJECTS_ROOT,
+  CLAUDE_PATROL_INDEX_INTERVAL_MS: "80", // /costs reads a background ledger; keep ticks fast for tests
 };
 
 let broker: ReturnType<typeof Bun.spawn>;
@@ -115,12 +116,19 @@ test("patrol send → seat's queue via real broker", async () => {
 });
 
 test("patrol status attributes fixture spend to the seat", async () => {
-  const { code, out } = await cli(["status"]);
+  // /costs is served from the broker's background ledger, so the fixture spend
+  // appears within a tick — poll status until it lands on the seat row.
+  let out = "";
+  let code = 1;
+  for (let i = 0; i < 60; i++) {
+    ({ code, out } = await cli(["status"]));
+    if (code === 0 && /builder.*\$0\.0[5-6]/.test(out)) break;
+    await new Promise((r) => setTimeout(r, 50));
+  }
   expect(code).toBe(0);
   expect(out).toContain("SPEND");
-  // 1000 in * $5 + 2000 out * $25 per MTok = $0.055 — attributed via the
-  // register-time heuristic or the query-time ±120s window (either path
-  // must land it on the seat row, not the unattributed bucket)
+  // 1000 in * $5 + 2000 out * $25 per MTok = $0.055 — attributed via the seat's
+  // registered session_id, resolved into the ledger by the background indexer
   expect(out).toMatch(/builder.*\$0\.0[5-6]/);
   expect(out).not.toContain("unattributed");
 });

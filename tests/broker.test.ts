@@ -8,6 +8,8 @@ import { test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { projectDirName, attributeSeatsToSessions } from "../src/costs.ts";
+import { seatMarker } from "../shared/types.ts";
 
 const PORT = 17900;
 const URL_BASE = `http://127.0.0.1:${PORT}`;
@@ -26,17 +28,31 @@ async function post(path: string, body: unknown, token = TOKEN) {
   });
 }
 
+type CostsBody = { rows: Array<{ seat_id: string | null; session_id: string; input: number; output: number; cost_usd: number }>; total_usd: number };
+
+// /costs is served from a ledger the broker fills on a background tick, so a
+// just-written fixture appears within a tick or two — poll instead of racing it.
+async function pollCosts(reqBody: unknown, until: (c: CostsBody) => boolean, tries = 60): Promise<CostsBody> {
+  let last: CostsBody = { rows: [], total_usd: 0 };
+  for (let i = 0; i < tries; i++) {
+    last = (await (await post("/costs", reqBody)).json()) as CostsBody;
+    if (until(last)) return last;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return last;
+}
+
 beforeAll(async () => {
   // fixture projects tree: one opus session + one subagent transcript
   const projDir = join(PROJECTS_ROOT, "-tmp-projA", "sessA", "subagents");
   mkdirSync(projDir, { recursive: true });
   writeFileSync(
     join(PROJECTS_ROOT, "-tmp-projA", "sessA.jsonl"),
-    JSON.stringify({ type: "assistant", sessionId: "sessA", timestamp: "2026-07-08T10:00:00Z", message: { id: "m1", model: "claude-opus-4-8", usage: { input_tokens: 1000, output_tokens: 2000 } } })
+    JSON.stringify({ type: "assistant", sessionId: "sessA", timestamp: "2026-07-08T10:00:00Z", message: { id: "m1", model: "claude-opus-4-8", usage: { input_tokens: 1000, output_tokens: 2000 } } }) + "\n"
   );
   writeFileSync(
     join(projDir, "agent-1.jsonl"),
-    JSON.stringify({ type: "assistant", sessionId: "subX", timestamp: "2026-07-08T10:10:00Z", message: { id: "s1", model: "claude-sonnet-5", usage: { input_tokens: 4000, output_tokens: 1000 } } })
+    JSON.stringify({ type: "assistant", sessionId: "subX", timestamp: "2026-07-08T10:10:00Z", message: { id: "s1", model: "claude-sonnet-5", usage: { input_tokens: 4000, output_tokens: 1000 } } }) + "\n"
   );
 
   broker = Bun.spawn(["bun", new URL("../src/broker.ts", import.meta.url).pathname], {
@@ -46,6 +62,7 @@ beforeAll(async () => {
       CLAUDE_PATROL_DB: join(dir, "test.db"),
       CLAUDE_PATROL_SECRET_FILE: SECRET_FILE,
       CLAUDE_PATROL_PROJECTS_ROOT: PROJECTS_ROOT,
+      CLAUDE_PATROL_INDEX_INTERVAL_MS: "80", // /costs reads a background ledger; keep ticks fast for tests
     },
     stdio: ["ignore", "ignore", "inherit"],
   });
@@ -142,16 +159,15 @@ test("/costs is auth-gated and attributes via a registered session_id", async ()
   });
   const seatId = ((await reg.json()) as { id: string }).id;
 
-  const res = await post("/costs", { since: "2000-01-01T00:00:00Z" });
-  expect(res.status).toBe(200);
-  const { rows, total_usd } = (await res.json()) as {
-    rows: Array<{ seat_id: string | null; session_id: string; cost_usd: number }>;
-    total_usd: number;
-  };
+  const { rows, total_usd } = await pollCosts(
+    { since: "2000-01-01T00:00:00Z" },
+    (c) => c.rows.some((r) => r.session_id === "sessA")
+  );
   // opus session 0.055 + sonnet subagent 0.027 = 0.082 (subagents counted)
   expect(total_usd).toBeCloseTo(0.082, 4);
   expect(rows.find((r) => r.session_id === "sessA")!.seat_id).toBe(seatId);
-  expect(rows.find((r) => r.session_id === "subX")!.seat_id).toBeNull();
+  // subX lives under sessA/subagents/ → rolls up to sessA's seat (v0.2)
+  expect(rows.find((r) => r.session_id === "subX")!.seat_id).toBe(seatId);
 });
 
 test("unregister by pid deregisters the seat (SessionEnd hook path)", async () => {
@@ -221,10 +237,124 @@ test("query-time attribution: a seat registered before its jsonl exists still at
   mkdirSync(lateDir, { recursive: true });
   writeFileSync(
     join(lateDir, "sessLate.jsonl"),
-    JSON.stringify({ type: "assistant", sessionId: "sessLate", timestamp: new Date().toISOString(), message: { id: "L1", model: "claude-opus-4-8", usage: { input_tokens: 1000, output_tokens: 1000 } } })
+    JSON.stringify({ type: "assistant", sessionId: "sessLate", timestamp: new Date().toISOString(), message: { id: "L1", model: "claude-opus-4-8", usage: { input_tokens: 1000, output_tokens: 1000 } } }) + "\n"
   );
 
-  const res = await post("/costs", { since: "2000-01-01T00:00:00Z" });
-  const { rows } = (await res.json()) as { rows: Array<{ seat_id: string | null; session_id: string }> };
+  const { rows } = await pollCosts(
+    { since: "2000-01-01T00:00:00Z" },
+    (c) => c.rows.some((r) => r.session_id === "sessLate" && r.seat_id === id)
+  );
   expect(rows.find((r) => r.session_id === "sessLate")!.seat_id).toBe(id);
+});
+
+// Helper: a project dir under PROJECTS_ROOT for a given cwd, with the session
+// log carrying its seat marker + one assistant usage record.
+function seatLog(cwd: string, sessionId: string, token: string, tokens: { i: number; o: number }, model = "claude-opus-4-8") {
+  const projDir = join(PROJECTS_ROOT, projectDirName(cwd));
+  mkdirSync(projDir, { recursive: true });
+  writeFileSync(
+    join(projDir, `${sessionId}.jsonl`),
+    JSON.stringify({ type: "user", sessionId, message: { role: "user", content: `briefing ${seatMarker(token)}` } }) +
+      "\n" +
+      JSON.stringify({
+        type: "assistant",
+        sessionId,
+        timestamp: new Date().toISOString(),
+        message: { id: `${sessionId}-a1`, model, usage: { input_tokens: tokens.i, output_tokens: tokens.o } },
+      }) +
+      "\n"
+  );
+}
+
+test("PROOF #2: two seats in one cwd, distinct tokens → each gets ITS spend (Layer 1; old heuristic can't)", async () => {
+  const CWD = "/tmp/ms-samecwd";
+  const T1 = "cp-11110000";
+  const T2 = "cp-22220000";
+  // two sessions in the SAME project dir, each log containing only its own token
+  seatLog(CWD, "ms-sess-1", T1, { i: 1000, o: 0 }); // 1000 in * $5/MTok = $0.005
+  seatLog(CWD, "ms-sess-2", T2, { i: 2000, o: 0 }); // 2000 in * $5/MTok = $0.010
+
+  // The OLD attribution (Layer 3) collapses here: two same-cwd seats, no
+  // session_id, both see BOTH logs → ambiguous → binds NEITHER. This is the
+  // exact dark case v0.2 fixes; assert it fails so the proof is meaningful.
+  const nowIso = new Date().toISOString();
+  const oldMap = attributeSeatsToSessions({
+    projectsRoot: PROJECTS_ROOT,
+    seats: [
+      { id: "sA", cwd: CWD, session_id: null, registered_at: nowIso },
+      { id: "sB", cwd: CWD, session_id: null, registered_at: nowIso },
+    ],
+  });
+  expect(oldMap.size).toBe(0); // old path attributes nothing
+
+  // Register two seats (distinct live pids, distinct tokens), no session_id —
+  // resolution must come from the token content match alone.
+  const regA = await post("/register", { pid: process.pid, cwd: CWD, git_root: null, tty: null, summary: "A", role: null, model: null, seat_token: T1 });
+  const seatA = ((await regA.json()) as { id: string }).id;
+  const regB = await post("/register", { pid: broker.pid, cwd: CWD, git_root: null, tty: null, summary: "B", role: null, model: null, seat_token: T2 });
+  const seatB = ((await regB.json()) as { id: string }).id;
+
+  const { rows } = await pollCosts(
+    { since: "2000-01-01T00:00:00Z" },
+    (c) => {
+      const r1 = c.rows.find((r) => r.session_id === "ms-sess-1");
+      const r2 = c.rows.find((r) => r.session_id === "ms-sess-2");
+      return !!r1 && !!r2 && r1.seat_id !== null && r2.seat_id !== null;
+    }
+  );
+  const r1 = rows.find((r) => r.session_id === "ms-sess-1")!;
+  const r2 = rows.find((r) => r.session_id === "ms-sess-2")!;
+  expect(r1.seat_id).toBe(seatA); // seat A's token → sess-1, not swapped
+  expect(r2.seat_id).toBe(seatB); // seat B's token → sess-2, not swapped
+  expect(r1.cost_usd).toBeCloseTo(0.005, 4);
+  expect(r2.cost_usd).toBeCloseTo(0.01, 4);
+});
+
+test("PROOF #3: a killed seat's spend still attributes via seat_runs.ended_at (history survives)", async () => {
+  const CWD = "/tmp/ms-persist";
+  const TOK = "cp-33330000";
+  seatLog(CWD, "ms-persist-1", TOK, { i: 4000, o: 0 }); // $0.020
+
+  const reg = await post("/register", { pid: broker.pid, cwd: CWD, git_root: null, tty: null, summary: "P", role: null, model: null, seat_token: TOK });
+  const seatP = ((await reg.json()) as { id: string }).id;
+
+  // wait for the token→session binding to land, THEN kill the seat
+  await pollCosts({ since: "2000-01-01T00:00:00Z" }, (c) => c.rows.some((r) => r.session_id === "ms-persist-1" && r.seat_id === seatP));
+  await post("/unregister", { id: seatP });
+
+  // /costs with `since` BEFORE the seat ever registered still attributes it —
+  // the binding lives in seat_runs (ended_at set), not the deleted live seat.
+  const { rows } = await pollCosts(
+    { since: "2000-01-01T00:00:00Z" },
+    (c) => c.rows.some((r) => r.session_id === "ms-persist-1")
+  );
+  expect(rows.find((r) => r.session_id === "ms-persist-1")!.seat_id).toBe(seatP);
+});
+
+test("indexer incremental resume: appended records add once; a rewrite/truncate reparses", async () => {
+  const CWD = "/tmp/ms-resume";
+  const projDir = join(PROJECTS_ROOT, projectDirName(CWD));
+  mkdirSync(projDir, { recursive: true });
+  const file = join(projDir, "ms-resume-1.jsonl");
+  const a = (id: string, i: number) =>
+    JSON.stringify({ type: "assistant", sessionId: "ms-resume-1", timestamp: new Date().toISOString(), message: { id, model: "claude-opus-4-8", usage: { input_tokens: i, output_tokens: 0 } } }) + "\n";
+
+  // register a seat here so the dir is indexed
+  await post("/register", { pid: broker.pid, cwd: CWD, git_root: null, tty: null, summary: "R", role: null, model: null });
+
+  writeFileSync(file, a("r1", 1000));
+  const win = { since: "2000-01-01T00:00:00Z" };
+  const sess = (c: CostsBody) => c.rows.find((r) => r.session_id === "ms-resume-1");
+  let got = await pollCosts(win, (c) => (sess(c)?.cost_usd ?? 0) >= 0.005);
+  expect(sess(got)!.input).toBe(1000);
+
+  // append a NEW record → only the delta lands (no double count of r1)
+  writeFileSync(file, a("r1", 1000) + a("r2", 500));
+  got = await pollCosts(win, (c) => (sess(c)?.input ?? 0) === 1500);
+  expect(sess(got)!.input).toBe(1500); // 1000 + 500, r1 not re-counted
+
+  // rewrite smaller (truncate) → file's contribution is reset to the new content
+  writeFileSync(file, a("r3", 200));
+  got = await pollCosts(win, (c) => (sess(c)?.input ?? 0) === 200);
+  expect(sess(got)!.input).toBe(200); // stale 1500 wiped, only r3 remains
 });

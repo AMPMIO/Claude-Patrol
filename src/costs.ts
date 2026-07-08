@@ -23,8 +23,15 @@ export function priceFor(model: string | null): [number, number, number, number]
 }
 
 // A path is included if it matches either the flat session log or a nested
-// subagent transcript. Returns [absPath, projectDirName] pairs.
-function* sessionFiles(root: string): Generator<[string, string]> {
+// subagent transcript. Yields [absPath, projectDirName, parentSessionId] where
+// parentSessionId is the <session> dir a subagents/ folder sits under (so its
+// spend can roll up to the parent seat) and null for a flat session log. Pass
+// projFilter to restrict the walk to specific project dirs (the broker's
+// incremental indexer scopes to fleet-relevant dirs; undefined = all projects).
+export function* sessionFiles(
+  root: string,
+  projFilter?: Set<string>
+): Generator<[string, string, string | null]> {
   let projects: string[];
   try {
     projects = readdirSync(root);
@@ -32,6 +39,7 @@ function* sessionFiles(root: string): Generator<[string, string]> {
     return; // no projects dir yet
   }
   for (const proj of projects) {
+    if (projFilter && !projFilter.has(proj)) continue;
     const projDir = join(root, proj);
     let entries: string[];
     try {
@@ -42,7 +50,7 @@ function* sessionFiles(root: string): Generator<[string, string]> {
     for (const entry of entries) {
       // flat: <root>/<proj>/<session>.jsonl
       if (entry.endsWith(".jsonl")) {
-        yield [join(projDir, entry), proj];
+        yield [join(projDir, entry), proj, null];
         continue;
       }
       // nested: <root>/<proj>/<session>/subagents/agent-*.jsonl
@@ -54,14 +62,57 @@ function* sessionFiles(root: string): Generator<[string, string]> {
         continue; // not a session dir with subagents
       }
       for (const s of subs) {
-        if (s.endsWith(".jsonl")) yield [join(subDir, s), proj];
+        if (s.endsWith(".jsonl")) yield [join(subDir, s), proj, entry];
       }
     }
   }
 }
 
+// One assistant-usage record extracted from a jsonl line. The SINGLE source of
+// truth for "what counts as billable usage": both computeCosts (the pure
+// reference impl) and the broker's incremental indexer parse lines through
+// here, so their token accounting can never drift.
+export interface UsageDelta {
+  sessionId: string;
+  msgId: string | undefined; // absent id => never deduped (matches computeCosts)
+  model: string;
+  tsMs: number | null;
+  input: number;
+  output: number;
+  cache_write: number;
+  cache_read: number;
+}
+
+// Parse ONE jsonl line to a UsageDelta, or null when the line is blank,
+// malformed, non-assistant, or carries no usage block. Time-window filtering,
+// dedupe, and attribution are the caller's job — this only decodes.
+export function parseUsageLine(line: string): UsageDelta | null {
+  if (!line) return null;
+  let d: any;
+  try {
+    d = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (d.type !== "assistant") return null;
+  const msg = d.message ?? {};
+  const u = msg.usage;
+  if (!u) return null;
+  return {
+    sessionId: d.sessionId ?? "?",
+    msgId: msg.id,
+    model: msg.model ?? "?",
+    tsMs: d.timestamp ? Date.parse(d.timestamp) : null,
+    input: u.input_tokens ?? 0,
+    output: u.output_tokens ?? 0,
+    cache_write: u.cache_creation_input_tokens ?? 0,
+    cache_read: u.cache_read_input_tokens ?? 0,
+  };
+}
+
 interface Tally {
-  session_id: string;
+  session_id: string; // the record's OWN session (kept for display: subagent rows stay visible)
+  attr_session_id: string; // parent for subagents, else own; drives seat_id lookup + scoping
   model: string;
   input: number;
   output: number;
@@ -86,7 +137,7 @@ export function computeCosts(opts: ComputeCostsOptions = {}): CostsResponse {
   const tally = new Map<string, Tally>(); // key: sessionId\0model
   const seen = new Set<string>(); // (sessionId, message id) — resume-rewrite guard
 
-  for (const [file, proj] of sessionFiles(root)) {
+  for (const [file, proj, parentSessionId] of sessionFiles(root)) {
     let text: string;
     try {
       text = readFileSync(file, "utf8");
@@ -94,45 +145,40 @@ export function computeCosts(opts: ComputeCostsOptions = {}): CostsResponse {
       continue;
     }
     for (const line of text.split("\n")) {
-      if (!line) continue;
-      let d: any;
-      try {
-        d = JSON.parse(line);
-      } catch {
-        continue;
+      const rec = parseUsageLine(line);
+      if (!rec) continue;
+      if (rec.tsMs !== null) {
+        if (since !== null && rec.tsMs < since) continue;
+        if (until !== null && rec.tsMs > until) continue;
       }
-      if (d.type !== "assistant") continue;
-      const ts = d.timestamp ? Date.parse(d.timestamp) : null;
-      if (ts !== null) {
-        if (since !== null && ts < since) continue;
-        if (until !== null && ts > until) continue;
-      }
-      const msg = d.message ?? {};
-      const u = msg.usage;
-      if (!u) continue;
 
-      const sessionId: string = d.sessionId ?? "?";
-      const msgId = msg.id;
-      const dedupeKey = `${sessionId}\0${msgId}`;
-      if (msgId && seen.has(dedupeKey)) continue;
-      seen.add(dedupeKey);
+      // A subagent record rolls up to its parent session for attribution and
+      // scoping, but keeps its OWN session_id as the displayed row so the
+      // per-model breakdown (e.g. a sonnet executor) stays visible.
+      const ownSessionId = rec.sessionId;
+      const attrSessionId = parentSessionId ?? ownSessionId;
+
+      // Dedupe on (ownSessionId, msgId): resume rewrites re-emit prior lines,
+      // and subagent msg ids are distinct from the parent's.
+      const dedupeKey = `${ownSessionId}\0${rec.msgId}`;
+      if (rec.msgId && seen.has(dedupeKey)) continue;
+      if (rec.msgId) seen.add(dedupeKey);
 
       // project scoping: exact-attributed sessions always count; otherwise
       // include only if the seat fleet has a seat in this project dir.
-      const attributed = seatSessions.has(sessionId);
+      const attributed = seatSessions.has(attrSessionId);
       if (!attributed && opts.projects && !opts.projects.has(proj)) continue;
 
-      const model: string = msg.model ?? "?";
-      const key = `${sessionId}\0${model}`;
+      const key = `${ownSessionId}\0${rec.model}`;
       let t = tally.get(key);
       if (!t) {
-        t = { session_id: sessionId, model, input: 0, output: 0, cache_write: 0, cache_read: 0 };
+        t = { session_id: ownSessionId, attr_session_id: attrSessionId, model: rec.model, input: 0, output: 0, cache_write: 0, cache_read: 0 };
         tally.set(key, t);
       }
-      t.input += u.input_tokens ?? 0;
-      t.output += u.output_tokens ?? 0;
-      t.cache_write += u.cache_creation_input_tokens ?? 0;
-      t.cache_read += u.cache_read_input_tokens ?? 0;
+      t.input += rec.input;
+      t.output += rec.output;
+      t.cache_write += rec.cache_write;
+      t.cache_read += rec.cache_read;
     }
   }
 
@@ -143,7 +189,7 @@ export function computeCosts(opts: ComputeCostsOptions = {}): CostsResponse {
     const cost = (t.input * pi + t.output * po + t.cache_write * pcw + t.cache_read * pcr) / 1e6;
     total += cost;
     rows.push({
-      seat_id: seatSessions.get(t.session_id) ?? null,
+      seat_id: seatSessions.get(t.attr_session_id) ?? null,
       session_id: t.session_id,
       model: t.model,
       input: t.input,
@@ -154,6 +200,87 @@ export function computeCosts(opts: ComputeCostsOptions = {}): CostsResponse {
     });
   }
   return { rows, total_usd: Math.round(total * 1e4) / 1e4 };
+}
+
+// Incremental single-file parser for the broker's background indexer. Reads the
+// byte range [fromByte, size) and returns the COMPLETE lines' usage records plus
+// a cursor at the last newline consumed. A trailing segment past the last
+// newline is left unconsumed so the next tick re-reads it whole — this defers
+// a record still being flushed, and is safe because real CC logs terminate
+// every record (including the last) with "\n" (verified), so a complete record
+// is never stranded. This is why the cursor advances by bytes, not by parsed
+// records. Truncation (size < fromByte) is the caller's to detect; it then
+// passes fromByte=0.
+export function parseFileTail(
+  file: string,
+  fromByte: number
+): { records: UsageDelta[]; bytesParsed: number; size: number } {
+  let size: number;
+  try {
+    size = statSync(file).size;
+  } catch {
+    return { records: [], bytesParsed: fromByte, size: 0 };
+  }
+  const start = Math.min(Math.max(fromByte, 0), size);
+  if (start >= size) return { records: [], bytesParsed: start, size };
+  let fd: number;
+  try {
+    fd = openSync(file, "r");
+  } catch {
+    return { records: [], bytesParsed: start, size };
+  }
+  try {
+    const len = size - start;
+    const buf = Buffer.alloc(len);
+    let read = 0;
+    while (read < len) {
+      const n = readSync(fd, buf, read, len - read, start + read);
+      if (n <= 0) break;
+      read += n;
+    }
+    const slice = buf.subarray(0, read);
+    const lastNl = slice.lastIndexOf(0x0a); // byte offset — must not use string length (UTF-8 multibyte)
+    if (lastNl < 0) return { records: [], bytesParsed: start, size }; // no complete line yet
+    const records: UsageDelta[] = [];
+    for (const line of slice.subarray(0, lastNl + 1).toString("utf8").split("\n")) {
+      const rec = parseUsageLine(line);
+      if (rec) records.push(rec);
+    }
+    return { records, bytesParsed: start + lastNl + 1, size };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+// Layer 1 (PRIMARY) attribution: resolve a launcher-issued seat token to its
+// session by content-matching the marker the launcher injected into the launch
+// prompt. Substring scan over the seat's project-dir session logs (ANY record
+// type — the spike showed the marker lands in user AND last-prompt/queue
+// records), NOT mtime — this is what makes N seats in one cwd separable, the
+// case the window heuristic collapses on. Returns the session id (the .jsonl
+// filename stem) ONLY when EXACTLY one log contains the token: zero => not
+// written yet (retry next tick), several => ambiguous (leave unbound). Scans
+// only top-level logs; the marker rides the main prompt, not subagent files.
+export function resolveTokenToSession(opts: { cwd: string; projectsRoot: string; token: string }): string | null {
+  const dir = join(opts.projectsRoot, projectDirName(opts.cwd));
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return null; // no project dir yet
+  }
+  const hits: string[] = [];
+  for (const e of entries) {
+    if (!e.endsWith(".jsonl")) continue;
+    let text: string;
+    try {
+      text = readFileSync(join(dir, e), "utf8");
+    } catch {
+      continue;
+    }
+    if (text.includes(opts.token)) hits.push(e.slice(0, -".jsonl".length));
+  }
+  return hits.length === 1 ? hits[0]! : null;
 }
 
 // Best-effort seat -> session-id mapping at register time. Looks in the seat's

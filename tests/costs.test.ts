@@ -8,8 +8,8 @@ import { test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { computeCosts, priceFor, projectDirName, findSessionIdByHeuristic, attributeSeatsToSessions } from "../src/costs.ts";
-import { PRICES, DEFAULT_PRICE } from "../shared/types.ts";
+import { computeCosts, priceFor, projectDirName, findSessionIdByHeuristic, attributeSeatsToSessions, resolveTokenToSession, parseFileTail } from "../src/costs.ts";
+import { PRICES, DEFAULT_PRICE, seatMarker } from "../shared/types.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "patrol-costs-"));
 const ROOT = join(dir, "projects");
@@ -78,25 +78,43 @@ test("excludes messages outside the time window", () => {
   expect(opus.input).toBe(1500); // m3 (9999, next day) excluded
 });
 
-test("attributes exact via seatSessions, else null", () => {
+test("attributes exact via seatSessions; a subagent rolls up to its parent's seat", () => {
   const { rows } = computeCosts({
     projectsRoot: ROOT,
     ...WINDOW,
     seatSessions: new Map([["sessA", "seat1"]]),
   });
   expect(rows.find((r) => r.session_id === "sessA")!.seat_id).toBe("seat1");
-  expect(rows.find((r) => r.session_id === "subX")!.seat_id).toBeNull(); // unmapped
+  // subX lives under sessA/subagents/ → its spend attributes to sessA's seat,
+  // while its own sonnet row stays visible (v0.2 subagent rollup)
+  expect(rows.find((r) => r.session_id === "subX")!.seat_id).toBe("seat1");
 });
 
-test("project filter scopes unattributed rows but never drops exact-attributed ones", () => {
-  const { rows } = computeCosts({
+test("unmapped sessions attribute to null", () => {
+  const { rows } = computeCosts({ projectsRoot: ROOT, ...WINDOW });
+  expect(rows.find((r) => r.session_id === "sessA")!.seat_id).toBeNull();
+  expect(rows.find((r) => r.session_id === "subX")!.seat_id).toBeNull();
+});
+
+test("project filter scopes unattributed rows but never drops attributed ones (incl. rolled-up subagents)", () => {
+  // nothing mapped → both rows unattributed; a foreign project filter drops them
+  const dropped = computeCosts({
+    projectsRoot: ROOT,
+    ...WINDOW,
+    projects: new Set(["-some-other-project"]), // excludes PROJ
+  });
+  expect(dropped.rows.find((r) => r.session_id === "sessA")).toBeUndefined();
+  expect(dropped.rows.find((r) => r.session_id === "subX")).toBeUndefined();
+
+  // sessA mapped → sessA AND its subagent subX (rolled up to sessA) both survive
+  const kept = computeCosts({
     projectsRoot: ROOT,
     ...WINDOW,
     seatSessions: new Map([["sessA", "seat1"]]),
-    projects: new Set(["-some-other-project"]), // excludes PROJ
+    projects: new Set(["-some-other-project"]),
   });
-  expect(rows.find((r) => r.session_id === "sessA")).toBeDefined(); // exact-attributed survives
-  expect(rows.find((r) => r.session_id === "subX")).toBeUndefined(); // unattributed + out of filter -> dropped
+  expect(kept.rows.find((r) => r.session_id === "sessA")).toBeDefined();
+  expect(kept.rows.find((r) => r.session_id === "subX")).toBeDefined();
 });
 
 test("priceFor: substring match, else default", () => {
@@ -193,5 +211,74 @@ test("attributeSeatsToSessions: a session two seats both match is dropped (cross
     ],
   });
   expect(map.has("shared")).toBe(false); // claimed by 2 seats -> unattributed, never misattributed
+  rmSync(d, { recursive: true, force: true });
+});
+
+// --- Layer 1: token -> session resolution (the same-cwd fix) ---
+
+function tokenFixture(cwd: string, files: Array<[name: string, contains: string]>): string {
+  const d = mkdtempSync(join(tmpdir(), "patrol-tok-"));
+  const projDir = join(d, projectDirName(cwd));
+  mkdirSync(projDir, { recursive: true });
+  for (const [name, contains] of files) {
+    writeFileSync(join(projDir, name), jl({ type: "user", message: { role: "user", content: contains } }) + "\n");
+  }
+  return d;
+}
+
+test("resolveTokenToSession: two same-cwd logs, distinct tokens, each resolves exactly (never swapped)", () => {
+  const t1 = "cp-0375a012";
+  const t2 = "cp-deadbeef";
+  const d = tokenFixture("/tmp/samecwd", [
+    ["sess-1111.jsonl", `hi ${seatMarker(t1)} go`],
+    ["sess-2222.jsonl", `yo ${seatMarker(t2)} run`],
+  ]);
+  expect(resolveTokenToSession({ cwd: "/tmp/samecwd", projectsRoot: d, token: t1 })).toBe("sess-1111");
+  expect(resolveTokenToSession({ cwd: "/tmp/samecwd", projectsRoot: d, token: t2 })).toBe("sess-2222");
+  rmSync(d, { recursive: true, force: true });
+});
+
+test("resolveTokenToSession: token in neither file -> null (not written yet)", () => {
+  const d = tokenFixture("/tmp/none", [["a.jsonl", "no marker here"], ["b.jsonl", "nor here"]]);
+  expect(resolveTokenToSession({ cwd: "/tmp/none", projectsRoot: d, token: "cp-00000000" })).toBeNull();
+  rmSync(d, { recursive: true, force: true });
+});
+
+test("resolveTokenToSession: token in more than one file -> null (ambiguous, never guess)", () => {
+  const t = "cp-abcabc12";
+  const d = tokenFixture("/tmp/dup", [["a.jsonl", seatMarker(t)], ["b.jsonl", seatMarker(t)]]);
+  expect(resolveTokenToSession({ cwd: "/tmp/dup", projectsRoot: d, token: t })).toBeNull();
+  rmSync(d, { recursive: true, force: true });
+});
+
+// --- incremental single-file parser (byte cursor) ---
+
+test("parseFileTail: resumes from the cursor so only appended records land", () => {
+  const d = mkdtempSync(join(tmpdir(), "patrol-tail-"));
+  const f = join(d, "s.jsonl");
+  const rec = (id: string, i: number) =>
+    jl({ type: "assistant", sessionId: "s", timestamp: "2026-07-08T10:00:00Z", message: { id, model: "claude-opus-4-8", usage: { input_tokens: i, output_tokens: 0 } } }) + "\n";
+
+  writeFileSync(f, rec("m1", 100) + rec("m2", 200));
+  const first = parseFileTail(f, 0);
+  expect(first.records.map((r) => r.msgId)).toEqual(["m1", "m2"]);
+  expect(first.bytesParsed).toBe(first.size); // consumed to EOF (trailing newline)
+
+  // append a third record; parsing from the saved cursor yields ONLY the delta
+  writeFileSync(f, rec("m1", 100) + rec("m2", 200) + rec("m3", 300));
+  const second = parseFileTail(f, first.bytesParsed);
+  expect(second.records.map((r) => r.msgId)).toEqual(["m3"]);
+  expect(second.bytesParsed).toBe(second.size);
+  rmSync(d, { recursive: true, force: true });
+});
+
+test("parseFileTail: a partial final line (mid-write) is not consumed until it completes", () => {
+  const d = mkdtempSync(join(tmpdir(), "patrol-tail2-"));
+  const f = join(d, "s.jsonl");
+  const full = jl({ type: "assistant", sessionId: "s", timestamp: "2026-07-08T10:00:00Z", message: { id: "m1", model: "claude-opus-4-8", usage: { input_tokens: 10, output_tokens: 0 } } }) + "\n";
+  writeFileSync(f, full + '{"type":"assistant","partial'); // no trailing newline on line 2
+  const r = parseFileTail(f, 0);
+  expect(r.records.map((x) => x.msgId)).toEqual(["m1"]); // only the complete line
+  expect(r.bytesParsed).toBe(Buffer.byteLength(full)); // cursor stops at the last newline
   rmSync(d, { recursive: true, force: true });
 });
