@@ -393,8 +393,8 @@ function handleUnregister(body: UnregisterRequest): void {
 // what CC hands it. Bind the session to the live run whose claude pid matches
 // (seats.pid is now the claude pid — see seat-server), else the newest still-
 // unbound live run in the same cwd. Idempotent: re-binding the same value or a
-// run that already has a session is a no-op. Safe to ship unused (kill criterion
-// in types.ts) — nothing calls it until the hook lands in a later package.
+// run that already has a session is a no-op. Called by plugin/hooks/reg-session.ts
+// (SessionStart), which posts CC's session_id + transcript_path for the seat.
 function handleObserveSession(body: ObserveSessionRequest): { ok: boolean } {
   if (!body.session_id) return { ok: false };
   // COALESCE keeps an already-set bound_via (a prior layer's binding wins the
@@ -718,6 +718,21 @@ function indexFile(file: string, parentSessionId: string | null) {
   })();
 }
 
+// Bound the token re-scan (perf). A run whose launch marker never lands (a
+// silent seat, or a marker that never reached the log) would otherwise re-scan
+// its whole project dir on every tick forever. Two bounds: (1) a per-run cache of
+// unchanged non-matching files so only new/changed files are re-read, and (2) a
+// cap on unsuccessful scans, after which the TOKEN scan is abandoned. Only the
+// marker scan gives up — Layer-2 observe (reg-session SessionStart) can still bind
+// the run later. ~40 ticks ≈ 8 min at the production cadence; env-overridable.
+const TOKEN_SCAN_CAP = parseInt(process.env.CLAUDE_PATROL_TOKEN_SCAN_CAP ?? "40", 10);
+interface RunScan {
+  misses: Map<string, { size: number; mtimeMs: number }>; // files read and found NOT to contain the token
+  attempts: number; // count of scans that found no match (the abandonment counter)
+  abandoned: boolean;
+}
+const runScans = new Map<number, RunScan>(); // run_id -> scan state; pruned when a run leaves pending
+
 // Resolve runs still missing a session_id. Launcher seats (have a token) bind
 // ONLY via Layer-1 content match — never the heuristic, which can't separate
 // same-cwd seats; manual seats (no token) fall to Layer-3. Cross-run uniqueness:
@@ -726,23 +741,48 @@ function resolvePendingRuns() {
   const pending = db.query(
     "SELECT run_id, seat_token, cwd, registered_at FROM seat_runs WHERE session_id IS NULL AND ended_at IS NULL"
   ).all() as { run_id: number; seat_token: string | null; cwd: string; registered_at: string }[];
+
+  // A run leaves `pending` once bound (elsewhere, e.g. observe) or ended; drop its
+  // scan state so these caches can't grow unbounded over a long-lived broker.
+  const pendingIds = new Set(pending.map((r) => r.run_id));
+  for (const id of runScans.keys()) if (!pendingIds.has(id)) runScans.delete(id);
+
   for (const run of pending) {
     let sid: string | null = null;
     // The branch taken IS the attribution layer: token content-match (Layer 1)
     // vs the mtime heuristic (Layer 3).
     const via: BoundVia = run.seat_token ? "token" : "heuristic";
     if (run.seat_token) {
-      sid = resolveTokenToSession({ cwd: run.cwd, projectsRoot: ROOT, token: run.seat_token });
+      let scan = runScans.get(run.run_id);
+      if (!scan) {
+        scan = { misses: new Map(), attempts: 0, abandoned: false };
+        runScans.set(run.run_id, scan);
+      }
+      if (scan.abandoned) continue; // token scan given up — observe (Layer 2) can still bind this run
+      sid = resolveTokenToSession({ cwd: run.cwd, projectsRoot: ROOT, token: run.seat_token }, scan.misses);
+      if (!sid) {
+        scan.attempts++;
+        if (scan.attempts >= TOKEN_SCAN_CAP) {
+          scan.abandoned = true;
+          scan.misses.clear(); // won't scan again — free the cache
+          log(
+            `run ${run.run_id} token unresolved after ${scan.attempts} scans ` +
+              `(~${Math.round((scan.attempts * INDEX_INTERVAL_MS) / 1000)}s); abandoning token scan (observe can still bind)`
+          );
+        }
+        continue;
+      }
     } else {
       sid = findSessionIdByHeuristic({ cwd: run.cwd, projectsRoot: ROOT, nowMs: Date.now() });
+      if (!sid) continue;
     }
-    if (!sid) continue;
     const owner = db.query("SELECT run_id FROM seat_runs WHERE session_id = ? AND run_id != ?").get(sid, run.run_id) as { run_id: number } | null;
     if (owner) {
       log(`token/heuristic resolved run ${run.run_id} to ${sid} but it is already owned — left unbound`);
       continue;
     }
     db.run("UPDATE seat_runs SET session_id = ?, bound_via = ? WHERE run_id = ?", [sid, via, run.run_id]);
+    runScans.delete(run.run_id); // bound — drop scan state
   }
 }
 
