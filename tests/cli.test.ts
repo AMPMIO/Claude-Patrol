@@ -57,9 +57,9 @@ beforeAll(async () => {
       if (url.pathname === "/health") return new Response("ok");
       if (req.headers.get("x-patrol-token") !== TOKEN) return new Response("unauthorized", { status: 401 });
       const body = await req.json().catch(() => ({}));
-      if (url.pathname === "/list") return Response.json(SEATS);
+      if (url.pathname === "/list-seats") return Response.json(SEATS);
       if (url.pathname === "/costs") return Response.json(COSTS);
-      if (url.pathname === "/send") {
+      if (url.pathname === "/send-message") {
         lastSend = body;
         return Response.json({ ok: true });
       }

@@ -10,7 +10,7 @@ export default async function list(args: string[]): Promise<number> {
     arg && (SCOPES as readonly string[]).includes(arg) ? (arg as ListSeatsRequest["scope"]) : "machine";
   try {
     const cwd = process.cwd();
-    const seats = await brokerPost<Seat[]>("/list", { scope, cwd, git_root: gitRoot(cwd) });
+    const seats = await brokerPost<Seat[]>("/list-seats", { scope, cwd, git_root: gitRoot(cwd) });
     if (seats.length === 0) {
       console.log("no seats.");
       return 0;

@@ -80,7 +80,7 @@ export default async function doctor(_args: string[]): Promise<number> {
   // 7. stale seats (registered but PID dead)
   if (up) {
     try {
-      const seats = await brokerPost<Seat[]>("/list", { scope: "machine", cwd: process.cwd(), git_root: null });
+      const seats = await brokerPost<Seat[]>("/list-seats", { scope: "machine", cwd: process.cwd(), git_root: null });
       const stale = seats.filter((s) => !pidAlive(s.pid));
       if (stale.length === 0) line("PASS", `${seats.length} seat(s), none stale`);
       else {

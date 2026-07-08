@@ -7,7 +7,7 @@ export default async function status(_args: string[]): Promise<number> {
   try {
     const cwd = process.cwd();
     const [seats, costs] = await Promise.all([
-      brokerPost<Seat[]>("/list", { scope: "machine", cwd, git_root: gitRoot(cwd) }),
+      brokerPost<Seat[]>("/list-seats", { scope: "machine", cwd, git_root: gitRoot(cwd) }),
       brokerPost<CostsResponse>("/costs", {}),
     ]);
 

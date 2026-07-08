@@ -11,7 +11,7 @@ export default async function send(args: string[]): Promise<number> {
   }
   try {
     const body: SendMessageRequest = { from_id: "cli", to_id: to, text };
-    await brokerPost<unknown>("/send", body);
+    await brokerPost<unknown>("/send-message", body);
     console.log(`sent to ${to}`);
     return 0;
   } catch (e) {
