@@ -12,7 +12,7 @@
  *   bun src/broker.ts
  */
 import { Database } from "bun:sqlite";
-import { statSync } from "node:fs";
+import { statSync, openSync, readSync, closeSync } from "node:fs";
 import { getSecret, TOKEN_HEADER } from "../shared/auth.ts";
 import {
   priceFor,
@@ -42,6 +42,9 @@ import type {
   SeatStats,
   BoundVia,
   Seat,
+  LogRequest,
+  LogResponse,
+  LogMessage,
 } from "../shared/types.ts";
 
 const PORT = parseInt(process.env.CLAUDE_PATROL_PORT ?? "7900", 10);
@@ -163,6 +166,17 @@ db.run(`
     mtime_ms INTEGER NOT NULL
   )
 `);
+// Additive: hash of the bytes just before the parse cursor. Lets the indexer
+// tell a plain append (anchor bytes intact -> tail parse) from an in-place
+// rewrite (anchor bytes changed -> full reparse) when a file changed without
+// shrinking. NULL for rows written before this column existed.
+for (const col of ["anchor_hash TEXT"]) {
+  try {
+    db.run(`ALTER TABLE session_index ADD COLUMN ${col}`);
+  } catch {
+    // column already exists
+  }
+}
 db.run(`
   CREATE TABLE IF NOT EXISTS seen_msgs (
     session_id TEXT NOT NULL,
@@ -197,20 +211,28 @@ function pidAlive(pid: number): boolean {
   }
 }
 
+// Fully retire a seat, whatever the trigger (stale sweep, lazy drop in
+// /list-seats, explicit /unregister). ONE definition so no removal path can
+// forget a step: bound the run FIRST (keeps the row + its token->session binding
+// for the /costs overlap join, so a killed seat's spend still attributes), then
+// purge its undelivered mail (a dead seat's queue can never drain — those rows
+// only bloat SQLite and orphan the run in every future stats window), then drop
+// the live row. Uses inline SQL, not the prepared statements below, because it
+// runs during module init (cleanStaleSeats) before those are declared.
+function endSeat(seatId: string) {
+  db.run("UPDATE seat_runs SET ended_at = ? WHERE seat_id = ? AND ended_at IS NULL", [
+    new Date().toISOString(),
+    seatId,
+  ]);
+  db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [seatId]);
+  db.run("DELETE FROM seats WHERE id = ?", [seatId]);
+}
+
 // Clean up seats whose PID is gone; cap delivered-message table growth.
 function cleanStaleSeats() {
   const seats = db.query("SELECT id, pid FROM seats").all() as { id: string; pid: number }[];
   for (const seat of seats) {
-    if (!pidAlive(seat.pid)) {
-      db.run("DELETE FROM seats WHERE id = ?", [seat.id]);
-      // A seat that died without a clean /unregister still gets its run bounded,
-      // so seat_runs.ended_at stays accurate for the /costs overlap join.
-      db.run("UPDATE seat_runs SET ended_at = ? WHERE seat_id = ? AND ended_at IS NULL", [
-        new Date().toISOString(),
-        seat.id,
-      ]);
-      db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [seat.id]);
-    }
+    if (!pidAlive(seat.pid)) endSeat(seat.id);
   }
   const cutoff = new Date(Date.now() - 7 * 86_400_000).toISOString();
   db.run("DELETE FROM messages WHERE delivered = 1 AND sent_at < ?", [cutoff]);
@@ -246,8 +268,8 @@ const upsertLedger = db.prepare(`
 `);
 const seenGet = db.prepare(`SELECT 1 FROM seen_msgs WHERE session_id = ? AND msg_id = ?`);
 const seenIns = db.prepare(`INSERT OR IGNORE INTO seen_msgs (session_id, msg_id) VALUES (?, ?)`);
-const idxGet = db.prepare(`SELECT bytes_parsed, mtime_ms FROM session_index WHERE file_path = ?`);
-const idxSet = db.prepare(`INSERT OR REPLACE INTO session_index (file_path, parent_session_id, bytes_parsed, mtime_ms) VALUES (?, ?, ?, ?)`);
+const idxGet = db.prepare(`SELECT bytes_parsed, mtime_ms, anchor_hash FROM session_index WHERE file_path = ?`);
+const idxSet = db.prepare(`INSERT OR REPLACE INTO session_index (file_path, parent_session_id, bytes_parsed, mtime_ms, anchor_hash) VALUES (?, ?, ?, ?, ?)`);
 const selectAllSeats = db.prepare(`SELECT * FROM seats`);
 const selectSeatsByDirectory = db.prepare(`SELECT * FROM seats WHERE cwd = ?`);
 const selectSeatsByGitRoot = db.prepare(`SELECT * FROM seats WHERE git_root = ?`);
@@ -263,6 +285,28 @@ const selectUndelivered = db.prepare(`
   ORDER BY m.sent_at ASC
 `);
 const markDelivered = db.prepare(`UPDATE messages SET delivered = 1 WHERE id = ?`);
+
+// Message history for `patrol watch` (/log). Sender AND recipient role/model come
+// from the LATEST seat_runs row per seat_id (runs persist past dereg, so a dead
+// seat still resolves; a "cli" from_id has no run and yields nulls). Delivered
+// and undelivered rows both included; ordered by id so a cursor (after_id) tails.
+const selectLog = db.prepare(`
+  WITH latest_run AS (
+    SELECT seat_id, role, model,
+           ROW_NUMBER() OVER (PARTITION BY seat_id ORDER BY run_id DESC) AS rn
+    FROM seat_runs
+  )
+  SELECT m.id, m.from_id, m.to_id, m.text, m.sent_at, m.delivered,
+         fr.role AS from_role, fr.model AS from_model,
+         tr.role AS to_role, tr.model AS to_model
+  FROM messages m
+  LEFT JOIN latest_run fr ON fr.seat_id = m.from_id AND fr.rn = 1
+  LEFT JOIN latest_run tr ON tr.seat_id = m.to_id AND tr.rn = 1
+  WHERE m.id > ?
+  ORDER BY m.id ASC
+  LIMIT ?
+`);
+const selectMaxMsgId = db.prepare(`SELECT MAX(id) AS mx FROM messages`);
 
 // --- Seat ID ---
 
@@ -335,10 +379,12 @@ function handleListSeats(body: ListSeatsRequest): Seat[] {
       seats = selectAllSeats.all() as Seat[];
   }
   if (body.exclude_id) seats = seats.filter((s) => s.id !== body.exclude_id);
-  // Drop seats whose process has died since last cleanup tick.
+  // Drop seats whose process has died since last cleanup tick. Full retirement
+  // (endSeat), not a bare row delete: `patrol status` right after a seat dies
+  // must not leave the run unbounded or its undelivered mail behind.
   return seats.filter((s) => {
     if (pidAlive(s.pid)) return true;
-    deleteSeat.run(s.id);
+    endSeat(s.id);
     return false;
   });
 }
@@ -380,13 +426,7 @@ function handleUnregister(body: UnregisterRequest): void {
     const row = db.query("SELECT id FROM seats WHERE pid = ?").get(body.pid) as { id: string } | null;
     id = row?.id;
   }
-  if (id) {
-    // Bound the run (keep the row + its token->session binding) BEFORE dropping
-    // the live seat, so the mapping survives for /costs history.
-    endSeatRun.run(new Date().toISOString(), id);
-    deleteSeat.run(id);
-    db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [id]);
-  }
+  if (id) endSeat(id);
 }
 
 // v0.2 Layer 2 (exact; any seat incl. manual): a plugin SessionStart hook posts
@@ -397,26 +437,43 @@ function handleUnregister(body: UnregisterRequest): void {
 // (SessionStart), which posts CC's session_id + transcript_path for the seat.
 function handleObserveSession(body: ObserveSessionRequest): { ok: boolean } {
   if (!body.session_id) return { ok: false };
+  const sid = body.session_id;
+
   // COALESCE keeps an already-set bound_via (a prior layer's binding wins the
   // label); only a run bound HERE for the first time is tagged "observe".
   const bind = (runId: number) =>
-    db.run("UPDATE seat_runs SET session_id = ?, bound_via = COALESCE(bound_via, 'observe') WHERE run_id = ?", [body.session_id, runId]);
+    db.run("UPDATE seat_runs SET session_id = ?, bound_via = COALESCE(bound_via, 'observe') WHERE run_id = ?", [sid, runId]);
 
+  // Never-misattribute guard: this session must not already belong to a
+  // DIFFERENT run. Two runs claiming one session would double-attribute its spend.
+  const ownedByOther = (exceptRunId: number): boolean =>
+    !!db.query("SELECT 1 FROM seat_runs WHERE session_id = ? AND run_id != ?").get(sid, exceptRunId);
+
+  // Primary: the live run whose claude pid matches (seats.pid is the claude pid).
   const byPid = db.query(
-    "SELECT sr.run_id FROM seat_runs sr JOIN seats s ON s.id = sr.seat_id WHERE s.pid = ? AND sr.ended_at IS NULL ORDER BY sr.registered_at DESC"
-  ).get(body.claude_pid) as { run_id: number } | null;
+    "SELECT sr.run_id, sr.session_id FROM seat_runs sr JOIN seats s ON s.id = sr.seat_id WHERE s.pid = ? AND sr.ended_at IS NULL ORDER BY sr.registered_at DESC"
+  ).get(body.claude_pid) as { run_id: number; session_id: string | null } | null;
   if (byPid) {
+    if (byPid.session_id === sid) return { ok: true }; // idempotent re-post: no change
+    if (byPid.session_id !== null) return { ok: false }; // already bound to another session — never overwrite
+    if (ownedByOther(byPid.run_id)) return { ok: false }; // some other run owns this session
     bind(byPid.run_id);
     return { ok: true };
   }
-  const byCwd = db.query(
-    "SELECT run_id FROM seat_runs WHERE cwd = ? AND session_id IS NULL AND ended_at IS NULL ORDER BY registered_at DESC"
-  ).get(body.cwd) as { run_id: number } | null;
-  if (byCwd) {
-    bind(byCwd.run_id);
-    return { ok: true };
-  }
-  return { ok: false };
+
+  // Fallback: bind ONLY when EXACTLY ONE unbound, live run sits in this cwd.
+  // Zero or several is ambiguous — degrade to unbound (token/heuristic layers or
+  // a later observe can still bind it) rather than guess which run to charge.
+  const candidates = (
+    db.query(
+      "SELECT sr.run_id, s.pid FROM seat_runs sr JOIN seats s ON s.id = sr.seat_id WHERE sr.cwd = ? AND sr.session_id IS NULL AND sr.ended_at IS NULL"
+    ).all(body.cwd) as { run_id: number; pid: number }[]
+  ).filter((r) => pidAlive(r.pid));
+  if (candidates.length !== 1) return { ok: false };
+  const run = candidates[0]!;
+  if (ownedByOther(run.run_id)) return { ok: false };
+  bind(run.run_id);
+  return { ok: true };
 }
 
 function round4(n: number): number {
@@ -635,6 +692,18 @@ function handleStats(body: StatsRequest): StatsResponse {
   };
 }
 
+// Message history for the `patrol watch` TUI. Reads the whole messages table
+// (delivered rows are retained 7 days), newest cursor via MAX(id). Sender +
+// recipient role/model resolve from seat_runs so dead seats still render.
+function handleLog(body: LogRequest): LogResponse {
+  const after = body.after_id ?? 0;
+  const limit = Math.min(body.limit ?? 200, 500);
+  const rows = selectLog.all(after, limit) as (Omit<LogMessage, "delivered"> & { delivered: number })[];
+  const messages: LogMessage[] = rows.map((m) => ({ ...m, delivered: !!m.delivered }));
+  const latestId = (selectMaxMsgId.get() as { mx: number | null }).mx ?? 0;
+  return { messages, latest_id: latestId };
+}
+
 // --- Background cost indexer (keeps /costs off the fs) ---
 
 function hourBucket(tsMs: number | null): number {
@@ -660,9 +729,41 @@ function interestedProjects(): Set<string> {
   return s;
 }
 
+// Hash of the last <=ANCHOR_BYTES bytes before `cursor`, or null if the file
+// can't be read. Stored on every index write and re-checked next tick: a plain
+// append only adds bytes AFTER the cursor, so this range — and its hash — stay
+// intact; an in-place rewrite (session resume) changes bytes before the cursor,
+// so the hash diverges. Empty prefix (cursor<=0) is the stable "0" sentinel.
+const ANCHOR_BYTES = 256;
+function anchorHash(file: string, cursor: number): string | null {
+  if (cursor <= 0) return "0";
+  const start = Math.max(0, cursor - ANCHOR_BYTES);
+  const len = cursor - start;
+  let fd: number;
+  try {
+    fd = openSync(file, "r");
+  } catch {
+    return null;
+  }
+  try {
+    const buf = Buffer.alloc(len);
+    let read = 0;
+    while (read < len) {
+      const n = readSync(fd, buf, read, len - read, start + read);
+      if (n <= 0) break;
+      read += n;
+    }
+    return String(Bun.hash(buf.subarray(0, read)));
+  } finally {
+    closeSync(fd);
+  }
+}
+
 // Index one file: skip if (size,mtime) unchanged; resume from the saved cursor;
-// on truncation/rewrite (size < cursor) wipe this file's sessions and reparse
-// from 0. seen_msgs makes accounting idempotent regardless of the cursor.
+// full reparse when the file shrank (size < cursor) OR was rewritten in place
+// (changed without shrinking AND the anchor bytes no longer match). A plain
+// append tail-parses from the cursor. seen_msgs keeps accounting idempotent
+// regardless of the cursor.
 function indexFile(file: string, parentSessionId: string | null) {
   let st: { size: number; mtimeMs: number };
   try {
@@ -672,7 +773,7 @@ function indexFile(file: string, parentSessionId: string | null) {
   }
   const size = st.size;
   const mtime = Math.floor(st.mtimeMs);
-  const prev = idxGet.get(file) as { bytes_parsed: number; mtime_ms: number } | null;
+  const prev = idxGet.get(file) as { bytes_parsed: number; mtime_ms: number; anchor_hash: string | null } | null;
   let fromByte = prev?.bytes_parsed ?? 0;
   let reset = false;
   if (prev) {
@@ -680,9 +781,16 @@ function indexFile(file: string, parentSessionId: string | null) {
     if (size < prev.bytes_parsed) {
       fromByte = 0;
       reset = true;
+    } else if (mtime !== prev.mtime_ms && prev.anchor_hash != null && anchorHash(file, prev.bytes_parsed) !== prev.anchor_hash) {
+      // Changed without shrinking, and the bytes before the old cursor moved:
+      // an in-place rewrite (not a pure append). Reparse from 0 so a same-size
+      // rewrite or a rewrite-then-grow can't leave stale totals in the ledger.
+      fromByte = 0;
+      reset = true;
     }
   }
   const { records, bytesParsed } = parseFileTail(file, fromByte);
+  const anchor = anchorHash(file, bytesParsed);
 
   db.transaction(() => {
     if (reset) {
@@ -714,7 +822,7 @@ function indexFile(file: string, parentSessionId: string | null) {
       a.cr += r.cache_read;
     }
     for (const a of agg.values()) upsertLedger.run(a.sid, a.attr, a.model, a.bucket, a.i, a.o, a.cw, a.cr);
-    idxSet.run(file, parentSessionId, bytesParsed, mtime);
+    idxSet.run(file, parentSessionId, bytesParsed, mtime, anchor);
   })();
 }
 
@@ -878,6 +986,11 @@ export function validate(path: string, body: unknown): string | null {
       if (!isStr(b.cwd, MAX_PATH, 1)) return "cwd must be a non-empty string";
       if (!isPosInt(b.claude_pid)) return "claude_pid must be a positive integer";
       return null;
+    case "/log":
+      if (b.after_id != null && !(typeof b.after_id === "number" && Number.isInteger(b.after_id) && b.after_id >= 0))
+        return "after_id must be a non-negative integer";
+      if (b.limit != null && !isPosInt(b.limit)) return "limit must be a positive integer";
+      return null;
     default:
       return null; // unknown route 404s below
   }
@@ -945,6 +1058,8 @@ Bun.serve({
           return Response.json(handleStats(body as StatsRequest));
         case "/observe-session":
           return Response.json(handleObserveSession(body as ObserveSessionRequest));
+        case "/log":
+          return Response.json(handleLog(body as LogRequest));
         case "/unregister":
           handleUnregister(body as UnregisterRequest);
           return Response.json({ ok: true });
