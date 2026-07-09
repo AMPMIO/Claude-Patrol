@@ -66,6 +66,7 @@ export interface CostRow {
 //   /costs            CostsRequest           → CostsResponse
 //   /observe-session  ObserveSessionRequest  → { ok: boolean }   (v0.2 Layer 2; see kill criterion)
 //   /stats            StatsRequest           → StatsResponse     (v0.2 telemetry)
+//   /log              LogRequest             → LogResponse       (v0.2.1 message history for `patrol watch`)
 //   GET /health       (no auth)              → { status: "ok"; seats: number }
 
 // --- v0.2 cost attribution: launcher-issued seat token (Layer 1, primary) ---
@@ -189,6 +190,26 @@ export interface StatsResponse {
     cost_usd: number;
     unattributed_usd: number; // spend in window no seat claimed
   };
+}
+
+// --- v0.2.1 message history (/log) — feeds the `patrol watch` TUI ---
+// Reads the broker's messages table (delivered rows are retained 7 days, so
+// that's the history window). Sender AND recipient get role/model context
+// joined from the latest seat_runs row per seat, so dead seats still render.
+
+export interface LogRequest {
+  after_id?: number; // return only messages with id > after_id (poll cursor)
+  limit?: number; // default 200, capped at 500
+}
+export interface LogMessage extends Message {
+  from_role: string | null;
+  from_model: string | null;
+  to_role: string | null;
+  to_model: string | null;
+}
+export interface LogResponse {
+  messages: LogMessage[];
+  latest_id: number; // highest message id known to the broker (cursor anchor)
 }
 
 // --- patrol.yaml (launcher config) ---
