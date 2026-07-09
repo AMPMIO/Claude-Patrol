@@ -5,7 +5,8 @@
  * endpoint (attribution + subagents-aware totals wired through the broker).
  */
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { Database } from "bun:sqlite";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { projectDirName, attributeSeatsToSessions } from "../src/costs.ts";
@@ -15,6 +16,7 @@ const PORT = 17900;
 const URL_BASE = `http://127.0.0.1:${PORT}`;
 const dir = mkdtempSync(join(tmpdir(), "patrol-broker-"));
 const SECRET_FILE = join(dir, "secret");
+const DB_FILE = join(dir, "test.db");
 const PROJECTS_ROOT = join(dir, "projects");
 
 let broker: ReturnType<typeof Bun.spawn>;
@@ -78,7 +80,7 @@ beforeAll(async () => {
     env: {
       ...process.env,
       CLAUDE_PATROL_PORT: String(PORT),
-      CLAUDE_PATROL_DB: join(dir, "test.db"),
+      CLAUDE_PATROL_DB: DB_FILE,
       CLAUDE_PATROL_SECRET_FILE: SECRET_FILE,
       CLAUDE_PATROL_PROJECTS_ROOT: PROJECTS_ROOT,
       CLAUDE_PATROL_INDEX_INTERVAL_MS: "80", // /costs reads a background ledger; keep ticks fast for tests
@@ -579,4 +581,279 @@ test("token scan is abandoned after the cap; the run stays bindable via observe"
     await new Promise((r) => setTimeout(r, 50));
   }
   expect(bound?.bound_via).toBe("observe"); // bound by observe, never by the abandoned token scan
+});
+
+// --- v0.2.1 fixes: observe invariants (A1), stale-seat unification (A2),
+// ledger in-place rewrites (A3), /log message history (B) ---
+
+// Read-only peek at the broker's live DB (a second WAL connection; SELECTs only).
+function peekDb<T>(fn: (db: Database) => T): T {
+  const db = new Database(DB_FILE);
+  db.run("PRAGMA busy_timeout = 3000");
+  try {
+    return fn(db);
+  } finally {
+    db.close();
+  }
+}
+
+// A1: /observe-session binding invariants (never-misattribute).
+
+test("A1: observe rejects a session_id another run already owns", async () => {
+  // run A owns "obs-dup" via the register-time env fast path
+  await post("/register", { pid: process.pid, cwd: "/tmp/obs-dup-a", git_root: null, tty: null, summary: "A", role: null, model: null, session_id: "obs-dup" });
+  // run B (a different live pid, no session) posts observe claiming the SAME session
+  const regB = await post("/register", { pid: broker.pid, cwd: "/tmp/obs-dup-b", git_root: null, tty: null, summary: "B", role: null, model: null });
+  const idB = ((await regB.json()) as { id: string }).id;
+
+  const obs = await post("/observe-session", { session_id: "obs-dup", transcript_path: "/tmp/t.jsonl", cwd: "/tmp/obs-dup-b", claude_pid: broker.pid });
+  expect(((await obs.json()) as { ok: boolean }).ok).toBe(false);
+
+  const runB = peekDb((db) => db.query("SELECT session_id, bound_via FROM seat_runs WHERE seat_id = ?").get(idB)) as { session_id: string | null; bound_via: string | null };
+  expect(runB.session_id).toBeNull(); // B stays unbound
+  expect(runB.bound_via).toBeNull();
+  const owners = peekDb((db) => db.query("SELECT COUNT(*) AS c FROM seat_runs WHERE session_id = ?").get("obs-dup")) as { c: number };
+  expect(owners.c).toBe(1); // only A owns it
+});
+
+test("A1: observe cannot overwrite a token-bound run", async () => {
+  const CWD = "/tmp/obs-tokenbound";
+  const TOK = "cp-55550000";
+  seatLog(CWD, "obs-tok-sess", TOK, { i: 1000, o: 0 }); // $0.005
+
+  const reg = await post("/register", { pid: process.pid, cwd: CWD, git_root: null, tty: null, summary: "T", role: "worker", model: "opus", seat_token: TOK });
+  const seatId = ((await reg.json()) as { id: string }).id;
+
+  // wait for the Layer-1 token binding to land
+  await pollCosts({ since: SINCE_ALL }, (c) => c.rows.some((r) => r.session_id === "obs-tok-sess" && r.seat_id === seatId));
+
+  // observe posts a DIFFERENT session for the SAME claude pid -> refused, no overwrite
+  const obs = await post("/observe-session", { session_id: "obs-tok-OTHER", transcript_path: "/tmp/t.jsonl", cwd: CWD, claude_pid: process.pid });
+  expect(((await obs.json()) as { ok: boolean }).ok).toBe(false);
+
+  const stats = (await (await post("/stats", { since: SINCE_ALL })).json()) as StatsBody;
+  expect(stats.seats.find((s) => s.seat_id === seatId)!.bound_via).toBe("token"); // unchanged
+  const costs = (await (await post("/costs", { since: SINCE_ALL })).json()) as CostsBody;
+  expect(costs.rows.find((r) => r.session_id === "obs-tok-sess")!.seat_id).toBe(seatId); // still attributes the original
+});
+
+test("A1: observe with a non-matching pid binds neither of two unbound same-cwd runs", async () => {
+  const CWD = "/tmp/obs-neither";
+  const reg1 = await post("/register", { pid: process.pid, cwd: CWD, git_root: null, tty: null, summary: "n1", role: null, model: null });
+  const id1 = ((await reg1.json()) as { id: string }).id;
+  const reg2 = await post("/register", { pid: broker.pid, cwd: CWD, git_root: null, tty: null, summary: "n2", role: null, model: null });
+  const id2 = ((await reg2.json()) as { id: string }).id;
+
+  const obs = await post("/observe-session", { session_id: "obs-neither-sess", transcript_path: "/tmp/t.jsonl", cwd: CWD, claude_pid: 999999 });
+  expect(((await obs.json()) as { ok: boolean }).ok).toBe(false);
+
+  const runs = peekDb((db) => db.query("SELECT session_id, bound_via FROM seat_runs WHERE seat_id IN (?, ?)").all(id1, id2)) as { session_id: string | null; bound_via: string | null }[];
+  expect(runs).toHaveLength(2);
+  expect(runs.every((r) => r.session_id === null && r.bound_via === null)).toBe(true); // neither bound
+});
+
+test("A1: observe is idempotent — a same-value re-post changes nothing", async () => {
+  const CWD = "/tmp/obs-idem";
+  const reg = await post("/register", { pid: process.pid, cwd: CWD, git_root: null, tty: null, summary: "I", role: null, model: null });
+  const id = ((await reg.json()) as { id: string }).id;
+
+  const first = await post("/observe-session", { session_id: "obs-idem-sess", transcript_path: "/tmp/t.jsonl", cwd: CWD, claude_pid: process.pid });
+  expect(((await first.json()) as { ok: boolean }).ok).toBe(true);
+  const before = peekDb((db) => db.query("SELECT session_id, bound_via FROM seat_runs WHERE seat_id = ?").get(id)) as { session_id: string | null; bound_via: string | null };
+  expect(before.session_id).toBe("obs-idem-sess");
+  expect(before.bound_via).toBe("observe");
+
+  const again = await post("/observe-session", { session_id: "obs-idem-sess", transcript_path: "/tmp/t.jsonl", cwd: CWD, claude_pid: process.pid });
+  expect(((await again.json()) as { ok: boolean }).ok).toBe(true); // idempotent ok
+  const after = peekDb((db) => db.query("SELECT session_id, bound_via FROM seat_runs WHERE seat_id = ?").get(id)) as { session_id: string | null; bound_via: string | null };
+  expect(after).toEqual(before); // unchanged
+});
+
+// A2: a dead seat swept via /list-seats is FULLY retired (run bounded + mail purged).
+
+test("A2: /list-seats bounds the run and purges undelivered mail of a dead seat (before any sweep tick)", async () => {
+  const DEAD_PID = 2_000_000_000; // valid pid int; no such live process
+  const reg = await post("/register", { pid: DEAD_PID, cwd: "/tmp/deadseat", git_root: null, tty: null, summary: "dead", role: "worker", model: "opus" });
+  const id = ((await reg.json()) as { id: string }).id;
+
+  const send = await post("/send-message", { from_id: "cli", to_id: id, text: "unreachable" });
+  expect(((await send.json()) as { ok: boolean }).ok).toBe(true);
+
+  // BEFORE the sweep: run open, message queued
+  const runBefore = peekDb((db) => db.query("SELECT ended_at FROM seat_runs WHERE seat_id = ?").get(id)) as { ended_at: string | null };
+  expect(runBefore.ended_at).toBeNull();
+  const queuedBefore = peekDb((db) => db.query("SELECT COUNT(*) AS c FROM messages WHERE to_id = ? AND delivered = 0").get(id)) as { c: number };
+  expect(queuedBefore.c).toBe(1);
+
+  // /list-seats is the ONLY sweep in-test (the 30s interval won't fire); it must
+  // run the full endSeat path, not a bare row delete.
+  await post("/list-seats", { scope: "machine", cwd: "/", git_root: null });
+
+  const runAfter = peekDb((db) => db.query("SELECT ended_at FROM seat_runs WHERE seat_id = ?").get(id)) as { ended_at: string | null };
+  expect(runAfter.ended_at).not.toBeNull(); // run bounded, no longer orphaned in stats windows
+  const queuedAfter = peekDb((db) => db.query("SELECT COUNT(*) AS c FROM messages WHERE to_id = ? AND delivered = 0").get(id)) as { c: number };
+  expect(queuedAfter.c).toBe(0); // undeliverable mail purged
+  const rowAfter = peekDb((db) => db.query("SELECT id FROM seats WHERE id = ?").get(id));
+  expect(rowAfter).toBeNull(); // live row gone
+});
+
+// A3: the ledger indexer catches in-place rewrites, not just truncation/append.
+
+const A3_WIN = { since: "2000-01-01T00:00:00Z" };
+
+test("A3: a same-size in-place rewrite corrects the ledger totals (anchor hash)", async () => {
+  const CWD = "/tmp/ms-samesize";
+  const projDir = join(PROJECTS_ROOT, projectDirName(CWD));
+  mkdirSync(projDir, { recursive: true });
+  const file = join(projDir, "ms-samesize-1.jsonl");
+  const TS = "2026-07-08T10:00:00.000Z";
+  const rec = (i: number) =>
+    JSON.stringify({ type: "assistant", sessionId: "ms-samesize-1", timestamp: TS, message: { id: "x1", model: "claude-opus-4-8", usage: { input_tokens: i, output_tokens: 0 } } }) + "\n";
+  expect(Buffer.byteLength(rec(1000))).toBe(Buffer.byteLength(rec(2000))); // same-size precondition
+
+  await post("/register", { pid: broker.pid, cwd: CWD, git_root: null, tty: null, summary: "SS", role: null, model: null });
+  const sess = (c: CostsBody) => c.rows.find((r) => r.session_id === "ms-samesize-1");
+
+  writeFileSync(file, rec(1000));
+  let t = Math.floor(Date.now() / 1000) - 30;
+  utimesSync(file, t, t);
+  let got = await pollCosts(A3_WIN, (c) => (sess(c)?.input ?? 0) === 1000);
+  expect(sess(got)!.input).toBe(1000);
+
+  // rewrite in place: 1000 -> 2000, identical byte length, newer mtime. A cursor
+  // parked at EOF would parse 0 new bytes and leave the ledger at 1000 forever.
+  writeFileSync(file, rec(2000));
+  t += 10;
+  utimesSync(file, t, t);
+  got = await pollCosts(A3_WIN, (c) => (sess(c)?.input ?? 0) === 2000);
+  expect(sess(got)!.input).toBe(2000); // corrected, not stuck at 1000, not summed to 3000
+});
+
+test("A3: a rewrite-then-grow corrects the ledger (a stale byte cursor is not trusted)", async () => {
+  const CWD = "/tmp/ms-regrow";
+  const projDir = join(PROJECTS_ROOT, projectDirName(CWD));
+  mkdirSync(projDir, { recursive: true });
+  const file = join(projDir, "ms-regrow-1.jsonl");
+  const TS = "2026-07-08T10:00:00.000Z";
+  const rec = (id: string, i: number) =>
+    JSON.stringify({ type: "assistant", sessionId: "ms-regrow-1", timestamp: TS, message: { id, model: "claude-opus-4-8", usage: { input_tokens: i, output_tokens: 0 } } }) + "\n";
+
+  await post("/register", { pid: broker.pid, cwd: CWD, git_root: null, tty: null, summary: "RG", role: null, model: null });
+  const sess = (c: CostsBody) => c.rows.find((r) => r.session_id === "ms-regrow-1");
+
+  writeFileSync(file, rec("g1", 1000));
+  let t = Math.floor(Date.now() / 1000) - 30;
+  utimesSync(file, t, t);
+  let got = await pollCosts(A3_WIN, (c) => (sess(c)?.input ?? 0) === 1000);
+  expect(sess(got)!.input).toBe(1000);
+
+  // rewrite line 1 (1000 -> 2000, same length so the OLD cursor still aligns to its
+  // newline) AND append a second record. A stale-cursor tail parse keeps line 1 at
+  // 1000 and adds 500 = 1500; the anchor mismatch forces a reparse -> 2500.
+  writeFileSync(file, rec("g1", 2000) + rec("g2", 500));
+  t += 10;
+  utimesSync(file, t, t);
+  got = await pollCosts(A3_WIN, (c) => (sess(c)?.input ?? 0) === 2500);
+  expect(sess(got)!.input).toBe(2500);
+});
+
+test("A3: a plain append still tail-parses (anchor intact, no double count, no miss)", async () => {
+  const CWD = "/tmp/ms-append";
+  const projDir = join(PROJECTS_ROOT, projectDirName(CWD));
+  mkdirSync(projDir, { recursive: true });
+  const file = join(projDir, "ms-append-1.jsonl");
+  const rec = (id: string, i: number) =>
+    JSON.stringify({ type: "assistant", sessionId: "ms-append-1", timestamp: new Date().toISOString(), message: { id, model: "claude-opus-4-8", usage: { input_tokens: i, output_tokens: 0 } } }) + "\n";
+
+  await post("/register", { pid: broker.pid, cwd: CWD, git_root: null, tty: null, summary: "AP", role: null, model: null });
+  const sess = (c: CostsBody) => c.rows.find((r) => r.session_id === "ms-append-1");
+
+  const line1 = rec("p1", 1000); // captured once so the append leaves line 1 byte-identical
+  writeFileSync(file, line1);
+  let got = await pollCosts(A3_WIN, (c) => (sess(c)?.input ?? 0) === 1000);
+  expect(sess(got)!.input).toBe(1000);
+
+  writeFileSync(file, line1 + rec("p2", 500));
+  got = await pollCosts(A3_WIN, (c) => (sess(c)?.input ?? 0) === 1500);
+  expect(sess(got)!.input).toBe(1500); // p1 counted once (not 2500), p2 added
+});
+
+// B: /log message history for `patrol watch`.
+
+type LogMsg = {
+  id: number;
+  from_id: string;
+  to_id: string;
+  text: string;
+  sent_at: string;
+  delivered: boolean;
+  from_role: string | null;
+  from_model: string | null;
+  to_role: string | null;
+  to_model: string | null;
+};
+type LogBody = { messages: LogMsg[]; latest_id: number };
+
+test("B: /log returns history with both endpoints' context, honoring after_id and limit", async () => {
+  const s = await post("/register", { pid: process.pid, cwd: "/tmp/log-s", git_root: null, tty: null, summary: "s", role: "orchestrator", model: "fable" });
+  const sender = ((await s.json()) as { id: string }).id;
+  const r = await post("/register", { pid: broker.pid, cwd: "/tmp/log-r", git_root: null, tty: null, summary: "r", role: "executor", model: "opus" });
+  const recv = ((await r.json()) as { id: string }).id;
+
+  // baseline cursor: only messages after this are ours
+  const base = ((await (await post("/log", {})).json()) as LogBody).latest_id;
+  for (const t of ["one", "two", "three"]) {
+    expect((await post("/send-message", { from_id: sender, to_id: recv, text: t })).status).toBe(200);
+  }
+  await post("/poll-messages", { id: recv }); // deliver them
+
+  const all = (await (await post("/log", { after_id: base })).json()) as LogBody;
+  expect(all.messages.map((m) => m.text)).toEqual(["one", "two", "three"]); // id ASC
+  expect(all.messages.every((m) => m.from_id === sender && m.to_id === recv)).toBe(true);
+  expect(all.messages.every((m) => m.delivered === true)).toBe(true); // polled
+  const m0 = all.messages[0]!;
+  expect(m0.from_role).toBe("orchestrator");
+  expect(m0.from_model).toBe("fable");
+  expect(m0.to_role).toBe("executor");
+  expect(m0.to_model).toBe("opus");
+  expect(all.latest_id).toBe(all.messages[all.messages.length - 1]!.id); // MAX(id) over the table
+
+  // after_id cursor: strictly newer than the first row
+  const rest = (await (await post("/log", { after_id: m0.id })).json()) as LogBody;
+  expect(rest.messages.map((m) => m.text)).toEqual(["two", "three"]);
+
+  // limit caps the batch; latest_id stays table-wide
+  const limited = (await (await post("/log", { after_id: base, limit: 2 })).json()) as LogBody;
+  expect(limited.messages.map((m) => m.text)).toEqual(["one", "two"]);
+  expect(limited.latest_id).toBe(all.latest_id);
+});
+
+test("B: /log resolves a dead seat via seat_runs; a cli sender yields null context", async () => {
+  const s = await post("/register", { pid: process.pid, cwd: "/tmp/log-dead-s", git_root: null, tty: null, summary: "s", role: "orchestrator", model: "fable" });
+  const sender = ((await s.json()) as { id: string }).id;
+  const r = await post("/register", { pid: broker.pid, cwd: "/tmp/log-dead-r", git_root: null, tty: null, summary: "r", role: "executor", model: "opus" });
+  const recv = ((await r.json()) as { id: string }).id;
+
+  const base = ((await (await post("/log", {})).json()) as LogBody).latest_id;
+  await post("/send-message", { from_id: sender, to_id: recv, text: "seat-msg" });
+  await post("/send-message", { from_id: "cli", to_id: recv, text: "cli-msg" });
+
+  // kill the sender: its live row goes, but its seat_run persists (with role/model)
+  await post("/unregister", { id: sender });
+
+  const log = (await (await post("/log", { after_id: base })).json()) as LogBody;
+  const seatMsg = log.messages.find((m) => m.text === "seat-msg")!;
+  expect(seatMsg.from_role).toBe("orchestrator"); // resolved from seat_runs, not the deleted seats row
+  expect(seatMsg.from_model).toBe("fable");
+  const cliMsg = log.messages.find((m) => m.text === "cli-msg")!;
+  expect(cliMsg.from_role).toBeNull(); // "cli" has no run
+  expect(cliMsg.from_model).toBeNull();
+  expect(cliMsg.to_role).toBe("executor"); // recipient still resolves
+});
+
+test("B: /log is auth-gated and rejects a bad after_id/limit", async () => {
+  expect((await post("/log", {}, "wrong")).status).toBe(401);
+  expect((await post("/log", { after_id: -1 })).status).toBe(400);
+  expect((await post("/log", { limit: 0 })).status).toBe(400);
+  expect((await post("/log", { limit: -5 })).status).toBe(400);
 });
