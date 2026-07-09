@@ -7,9 +7,12 @@ Every decision below carries its kill criterion; re-litigate only when one fires
 ## Premise (confirmed, with reversal condition)
 
 Independent standing terminal seats, coordinated by a local broker. This is
-where the measured cost edge over subagent spawning lives (~2.9× on single
-unrepeated runs, one per topology — repeat + matrix cells pending, see
-orchestration.md items 39–42 in the Fable Hijack repo), and it is
+where the measured cost edge over subagent spawning lives — ~2.9× on the
+config-matched plugin-heavy pair, with the mechanism now isolated by a repeat
+run (2026-07-09 forensics: ~80% of subagent-topology cost is standing context
+re-bought as cache_write per spawn, ~138k tokens/spawn heavy vs ~36k lean;
+dollar totals are mix-sensitive, the per-spawn re-buy is the robust number —
+see orchestration.md items 39–42 in the Fable Hijack repo), and it is
 exactly what first-party Agent Teams does NOT do (session-scoped,
 lead-spawned; Anthropic issue #28300 requests our model = unshipped).
 **Reverses if:** Anthropic ships persistent cross-session teams — then Patrol

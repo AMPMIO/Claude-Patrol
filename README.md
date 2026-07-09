@@ -14,19 +14,28 @@ patrol down        # tear it all down
 ## Why standing seats at all
 
 Measured on real workloads (July 2026, identical fixed-spec dev task, same
-model mix, cost from session logs at list prices — **one run per topology so
-far; read it as ~2–3× until the repeat runs land**, tracked for v0.2):
+quality gate, cost from session logs at list prices). Config-matched
+comparison — both runs on the same plugin-heavy seat configuration:
 
-| topology | cost | wall-clock |
+| topology (plugin-heavy config) | cost | wall-clock |
 |---|---|---|
 | orchestrator + **subagents** (spawn per task) | $6.22 | 13m 15s |
 | orchestrator + **standing peer seats** | **$2.16 (−65%)** | **5m 03s (−62%)** |
 
-Both passed the same quality gate; output tokens were near-identical. The
-difference is overhead: every subagent spawn re-buys the standing context as
-cache *writes* (~100–150k tokens on a plugin-heavy config), while a standing
-seat wrote it once and reads it back at 1/12.5 the price. Standing seats
-amortize after roughly one task.
+The mechanism is context weight, and we've measured it directly: every
+subagent spawn re-buys the seat's standing context (system prompt, MCP
+schemas, CLAUDE.md) as cache *writes* — ~138k tokens per spawn on the heavy
+config vs ~36k on a minimal one. A repeat of the subagent run on a
+stripped-down orchestrator came in at $1.06: about 80% of the heavy run's
+cost was config weight being repurchased per spawn and re-read per turn, not
+the task itself. A standing seat buys its context once and reads it back at
+1/12.5 the write price, amortizing after roughly one task.
+
+Two honest caveats: sample sizes are 1–2 runs per cell, and dollar totals are
+sensitive to the exact subagent mix — the robust, repeatable number is the
+per-spawn cache-write re-buy. So the cost driver is config weight × spawn
+count, and Patrol attacks both ends: standing seats amortize the buy, and
+per-seat profiles (`peer`, `lite`) shrink what gets bought at all.
 
 Patrol exists to make that topology cheap to run and easy to operate.
 
