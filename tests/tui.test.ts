@@ -13,11 +13,15 @@ import {
   cycleTarget,
   shortId,
   shortenCwd,
+  truncateCwd,
   hhmmss,
   msgLine,
   headerTotals,
+  initConn,
+  reduceConn,
+  connView,
 } from "../src/tui/data.ts";
-import { clampCursor } from "../src/tui/components/TextInput.tsx";
+import { clampCursor, killToLineStart } from "../src/tui/components/TextInput.tsx";
 
 function msg(id: number, over: Partial<LogMessage> = {}): LogMessage {
   return {
@@ -176,4 +180,43 @@ test("clampCursor leaves an in-range cursor untouched (mid-string editing preser
 
 test("clampCursor never returns a negative cursor", () => {
   expect(clampCursor(-3, 5)).toBe(0);
+});
+
+test("killToLineStart drops everything before the cursor, keeping the tail", () => {
+  expect(killToLineStart("hello world", 6)).toBe("world"); // cursor after "hello "
+  expect(killToLineStart("draft", 5)).toBe(""); // cursor at end -> clears the line
+  expect(killToLineStart("abc", 0)).toBe("abc"); // cursor at start -> nothing killed
+  expect(killToLineStart("abc", 99)).toBe(""); // out-of-range cursor clamps to end
+});
+
+// ---- broker connection health ----
+
+test("reduceConn counts consecutive failures and resets on any success", () => {
+  let s = initConn();
+  expect(s.fails).toBe(0);
+  s = reduceConn(s, false);
+  expect(s.fails).toBe(1);
+  s = reduceConn(s, false);
+  expect(s.fails).toBe(2);
+  s = reduceConn(s, true); // recovery clears the streak immediately
+  expect(s.fails).toBe(0);
+});
+
+test("connView maps the ok->fail->fail->ok cycle: green -> amber -> red -> green", () => {
+  let s = initConn();
+  expect(connView(s)).toEqual({ dotColor: "green", dotGlyph: "●", banner: null });
+  s = reduceConn(s, false);
+  expect(connView(s)).toEqual({ dotColor: "yellow", dotGlyph: "●", banner: "broker slow — reconnecting…" });
+  s = reduceConn(s, false);
+  expect(connView(s)).toEqual({ dotColor: "red", dotGlyph: "○", banner: "broker unreachable — reconnecting…" });
+  s = reduceConn(s, true);
+  expect(connView(s)).toEqual({ dotColor: "green", dotGlyph: "●", banner: null }); // banner cleared on recovery
+});
+
+// ---- CWD leaf-preserving truncation ----
+
+test("truncateCwd preserves the leaf directory instead of tail-truncating it away", () => {
+  expect(truncateCwd("/Users/x/Projects/Claude-Patrol", 20)).toBe("…/Claude-Patrol"); // leaf kept, head elided
+  expect(truncateCwd("~/Projects/p", 20)).toBe("~/Projects/p"); // fits -> unchanged
+  expect(truncateCwd("/a/really-really-long-leaf-name", 10)).toBe("…leaf-name"); // leaf itself overflows -> keep its tail, width 10
 });

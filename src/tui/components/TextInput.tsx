@@ -16,6 +16,13 @@ export function clampCursor(cursor: number, length: number): number {
   return Math.max(0, Math.min(cursor, length));
 }
 
+// Ctrl-U kill-line: delete from the start of the line up to the cursor, leaving
+// the text after it. With the cursor at the end (the send bar's usual state) this
+// clears the whole draft; the new cursor is always 0. Pure so it's unit-testable.
+export function killToLineStart(value: string, cursor: number): string {
+  return value.slice(Math.max(0, Math.min(cursor, value.length)));
+}
+
 export interface TextInputProps {
   /** Controlled value */
   value: string;
@@ -130,6 +137,13 @@ const FocusedInput: React.FC<FocusedInputProps> = ({
     }
 
     if (key.return) { onSubmit?.(value); return; }
+
+    // Line editing that the send bar advertises: Esc clears the draft, Ctrl-U
+    // kills to line start. Both handled here (before the ctrl/meta/escape guard)
+    // so they mutate the value instead of being swallowed as parent-owned keys.
+    if (key.escape) { onChange(""); setCursor(0); return; }
+    if (key.ctrl && input === "u") { onChange(killToLineStart(value, cursor)); setCursor(0); return; }
+
     if (key.ctrl || key.meta || key.escape) return;
 
     onChange(value.slice(0, cursor) + input + value.slice(cursor));

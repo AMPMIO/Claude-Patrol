@@ -118,3 +118,61 @@ export function headerTotals(totals: StatsResponse["totals"] | null): {
 } {
   return { spendUsd: totals?.cost_usd ?? 0, wakes: totals?.notifications ?? 0 };
 }
+
+// ---- broker connection health ----------------------------------------------
+
+// Consecutive /list-seats poll failures fold into this state so a dead broker is
+// visibly distinct from a healthy empty fleet, and a single transient blip
+// doesn't flap the header. Held in the data layer (not inline app state) so the
+// ok→fail→fail→ok transitions are reducer-testable without a terminal.
+export interface ConnState {
+  fails: number; // consecutive failed seat polls; 0 == last poll succeeded
+}
+
+export function initConn(): ConnState {
+  return { fails: 0 };
+}
+
+// Fold one poll outcome. A success clears the streak immediately (recovery shows
+// on the very next good poll); each failure increments it.
+export function reduceConn(prev: ConnState, ok: boolean): ConnState {
+  return ok ? { fails: 0 } : { fails: prev.fails + 1 };
+}
+
+// Consecutive failures before the broker is declared DOWN rather than merely
+// slow. At the 2s seat-poll cadence this is ~4s of silence — long enough to ride
+// out one dropped/slow response, short enough to surface a real death fast.
+export const CONN_DOWN_THRESHOLD = 2;
+
+export interface ConnView {
+  dotColor: "green" | "yellow" | "red";
+  dotGlyph: string;
+  banner: string | null; // null == healthy, render nothing
+}
+
+// Map connection state to what the header shows. green/no-banner when healthy,
+// amber "reconnecting" on the first miss, red "unreachable" once sustained.
+export function connView(s: ConnState): ConnView {
+  // Glyph stays within the original ●/○ set for terminal portability; colour is
+  // the primary signal (green healthy, amber transient, red down).
+  if (s.fails === 0) return { dotColor: "green", dotGlyph: "●", banner: null };
+  if (s.fails < CONN_DOWN_THRESHOLD) return { dotColor: "yellow", dotGlyph: "●", banner: "broker slow — reconnecting…" };
+  return { dotColor: "red", dotGlyph: "○", banner: "broker unreachable — reconnecting…" };
+}
+
+// ---- CWD fit (leaf-preserving) ----------------------------------------------
+
+// Fit a path into `width` while preserving the LEAF directory — the segment that
+// actually distinguishes one seat's project from another. The table's plain
+// tail-truncation drops the leaf, so every seat under a shared parent (and every
+// distinct project) collapses to the same visible prefix; the cross-project board
+// is the whole point of `patrol watch`. Elides the head with "…/" instead.
+export function truncateCwd(cwd: string, width: number): string {
+  if (cwd.length <= width) return cwd;
+  const slash = cwd.lastIndexOf("/");
+  const leaf = slash >= 0 ? cwd.slice(slash + 1) : cwd;
+  const withEllipsis = "…/" + leaf;
+  if (withEllipsis.length <= width) return withEllipsis;
+  // even the leaf alone overflows: keep its tail under a bare ellipsis
+  return "…" + leaf.slice(Math.max(0, leaf.length - (width - 1)));
+}
