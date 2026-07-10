@@ -170,7 +170,15 @@ db.run(`
 // tell a plain append (anchor bytes intact -> tail parse) from an in-place
 // rewrite (anchor bytes changed -> full reparse) when a file changed without
 // shrinking. NULL for rows written before this column existed.
-for (const col of ["anchor_hash TEXT"]) {
+//
+// session_ids: JSON array of the session id(s) this file has contributed to the
+// ledger (one file == one session in practice; an array so a multi-session file
+// is still expressible). On a reset (shrink/in-place rewrite) the indexer deletes
+// the ledger + seen_msgs rows for these STORED ids, not just the ids in the newly
+// parsed content — so a rewrite-to-empty, or a file whose session_id changed,
+// still drops its prior contribution instead of orphaning stale (double-countable)
+// rows. NULL for rows written before this column existed.
+for (const col of ["anchor_hash TEXT", "session_ids TEXT"]) {
   try {
     db.run(`ALTER TABLE session_index ADD COLUMN ${col}`);
   } catch {
@@ -249,12 +257,10 @@ const insertSeat = db.prepare(`
 `);
 const updateLastSeen = db.prepare(`UPDATE seats SET last_seen = ? WHERE id = ?`);
 const updateSummary = db.prepare(`UPDATE seats SET summary = ? WHERE id = ?`);
-const deleteSeat = db.prepare(`DELETE FROM seats WHERE id = ?`);
 const insertSeatRun = db.prepare(`
   INSERT INTO seat_runs (seat_id, session_id, seat_token, cwd, role, model, profile, registered_at, ended_at, bound_via)
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
 `);
-const endSeatRun = db.prepare(`UPDATE seat_runs SET ended_at = ? WHERE seat_id = ? AND ended_at IS NULL`);
 const insertDelivery = db.prepare(`INSERT INTO delivery_log (to_id, batch_size, delivered_at) VALUES (?, ?, ?)`);
 const upsertLedger = db.prepare(`
   INSERT INTO cost_ledger (session_id, attr_session_id, model, bucket_ts, input, output, cache_write, cache_read)
@@ -268,8 +274,8 @@ const upsertLedger = db.prepare(`
 `);
 const seenGet = db.prepare(`SELECT 1 FROM seen_msgs WHERE session_id = ? AND msg_id = ?`);
 const seenIns = db.prepare(`INSERT OR IGNORE INTO seen_msgs (session_id, msg_id) VALUES (?, ?)`);
-const idxGet = db.prepare(`SELECT bytes_parsed, mtime_ms, anchor_hash FROM session_index WHERE file_path = ?`);
-const idxSet = db.prepare(`INSERT OR REPLACE INTO session_index (file_path, parent_session_id, bytes_parsed, mtime_ms, anchor_hash) VALUES (?, ?, ?, ?, ?)`);
+const idxGet = db.prepare(`SELECT bytes_parsed, mtime_ms, anchor_hash, session_ids FROM session_index WHERE file_path = ?`);
+const idxSet = db.prepare(`INSERT OR REPLACE INTO session_index (file_path, parent_session_id, bytes_parsed, mtime_ms, anchor_hash, session_ids) VALUES (?, ?, ?, ?, ?, ?)`);
 const selectAllSeats = db.prepare(`SELECT * FROM seats`);
 const selectSeatsByDirectory = db.prepare(`SELECT * FROM seats WHERE cwd = ?`);
 const selectSeatsByGitRoot = db.prepare(`SELECT * FROM seats WHERE git_root = ?`);
@@ -322,13 +328,14 @@ function generateId(): string {
 function handleRegister(body: RegisterRequest): RegisterResponse {
   const id = generateId();
   const now = new Date().toISOString();
-  // Re-registration for the same PID replaces the prior row (deleted first, so
-  // a seat reclaiming its own session_id below never collides with itself).
+  // Re-registration for the same PID replaces the prior row. Full retirement via
+  // endSeat (not a bare row delete): the old seat_id is discarded — a fresh id is
+  // generated above — so any mail still queued to it can never be polled or swept
+  // and would linger forever (and render as phantom rows in /log). endSeat bounds
+  // the run, purges that undelivered mail, and drops the row; deleting the row
+  // also lets a seat reclaim its own session_id below without colliding with itself.
   const existing = db.query("SELECT id FROM seats WHERE pid = ?").get(body.pid) as { id: string } | null;
-  if (existing) {
-    endSeatRun.run(now, existing.id); // bound the replaced seat's run so its history stays consistent
-    deleteSeat.run(existing.id);
-  }
+  if (existing) endSeat(existing.id);
 
   // Uniqueness guard: a session_id already held by a LIVE seat must not be
   // claimed twice — two same-cwd seats racing the mtime heuristic would else
@@ -445,9 +452,12 @@ function handleObserveSession(body: ObserveSessionRequest): { ok: boolean } {
     db.run("UPDATE seat_runs SET session_id = ?, bound_via = COALESCE(bound_via, 'observe') WHERE run_id = ?", [sid, runId]);
 
   // Never-misattribute guard: this session must not already belong to a
-  // DIFFERENT run. Two runs claiming one session would double-attribute its spend.
+  // DIFFERENT OPEN run. Two LIVE runs claiming one session would double-attribute
+  // its spend. An ENDED run's session, though, is fair game to re-bind: a
+  // restarted seat resuming the same CC session must be able to claim it, and
+  // readLedgerWindow's last-run-wins then attributes the overlap to the newest run.
   const ownedByOther = (exceptRunId: number): boolean =>
-    !!db.query("SELECT 1 FROM seat_runs WHERE session_id = ? AND run_id != ?").get(sid, exceptRunId);
+    !!db.query("SELECT 1 FROM seat_runs WHERE session_id = ? AND run_id != ? AND ended_at IS NULL").get(sid, exceptRunId);
 
   // Primary: the live run whose claude pid matches (seats.pid is the claude pid).
   const byPid = db.query(
@@ -759,6 +769,19 @@ function anchorHash(file: string, cursor: number): string | null {
   }
 }
 
+// Parse the stored session_ids column (JSON array) defensively: a legacy NULL
+// (row written before the column existed) or any malformed value degrades to an
+// empty list rather than throwing on the index path.
+function parseSessionIds(raw: string | null): string[] {
+  if (!raw) return [];
+  try {
+    const a = JSON.parse(raw);
+    return Array.isArray(a) ? a.filter((x): x is string => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
 // Index one file: skip if (size,mtime) unchanged; resume from the saved cursor;
 // full reparse when the file shrank (size < cursor) OR was rewritten in place
 // (changed without shrinking AND the anchor bytes no longer match). A plain
@@ -773,7 +796,7 @@ function indexFile(file: string, parentSessionId: string | null) {
   }
   const size = st.size;
   const mtime = Math.floor(st.mtimeMs);
-  const prev = idxGet.get(file) as { bytes_parsed: number; mtime_ms: number; anchor_hash: string | null } | null;
+  const prev = idxGet.get(file) as { bytes_parsed: number; mtime_ms: number; anchor_hash: string | null; session_ids: string | null } | null;
   let fromByte = prev?.bytes_parsed ?? 0;
   let reset = false;
   if (prev) {
@@ -792,11 +815,21 @@ function indexFile(file: string, parentSessionId: string | null) {
   const { records, bytesParsed } = parseFileTail(file, fromByte);
   const anchor = anchorHash(file, bytesParsed);
 
+  const newIds = new Set(records.map((r) => r.sessionId));
+  const priorIds = parseSessionIds(prev?.session_ids ?? null);
+  // A reset re-adds only the current content, so its recorded contribution IS the
+  // new ids; a plain append accumulates (prior ∪ new) so a session an append tick
+  // happens not to re-mention isn't dropped from the file's recorded contribution.
+  const storedIds = reset ? newIds : new Set([...priorIds, ...newIds]);
+
   db.transaction(() => {
     if (reset) {
-      // The file shrank/was rewritten: drop its prior contribution, then re-add
-      // the full current content below (one file == one session's records).
-      for (const sid of new Set(records.map((r) => r.sessionId))) {
+      // The file shrank/was rewritten: drop its PRIOR contribution (the stored
+      // ids) as well as any current-content ids, then re-add the full current
+      // content below. Deleting by the stored ids — not just the newly parsed
+      // ones — is what clears a rewrite-to-empty or a changed-session_id file
+      // whose old rows would otherwise linger and double-count.
+      for (const sid of new Set([...priorIds, ...newIds])) {
         db.run("DELETE FROM cost_ledger WHERE session_id = ?", [sid]);
         db.run("DELETE FROM seen_msgs WHERE session_id = ?", [sid]);
       }
@@ -822,7 +855,7 @@ function indexFile(file: string, parentSessionId: string | null) {
       a.cr += r.cache_read;
     }
     for (const a of agg.values()) upsertLedger.run(a.sid, a.attr, a.model, a.bucket, a.i, a.o, a.cw, a.cr);
-    idxSet.run(file, parentSessionId, bytesParsed, mtime, anchor);
+    idxSet.run(file, parentSessionId, bytesParsed, mtime, anchor, JSON.stringify([...storedIds]));
   })();
 }
 
@@ -844,7 +877,8 @@ const runScans = new Map<number, RunScan>(); // run_id -> scan state; pruned whe
 // Resolve runs still missing a session_id. Launcher seats (have a token) bind
 // ONLY via Layer-1 content match — never the heuristic, which can't separate
 // same-cwd seats; manual seats (no token) fall to Layer-3. Cross-run uniqueness:
-// never bind a session another run already owns.
+// never bind a session another OPEN run already owns (an ended run's session may
+// be re-bound by a newer live run — see the ownedByOther note in observe).
 function resolvePendingRuns() {
   const pending = db.query(
     "SELECT run_id, seat_token, cwd, registered_at FROM seat_runs WHERE session_id IS NULL AND ended_at IS NULL"
@@ -884,9 +918,9 @@ function resolvePendingRuns() {
       sid = findSessionIdByHeuristic({ cwd: run.cwd, projectsRoot: ROOT, nowMs: Date.now() });
       if (!sid) continue;
     }
-    const owner = db.query("SELECT run_id FROM seat_runs WHERE session_id = ? AND run_id != ?").get(sid, run.run_id) as { run_id: number } | null;
+    const owner = db.query("SELECT run_id FROM seat_runs WHERE session_id = ? AND run_id != ? AND ended_at IS NULL").get(sid, run.run_id) as { run_id: number } | null;
     if (owner) {
-      log(`token/heuristic resolved run ${run.run_id} to ${sid} but it is already owned — left unbound`);
+      log(`token/heuristic resolved run ${run.run_id} to ${sid} but an open run already owns it — left unbound`);
       continue;
     }
     db.run("UPDATE seat_runs SET session_id = ?, bound_via = ? WHERE run_id = ?", [sid, via, run.run_id]);

@@ -669,6 +669,74 @@ test("A1: observe is idempotent — a same-value re-post changes nothing", async
   expect(after).toEqual(before); // unchanged
 });
 
+// A1 (round 2): an ENDED run's session is fair game to re-bind. A restarted seat
+// resuming the same CC session must claim it, not stay dark because the dead
+// seat's run still names the session id. Only OPEN runs enforce uniqueness.
+
+test("A1: observe rebinds a session whose prior owner run has ended (resume)", async () => {
+  const S = "obs-resume-sess";
+  // run A owns S via the env fast path, then unregisters — its run ends but keeps S
+  const regA = await post("/register", { pid: process.pid, cwd: "/tmp/obs-resume-a", git_root: null, tty: null, summary: "A", role: null, model: null, session_id: S });
+  const idA = ((await regA.json()) as { id: string }).id;
+  await post("/unregister", { id: idA });
+  const runA = peekDb((db) => db.query("SELECT session_id, ended_at FROM seat_runs WHERE seat_id = ?").get(idA)) as { session_id: string | null; ended_at: string | null };
+  expect(runA.session_id).toBe(S);
+  expect(runA.ended_at).not.toBeNull(); // A's run ended but still names S
+
+  // run B (live, distinct pid) resumes the SAME CC session and observes it
+  const regB = await post("/register", { pid: broker.pid, cwd: "/tmp/obs-resume-b", git_root: null, tty: null, summary: "B", role: null, model: null });
+  const idB = ((await regB.json()) as { id: string }).id;
+  const obs = await post("/observe-session", { session_id: S, transcript_path: "/tmp/t.jsonl", cwd: "/tmp/obs-resume-b", claude_pid: broker.pid });
+  expect(((await obs.json()) as { ok: boolean }).ok).toBe(true); // the ended owner no longer blocks
+
+  const runB = peekDb((db) => db.query("SELECT session_id, bound_via FROM seat_runs WHERE seat_id = ?").get(idB)) as { session_id: string | null; bound_via: string | null };
+  expect(runB.session_id).toBe(S);
+  expect(runB.bound_via).toBe("observe");
+});
+
+test("A1: token resolution rebinds a session whose prior owner run has ended (resume)", async () => {
+  const CWD = "/tmp/tok-resume";
+  const TOK = "cp-77770000";
+  const S = "tok-resume-sess";
+  seatLog(CWD, S, TOK, { i: 1000, o: 0 });
+
+  // seat A binds S via Layer-1 token match, then unregisters (run ends, keeps S)
+  const regA = await post("/register", { pid: process.pid, cwd: CWD, git_root: null, tty: null, summary: "A", role: null, model: null, seat_token: TOK });
+  const idA = ((await regA.json()) as { id: string }).id;
+  await pollCosts({ since: SINCE_ALL }, (c) => c.rows.some((r) => r.session_id === S && r.seat_id === idA));
+  await post("/unregister", { id: idA });
+
+  // seat B (live, distinct pid) resumes the same CC session with the same token
+  const regB = await post("/register", { pid: broker.pid, cwd: CWD, git_root: null, tty: null, summary: "B", role: null, model: null, seat_token: TOK });
+  const idB = ((await regB.json()) as { id: string }).id;
+
+  // the resolver rebinds S to B (A's run ended, no longer an OPEN owner);
+  // readLedgerWindow's last-run-wins then attributes S's spend to B
+  const { rows } = await pollCosts({ since: SINCE_ALL }, (c) => c.rows.some((r) => r.session_id === S && r.seat_id === idB));
+  expect(rows.find((r) => r.session_id === S)!.seat_id).toBe(idB);
+  const runB = peekDb((db) => db.query("SELECT session_id, bound_via FROM seat_runs WHERE seat_id = ?").get(idB)) as { session_id: string | null; bound_via: string | null };
+  expect(runB.session_id).toBe(S);
+  expect(runB.bound_via).toBe("token");
+});
+
+test("A1: two OPEN runs racing one session still conflict — exactly one binds (invariant intact)", async () => {
+  const CWD = "/tmp/tok-conflict";
+  const TOK = "cp-88880000";
+  const S = "tok-conflict-sess";
+  seatLog(CWD, S, TOK, { i: 1000, o: 0 });
+
+  // two LIVE seats share a token + cwd -> both resolve to S. The first to bind
+  // owns it; the second sees an OPEN owner and is left unbound (no double-attribute).
+  const regA = await post("/register", { pid: process.pid, cwd: CWD, git_root: null, tty: null, summary: "A", role: null, model: null, seat_token: TOK });
+  const idA = ((await regA.json()) as { id: string }).id;
+  const regB = await post("/register", { pid: broker.pid, cwd: CWD, git_root: null, tty: null, summary: "B", role: null, model: null, seat_token: TOK });
+  const idB = ((await regB.json()) as { id: string }).id;
+
+  await pollCosts({ since: SINCE_ALL }, (c) => c.rows.some((r) => r.session_id === S && r.seat_id !== null));
+  const runs = peekDb((db) => db.query("SELECT seat_id, session_id FROM seat_runs WHERE seat_id IN (?, ?)").all(idA, idB)) as { seat_id: string; session_id: string | null }[];
+  expect(runs.filter((r) => r.session_id === S)).toHaveLength(1); // exactly one of the two open runs owns S
+});
+
 // A2: a dead seat swept via /list-seats is FULLY retired (run bounded + mail purged).
 
 test("A2: /list-seats bounds the run and purges undelivered mail of a dead seat (before any sweep tick)", async () => {
@@ -695,6 +763,33 @@ test("A2: /list-seats bounds the run and purges undelivered mail of a dead seat 
   expect(queuedAfter.c).toBe(0); // undeliverable mail purged
   const rowAfter = peekDb((db) => db.query("SELECT id FROM seats WHERE id = ?").get(id));
   expect(rowAfter).toBeNull(); // live row gone
+});
+
+// A2 (round 2): re-registering the same pid is a FULL retirement of the replaced
+// seat, not a bare row swap. A fresh id is issued, so mail still queued to the old
+// seat_id can never be polled or swept — it must be purged and the run bounded.
+
+test("A2: re-registering the same pid purges the replaced seat's mail and bounds its run", async () => {
+  const PID = process.pid;
+  const reg1 = await post("/register", { pid: PID, cwd: "/tmp/rereg", git_root: null, tty: null, summary: "one", role: null, model: null });
+  const id1 = ((await reg1.json()) as { id: string }).id;
+
+  const send = await post("/send-message", { from_id: "cli", to_id: id1, text: "orphan-me" });
+  expect(((await send.json()) as { ok: boolean }).ok).toBe(true);
+  const queuedBefore = peekDb((db) => db.query("SELECT COUNT(*) AS c FROM messages WHERE to_id = ? AND delivered = 0").get(id1)) as { c: number };
+  expect(queuedBefore.c).toBe(1);
+
+  // same pid re-registers -> a NEW seat id; the old one is fully retired
+  const reg2 = await post("/register", { pid: PID, cwd: "/tmp/rereg", git_root: null, tty: null, summary: "two", role: null, model: null });
+  const id2 = ((await reg2.json()) as { id: string }).id;
+  expect(id2).not.toBe(id1);
+
+  const queuedAfter = peekDb((db) => db.query("SELECT COUNT(*) AS c FROM messages WHERE to_id = ? AND delivered = 0").get(id1)) as { c: number };
+  expect(queuedAfter.c).toBe(0); // orphaned mail purged, not left unpollable forever
+  const run1 = peekDb((db) => db.query("SELECT ended_at FROM seat_runs WHERE seat_id = ?").get(id1)) as { ended_at: string | null };
+  expect(run1.ended_at).not.toBeNull(); // replaced run bounded
+  const row1 = peekDb((db) => db.query("SELECT id FROM seats WHERE id = ?").get(id1));
+  expect(row1).toBeNull(); // old live row gone
 });
 
 // A3: the ledger indexer catches in-place rewrites, not just truncation/append.
@@ -776,6 +871,57 @@ test("A3: a plain append still tail-parses (anchor intact, no double count, no m
   writeFileSync(file, line1 + rec("p2", 500));
   got = await pollCosts(A3_WIN, (c) => (sess(c)?.input ?? 0) === 1500);
   expect(sess(got)!.input).toBe(1500); // p1 counted once (not 2500), p2 added
+});
+
+// A3 (round 2): a reset drops the file's PRIOR contribution (its stored session
+// ids), not just the ids present in the newly parsed content. Otherwise a
+// rewrite-to-empty or a changed session_id strands stale, double-countable rows.
+
+test("A3: a rewrite-to-empty clears the file's whole ledger contribution", async () => {
+  const CWD = "/tmp/ms-empty";
+  const projDir = join(PROJECTS_ROOT, projectDirName(CWD));
+  mkdirSync(projDir, { recursive: true });
+  const file = join(projDir, "ms-empty-1.jsonl");
+  const rec = (i: number) =>
+    JSON.stringify({ type: "assistant", sessionId: "ms-empty-1", timestamp: new Date().toISOString(), message: { id: "e1", model: "claude-opus-4-8", usage: { input_tokens: i, output_tokens: 0 } } }) + "\n";
+
+  await post("/register", { pid: broker.pid, cwd: CWD, git_root: null, tty: null, summary: "E", role: null, model: null });
+  const sess = (c: CostsBody) => c.rows.find((r) => r.session_id === "ms-empty-1");
+
+  writeFileSync(file, rec(1000));
+  let got = await pollCosts(A3_WIN, (c) => (sess(c)?.input ?? 0) === 1000);
+  expect(sess(got)!.input).toBe(1000);
+
+  // truncate to empty: the reparse yields zero records, so deleting only the
+  // newly parsed ids would delete nothing. Deleting the STORED ids clears it.
+  writeFileSync(file, "");
+  got = await pollCosts(A3_WIN, (c) => sess(c) === undefined);
+  expect(sess(got)).toBeUndefined(); // contribution gone, not stuck at 1000
+});
+
+test("A3: an in-place rewrite that changes the session_id drops the old session's rows", async () => {
+  const CWD = "/tmp/ms-sidchange";
+  const projDir = join(PROJECTS_ROOT, projectDirName(CWD));
+  mkdirSync(projDir, { recursive: true });
+  const file = join(projDir, "ms-sidchange.jsonl");
+  const rec = (sid: string, id: string, i: number) =>
+    JSON.stringify({ type: "assistant", sessionId: sid, timestamp: new Date().toISOString(), message: { id, model: "claude-opus-4-8", usage: { input_tokens: i, output_tokens: 0 } } }) + "\n";
+
+  await post("/register", { pid: broker.pid, cwd: CWD, git_root: null, tty: null, summary: "SC", role: null, model: null });
+
+  // two records under session S1 (so the single-record rewrite below is strictly
+  // smaller -> a size-shrink reset)
+  writeFileSync(file, rec("ms-sid-1", "a1", 1000) + rec("ms-sid-1", "a2", 500));
+  await pollCosts(A3_WIN, (c) => (c.rows.find((r) => r.session_id === "ms-sid-1")?.input ?? 0) === 1500);
+
+  // rewrite the whole file to one record under a DIFFERENT session S2
+  writeFileSync(file, rec("ms-sid-2", "b1", 700));
+  const got = await pollCosts(
+    A3_WIN,
+    (c) => (c.rows.find((r) => r.session_id === "ms-sid-2")?.input ?? 0) === 700 && c.rows.find((r) => r.session_id === "ms-sid-1") === undefined
+  );
+  expect(got.rows.find((r) => r.session_id === "ms-sid-2")!.input).toBe(700);
+  expect(got.rows.find((r) => r.session_id === "ms-sid-1")).toBeUndefined(); // old session removed, not double-counted
 });
 
 // B: /log message history for `patrol watch`.
