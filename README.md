@@ -7,6 +7,7 @@ per-seat cost tracking, and a profile-aware fleet launcher.
 ```
 patrol up          # boot a whole fleet from patrol.yaml — one command
 patrol status      # who's running, what role, what model, what it costs
+patrol watch       # live TUI: fleet board + message log, across all projects
 patrol send <id> "review the diff in ~/proj/x"
 patrol down        # tear it all down
 ```
@@ -72,6 +73,10 @@ Patrol exists to make that topology cheap to run and easy to operate.
    registration (`CLAUDE_PATROL_*` env, set by the launcher). Orchestrators
    route work by the seat list instead of burning a round-trip asking every
    seat what it runs.
+7. **One screen for the whole fleet.** `patrol watch` is a live TUI: every
+   seat on the machine (whatever project it sits in), a running log of the
+   messages flowing between them, and a send bar — Tab picks a target, Enter
+   messages it. Fleet operation stops meaning six tmux windows and a prayer.
 
 ## Comparison: Claude-Patrol vs claude-peers-mcp
 

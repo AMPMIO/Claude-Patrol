@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.2.1 — 2026-07-10
+
+A Codex adversarial review of v0.2 found three correctness holes in the
+attribution/ledger paths; all fixed. Plus `patrol watch` — a live
+fleet-overview TUI — and a rewritten benchmark claim grounded in repeat-run
+forensics. 147 tests.
+
+### Fixed (Codex review findings)
+- **/observe-session could misattribute spend**: it bound by pid without
+  requiring the run to be unbound, could overwrite a token-bound run, never
+  checked whether another run already owned the posted session_id, and its
+  cwd fallback guessed among multiple candidates. Now: a bound run is never
+  overwritten (same-value re-post is an idempotent ok), a session owned by
+  any other run is rejected, and the cwd fallback binds only when exactly
+  one unbound live run exists — degrade over guess, everywhere.
+- **`/list-seats` orphaned seat_runs**: it deleted a dead seat's row without
+  setting `seat_runs.ended_at` or purging its undelivered messages, so a
+  `patrol status` right after a seat died left the run open forever (still
+  participating in token resolution and every future stats window). One
+  `endSeat()` helper now serves list-seats, the stale sweep, and unregister.
+- **Ledger missed in-place transcript rewrites**: the incremental indexer
+  only re-parsed when a file shrank; a same-size rewrite (or a rewrite that
+  then grew past the byte cursor) kept stale totals forever. The index now
+  stores an anchor hash of the bytes just before the cursor and re-parses
+  from zero whenever those bytes change. Known limit: a rewrite confined to
+  >256 bytes before the cursor with an identical tail is still misread as an
+  append — real Claude Code resume rewrites touch the tail, so this is
+  theoretical.
+
+### Added
+- **`patrol watch`** — live fleet-overview TUI (ink 6 + React 19; inkui
+  components vendored as source): fleet board across all projects (seat,
+  role, model, cwd, live, spend, summary), a running inter-seat message log
+  (auto-follow, scrollback), and an interactive send bar (Tab cycles the
+  target seat, Enter sends as `cli`). Polls /log 1s, /list-seats 2s,
+  /stats 5s; a dead broker shows a reconnect banner instead of crashing.
+- **`/log` broker route** — message history with sender AND recipient
+  role/model context (resolved from seat_runs, so dead seats still render);
+  `after_id` cursor for cheap polling. Feeds the TUI.
+- New runtime dependencies: `ink@^6`, `react@^19` (a deliberate amendment of
+  the stdlib-only rule, for the TUI only).
+
+### Docs / integrity
+- Benchmark claim rewritten around the measured mechanism: a D1 repeat run
+  + forensics showed ~80% of subagent-topology cost is standing context
+  re-bought per spawn (~138k cache_write/spawn on a plugin-heavy config vs
+  ~36k minimal). The config-matched −65% pair stands; dollar totals are now
+  labeled mix-sensitive, with the per-spawn re-buy as the robust number.
+  Both repeat runs recorded in the benchmark matrix (orchestration.md).
+
 ## 0.2.0 — 2026-07-08
 
 The "make the differentiator real" wave: per-seat cost attribution — broken

@@ -228,6 +228,28 @@ daily to accumulate evidence. Keep the files — they're the raw data behind
 any future benchmark writeup, and `--since`/`--until` let you re-slice them
 after the fact instead of re-running against a broker that's moved on.
 
+## Watch the fleet
+
+```bash
+patrol watch
+```
+
+A full-screen live TUI (run it in its own terminal or tmux window, not
+inside a seat): a fleet board of every seat on the machine across all
+projects (seat, role, model, cwd, live, spend, summary), a running log of
+inter-seat messages below it, and a send bar at the bottom.
+
+Keys: `Tab` cycles the send target through live seats; `Enter` sends the
+typed message (as `cli`, same as `patrol send`); `↑`/`↓`/`PgUp`/`PgDn`
+scroll the log (it auto-follows the newest message unless you've scrolled
+up, and shows an "N new" hint until you return to the bottom); `q` or
+Ctrl-C quits and restores the terminal.
+
+Polling: log 1s, seats 2s, spend 5s. If the broker dies mid-watch you get a
+reconnect banner, not a crash — it recovers when the broker is back. A send
+to a dead or malformed id shows the broker's real error inline above the
+input.
+
 ## Known limits in this build (v0.2)
 
 - The channel capability is a Claude Code **research preview** — the
