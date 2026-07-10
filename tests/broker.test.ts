@@ -924,6 +924,55 @@ test("A3: an in-place rewrite that changes the session_id drops the old session'
   expect(got.rows.find((r) => r.session_id === "ms-sid-1")).toBeUndefined(); // old session removed, not double-counted
 });
 
+// A3 (round 3): the legacy-row self-heal. A session_index row written before the
+// session_ids column existed has it NULL; if the transcript was rewritten to empty
+// BEFORE any post-upgrade tick recorded session_ids, the old code could not know
+// the file's prior contribution and left its cost_ledger rows stranded. The heal
+// forces a full reparse of legacy rows and, for a flat top-level file, seeds the
+// filename stem as the prior session id so the stale rows are dropped.
+
+test("A3: a legacy session_index row (NULL session_ids) self-heals a pre-upgrade rewrite-to-empty", async () => {
+  const CWD = "/tmp/ms-legacy";
+  const dir = join(PROJECTS_ROOT, projectDirName(CWD));
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, "ms-legacy-1.jsonl");
+  // the file's PRE-empty content, only used to size the legacy cursor realistically
+  const oldContent =
+    JSON.stringify({ type: "assistant", sessionId: "ms-legacy-1", timestamp: "2026-07-08T10:00:00Z", message: { id: "leg1", model: "claude-opus-4-8", usage: { input_tokens: 1000, output_tokens: 0 } } }) + "\n";
+  // On disk the file is ALREADY empty (the rewrite happened "pre-upgrade"). No seat
+  // is registered here, so the ONLY thing making this project interested — and thus
+  // scanned — is the seeded index row, which we insert together with the ledger rows
+  // in one transaction so no tick ever observes a half-seeded (already-healed) state.
+  writeFileSync(file, "");
+  const wdb = new Database(DB_FILE);
+  wdb.run("PRAGMA busy_timeout = 3000");
+  wdb.transaction(() => {
+    wdb.run(
+      "INSERT OR REPLACE INTO session_index (file_path, parent_session_id, bytes_parsed, mtime_ms, anchor_hash, session_ids) VALUES (?, NULL, ?, 0, NULL, NULL)",
+      [file, Buffer.byteLength(oldContent)]
+    );
+    wdb.run(
+      "INSERT INTO cost_ledger (session_id, attr_session_id, model, bucket_ts, input, output, cache_write, cache_read) VALUES (?, ?, ?, 0, 1000, 0, 0, 0)",
+      ["ms-legacy-1", "ms-legacy-1", "claude-opus-4-8"]
+    );
+    wdb.run("INSERT OR IGNORE INTO seen_msgs (session_id, msg_id) VALUES (?, ?)", ["ms-legacy-1", "leg1"]);
+  })();
+  const seeded = wdb.query("SELECT COUNT(*) AS c FROM cost_ledger WHERE session_id = ?").get("ms-legacy-1") as { c: number };
+  wdb.close();
+  expect(seeded.c).toBe(1); // precondition: the stale ledger row exists before the heal
+
+  // the heal runs on a normal index tick; poll the ledger until the stale row is gone
+  let gone = false;
+  for (let i = 0; i < 60; i++) {
+    const row = peekDb((db) => db.query("SELECT COUNT(*) AS c FROM cost_ledger WHERE session_id = ?").get("ms-legacy-1")) as { c: number };
+    if (row.c === 0) { gone = true; break; }
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  expect(gone).toBe(true); // legacy heal deleted the stranded contribution (stem-seeded prior id)
+  const idx = peekDb((db) => db.query("SELECT session_ids FROM session_index WHERE file_path = ?").get(file)) as { session_ids: string | null };
+  expect(idx.session_ids).not.toBeNull(); // and recorded session_ids so the row is never legacy again
+});
+
 // B: /log message history for `patrol watch`.
 
 type LogMsg = {

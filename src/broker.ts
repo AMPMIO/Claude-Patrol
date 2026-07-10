@@ -13,6 +13,7 @@
  */
 import { Database } from "bun:sqlite";
 import { statSync, openSync, readSync, closeSync } from "node:fs";
+import { basename } from "node:path";
 import { getSecret, TOKEN_HEADER } from "../shared/auth.ts";
 import {
   priceFor,
@@ -799,9 +800,19 @@ function indexFile(file: string, parentSessionId: string | null) {
   const prev = idxGet.get(file) as { bytes_parsed: number; mtime_ms: number; anchor_hash: string | null; session_ids: string | null } | null;
   let fromByte = prev?.bytes_parsed ?? 0;
   let reset = false;
+  // A row written before the session_ids column existed (additive migration) has
+  // it NULL. Such a row can't answer "what did this file contribute?" at reset
+  // time, so a pre-upgrade transcript rewritten before any post-upgrade append
+  // would strand its old ledger rows (round-3 finding). One-time self-heal: force
+  // a full reparse of every legacy row — bypassing the unchanged early-return —
+  // so session_ids gets recorded AND reconciled against current content before any
+  // rewrite can slip past. After this pass session_ids is non-null, so the row is
+  // never legacy again. (session_ids NULL also implies the earlier anchor_hash was
+  // NULL or predates it, so keying on session_ids covers every legacy row.)
+  const isLegacy = prev != null && prev.session_ids == null;
   if (prev) {
-    if (size === prev.bytes_parsed && mtime === prev.mtime_ms) return; // unchanged
-    if (size < prev.bytes_parsed) {
+    if (!isLegacy && size === prev.bytes_parsed && mtime === prev.mtime_ms) return; // unchanged (already backfilled)
+    if (isLegacy || size < prev.bytes_parsed) {
       fromByte = 0;
       reset = true;
     } else if (mtime !== prev.mtime_ms && prev.anchor_hash != null && anchorHash(file, prev.bytes_parsed) !== prev.anchor_hash) {
@@ -817,6 +828,17 @@ function indexFile(file: string, parentSessionId: string | null) {
 
   const newIds = new Set(records.map((r) => r.sessionId));
   const priorIds = parseSessionIds(prev?.session_ids ?? null);
+  // Legacy self-heal, best-effort prior-id recovery when current content can no
+  // longer supply it (the file was already rewritten/emptied pre-upgrade): a flat
+  // top-level file's contributed session id IS its filename stem (sessionFiles
+  // yields parent=null for these), so seed it into priorIds to delete the stale
+  // rows below even if the content is now gone. A subagents/ file's own session id
+  // is not in its filename and is unrecoverable once its content is gone — that
+  // residual sliver is a known limit: its stale rows persist until the file next
+  // changes with content.
+  if (isLegacy && parentSessionId == null) {
+    priorIds.push(basename(file).replace(/\.jsonl$/, ""));
+  }
   // A reset re-adds only the current content, so its recorded contribution IS the
   // new ids; a plain append accumulates (prior ∪ new) so a session an append tick
   // happens not to re-mention isn't dropped from the file's recorded contribution.
