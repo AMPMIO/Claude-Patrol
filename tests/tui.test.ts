@@ -17,6 +17,7 @@ import {
   msgLine,
   headerTotals,
 } from "../src/tui/data.ts";
+import { clampCursor } from "../src/tui/components/TextInput.tsx";
 
 function msg(id: number, over: Partial<LogMessage> = {}): LogMessage {
   return {
@@ -158,4 +159,21 @@ test("headerTotals is null-safe", () => {
   expect(
     headerTotals({ notifications: 4, messages: 12, cost_usd: 1.3, unattributed_usd: 0.05 }),
   ).toEqual({ spendUsd: 1.3, wakes: 4 });
+});
+
+// ---- TextInput cursor clamp ----
+
+test("clampCursor snaps a stranded cursor back onto a shrunken value (the post-send clear bug)", () => {
+  expect(clampCursor(5, 0)).toBe(0); // draft "hello" cleared to "" -> cursor lands at 0, backspace works again
+  expect(clampCursor(5, 3)).toBe(3); // value shrank to length 3 -> cursor clamps to the new end
+});
+
+test("clampCursor leaves an in-range cursor untouched (mid-string editing preserved)", () => {
+  expect(clampCursor(2, 5)).toBe(2); // cursor already inside the value
+  expect(clampCursor(5, 5)).toBe(5); // cursor at the end
+  expect(clampCursor(0, 0)).toBe(0); // empty value, cursor at start
+});
+
+test("clampCursor never returns a negative cursor", () => {
+  expect(clampCursor(-3, 5)).toBe(0);
 });

@@ -1,10 +1,20 @@
 // Vendored from inkui (github.com/kamlesh723/inkui) `text-input`. Local edits:
 // import path -> ./theme.ts; guard Tab / vertical-scroll keys so the parent's
 // useInput owns them (otherwise Tab appends a tab char to the draft).
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { Box, Text, useInput, useApp, useStdin } from "ink";
 import { darkTheme } from "./theme.ts";
 import type { InkUITheme } from "./theme.ts";
+
+// Keep the cursor inside [0, length]. The cursor is local state seeded from the
+// initial value.length; when the CONTROLLED value shrinks out from under it (the
+// watch app clears the draft after a send), an unclamped cursor sits past the new
+// end — backspace then no-ops until it walks back one press at a time. Clamping
+// only ever lowers the cursor, so mid-string editing (cursor already ≤ length) is
+// untouched; it just snaps a now-out-of-range cursor back onto the value.
+export function clampCursor(cursor: number, length: number): number {
+  return Math.max(0, Math.min(cursor, length));
+}
 
 export interface TextInputProps {
   /** Controlled value */
@@ -96,6 +106,12 @@ const FocusedInput: React.FC<FocusedInputProps> = ({
 }) => {
   const { exit } = useApp();
   const [cursor, setCursor] = useState(value.length);
+
+  // Re-clamp whenever the controlled value changes (e.g. the parent clears the
+  // draft after submit) so the cursor never strands past the new end.
+  useEffect(() => {
+    setCursor((c) => clampCursor(c, value.length));
+  }, [value]);
 
   useInput((input, key) => {
     if (key.ctrl && input === "c") { exit(); return; }
