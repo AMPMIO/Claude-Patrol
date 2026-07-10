@@ -188,7 +188,9 @@ stale recorded pid is actually yours). The broker daemon **survives `patrol
 down`** — it's launched detached (nohup + orphaned to launchd), so tearing down
 the fleet leaves it running to hold cost history and keep indexing. Confirm
 with `curl -s 127.0.0.1:7900/health`. To stop it too:
-`kill $(lsof -ti :7900)`.
+`kill $(lsof -ti :7900 -sTCP:LISTEN)` — the `-sTCP:LISTEN` matters: a bare
+`lsof -ti :7900` also matches the client sockets of anything connected to the
+broker (a running `patrol watch`, seat servers), and you'd kill those too.
 
 ## Telemetry
 
