@@ -7,6 +7,7 @@ import type { Seat, SeatStats, SeatId, LogResponse, StatsResponse } from "../../
 import { brokerPost, BrokerError, gitRoot, pidAlive, usd, truncate } from "../commands/_client.ts";
 import {
   type LogState,
+  type ConnState,
   emptyLog,
   mergeLog,
   indexStats,
@@ -16,8 +17,12 @@ import {
   shortId,
   roleTag,
   shortenCwd,
+  truncateCwd,
   hhmmss,
   headerTotals,
+  initConn,
+  reduceConn,
+  connView,
 } from "./data.ts";
 import { Panel } from "./components/Panel.tsx";
 import { Table, type Cell, type Column } from "./components/Table.tsx";
@@ -83,7 +88,7 @@ function WatchApp() {
   const [totals, setTotals] = useState<StatsResponse["totals"] | null>(null);
   const [log, setLog] = useState<LogState>(emptyLog());
   const [targetId, setTargetId] = useState<SeatId | null>(null);
-  const [brokerUp, setBrokerUp] = useState(true);
+  const [conn, setConn] = useState<ConnState>(initConn);
   const [draft, setDraft] = useState("");
   const [sendError, setSendError] = useState<string | null>(null);
 
@@ -101,8 +106,8 @@ function WatchApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [liveKey]);
 
-  // Polling: /log 1s, /list-seats 2s, /stats 5s. brokerUp reflects the core
-  // /list-seats reachability only — /log and /stats can be absent (parallel
+  // Polling: /log 1s, /list-seats 2s, /stats 5s. Connection health reflects the
+  // core /list-seats reachability only — /log and /stats can be absent (parallel
   // package) without flapping the health banner.
   usePoll(async () => {
     try {
@@ -123,10 +128,10 @@ function WatchApp() {
         cwd: process.cwd(),
         git_root: gitRoot(),
       });
-      setBrokerUp(true);
+      setConn((c) => reduceConn(c, true));
       setSeats(s);
     } catch {
-      setBrokerUp(false);
+      setConn((c) => reduceConn(c, false));
     }
   }, 2000);
 
@@ -141,6 +146,7 @@ function WatchApp() {
   }, 5000);
 
   // ---- layout budget ----
+  const cv = connView(conn);
   const boardRows = seats.length === 0 ? 1 : seats.length;
   const chrome =
     1 /* header */ +
@@ -150,7 +156,7 @@ function WatchApp() {
     1 /* input */ +
     1 /* footer */ +
     (sendError ? 1 : 0) +
-    (!brokerUp ? 1 : 0) +
+    (cv.banner ? 1 : 0) +
     1 /* log status/hint line */;
   const logVisible = Math.max(3, rows - chrome);
 
@@ -233,7 +239,7 @@ function WatchApp() {
       { text: shortId(s.id), dim: !alive },
       { text: roleTag(s.role), dim: !alive },
       { text: s.model ?? "-", dim: !alive },
-      { text: shortenCwd(s.cwd, HOME), dim: !alive },
+      { text: truncateCwd(shortenCwd(s.cwd, HOME), cwdW), dim: !alive },
       { text: alive ? "yes" : "no", color: alive ? "green" : "red" },
       { text: usd(st?.cost_usd ?? 0), align: "right", dim: !alive },
       { text: s.summary || "-", dim: !alive },
@@ -248,7 +254,7 @@ function WatchApp() {
     <Box flexDirection="column" width={cols}>
       {/* header strip */}
       <Box>
-        <Text color={brokerUp ? "green" : "red"}>{brokerUp ? "●" : "○"}</Text>
+        <Text color={cv.dotColor}>{cv.dotGlyph}</Text>
         <Text bold> patrol watch </Text>
         <Text color="gray"> seats </Text>
         <Text bold>{seats.length}</Text>
@@ -258,7 +264,7 @@ function WatchApp() {
         <Text bold>{ht.wakes}</Text>
       </Box>
 
-      {!brokerUp && <Text color="yellow">broker unreachable — retrying</Text>}
+      {cv.banner && <Text color={cv.dotColor}>{cv.banner}</Text>}
 
       {/* fleet board */}
       <Panel title="FLEET" width={cols}>
@@ -305,13 +311,15 @@ function WatchApp() {
         <TextInput value={draft} onChange={setDraft} onSubmit={onSubmit} placeholder="message… (Tab to switch seat)" />
       </Box>
 
-      {/* footer */}
+      {/* footer — the last hint is conditional: while a draft is held, `q` types
+          a literal 'q' (it only quits on an empty input), so advertise Esc-clear
+          instead of a "quit" that won't fire. */}
       <KeyHint
         keys={[
           { key: "Tab", label: "target" },
           { key: "↑↓ PgUp/Dn", label: "scroll" },
           { key: "Enter", label: "send" },
-          { key: "q", label: "quit" },
+          draft.length > 0 ? { key: "esc", label: "clear" } : { key: "q", label: "quit" },
         ]}
       />
     </Box>

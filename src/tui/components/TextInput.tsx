@@ -1,10 +1,27 @@
 // Vendored from inkui (github.com/kamlesh723/inkui) `text-input`. Local edits:
 // import path -> ./theme.ts; guard Tab / vertical-scroll keys so the parent's
 // useInput owns them (otherwise Tab appends a tab char to the draft).
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { Box, Text, useInput, useApp, useStdin } from "ink";
 import { darkTheme } from "./theme.ts";
 import type { InkUITheme } from "./theme.ts";
+
+// Keep the cursor inside [0, length]. The cursor is local state seeded from the
+// initial value.length; when the CONTROLLED value shrinks out from under it (the
+// watch app clears the draft after a send), an unclamped cursor sits past the new
+// end — backspace then no-ops until it walks back one press at a time. Clamping
+// only ever lowers the cursor, so mid-string editing (cursor already ≤ length) is
+// untouched; it just snaps a now-out-of-range cursor back onto the value.
+export function clampCursor(cursor: number, length: number): number {
+  return Math.max(0, Math.min(cursor, length));
+}
+
+// Ctrl-U kill-line: delete from the start of the line up to the cursor, leaving
+// the text after it. With the cursor at the end (the send bar's usual state) this
+// clears the whole draft; the new cursor is always 0. Pure so it's unit-testable.
+export function killToLineStart(value: string, cursor: number): string {
+  return value.slice(Math.max(0, Math.min(cursor, value.length)));
+}
 
 export interface TextInputProps {
   /** Controlled value */
@@ -97,6 +114,12 @@ const FocusedInput: React.FC<FocusedInputProps> = ({
   const { exit } = useApp();
   const [cursor, setCursor] = useState(value.length);
 
+  // Re-clamp whenever the controlled value changes (e.g. the parent clears the
+  // draft after submit) so the cursor never strands past the new end.
+  useEffect(() => {
+    setCursor((c) => clampCursor(c, value.length));
+  }, [value]);
+
   useInput((input, key) => {
     if (key.ctrl && input === "c") { exit(); return; }
 
@@ -114,6 +137,13 @@ const FocusedInput: React.FC<FocusedInputProps> = ({
     }
 
     if (key.return) { onSubmit?.(value); return; }
+
+    // Line editing that the send bar advertises: Esc clears the draft, Ctrl-U
+    // kills to line start. Both handled here (before the ctrl/meta/escape guard)
+    // so they mutate the value instead of being swallowed as parent-owned keys.
+    if (key.escape) { onChange(""); setCursor(0); return; }
+    if (key.ctrl && input === "u") { onChange(killToLineStart(value, cursor)); setCursor(0); return; }
+
     if (key.ctrl || key.meta || key.escape) return;
 
     onChange(value.slice(0, cursor) + input + value.slice(cursor));
