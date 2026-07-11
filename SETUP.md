@@ -263,9 +263,14 @@ input.
   dereg). If a killed seat always lingers ~30s (stale-sweep timing), the
   hook's `$PPID` isn't the pid the seat registered — report it, because the
   same join backs exact attribution for manually-opened sessions.
-- `bg` (headless) seats: channel-flag support under `claude --bg` is
-  untested — if a bg seat never wakes on send, that's the first suspect;
-  report it (tmux seats are the verified path).
+- `bg` (headless) seats **do not wake on push** — CONFIRMED (2026-07-10 live
+  test): the development-channels capability requires an interactive consent
+  no headless session can answer, so the channel never registers and pushes
+  are silently dropped. The seat still registers, heartbeats, and can be
+  driven by its launch prompt or `claude attach`; it just won't react to
+  `patrol send`. Use tmux for any seat that must receive messages; treat
+  `bg` as outbound-only until the plugin ships on an approved allowlist
+  (v0.3 packaging).
 - `/costs` windows are hour-granular (ledger buckets); `patrol status`
   totals are unaffected.
 - Multi-user / cross-machine is out of scope until v0.3's auth redesign.
