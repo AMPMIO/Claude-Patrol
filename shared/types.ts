@@ -219,7 +219,16 @@ export interface SeatSpec {
   role?: string; // default: name
   model: string; // REQUIRED — a seat never boots on the default model
   cwd?: string; // default: config file's directory
-  backend?: "tmux" | "bg" | "current"; // default tmux; bg = claude --bg headless
+  // default tmux; bg = claude --bg headless (outbound-only: no push-wake, see
+  // SETUP known limits); codex = v0.2.2 adapter seat — a bun daemon that
+  // registers with the broker and drives ONE persistent `codex exec resume`
+  // thread: each inbound patrol message becomes a codex turn, stdout returns
+  // via patrol send to the requester. model: then names the codex model
+  // (label + adapter --model flag). Spike-verified 2026-07-11: thread memory
+  // survives resume; fresh spawn ≈ 15.8k tokens, resumed turns pay a growing
+  // half-price prefix — the adapter retires and restarts its thread past a
+  // budget (see CODEX_THREAD_RETIRE_TOKENS in the adapter).
+  backend?: "tmux" | "bg" | "current" | "codex";
   profile?: ProfileSpec | string; // string = named preset: "lite" | "peer" | "full"
   prompt?: string; // optional initial prompt (briefing) passed at launch
   silent?: boolean; // v0.2: skip seat-token marker injection (seat stays on Layer-3 heuristic attribution)

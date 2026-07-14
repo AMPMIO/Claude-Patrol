@@ -21,7 +21,7 @@ export interface SeatPlan {
   spec: SeatSpec;
   role: string;
   cwd: string;
-  backend: "tmux" | "bg" | "current";
+  backend: "tmux" | "bg" | "current" | "codex";
   resolved: ResolvedProfile | null;
   settingsOverlay: Record<string, unknown> | null;
 }
@@ -62,6 +62,11 @@ export function validateConfig(config: PatrolConfig): void {
     // clean config error, not a crash later in planSeat/resolveProfile.
     if (typeof seat.profile === "string" && !(seat.profile in NAMED_PROFILES)) {
       throw new Error(`seat "${name}" has unknown profile "${seat.profile}" (expected ${PRESET_NAMES.join(" | ")}, or an inline profile map)`);
+    }
+    // Contract frozen ahead of the adapter (v0.2.2 WP-J): fail the fleet loudly
+    // rather than silently launching a codex seat down the tmux path.
+    if (seat.backend === "codex") {
+      throw new Error(`seat "${name}": backend "codex" is not implemented yet (v0.2.2 in progress)`);
     }
   }
 }
