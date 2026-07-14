@@ -61,7 +61,8 @@ export interface CostRow {
 //   /set-summary      SetSummaryRequest      → { ok: true }
 //   /list-seats       ListSeatsRequest       → Seat[]            (raw array, no wrapper)
 //   /send-message     SendMessageRequest     → { ok: boolean; error?: string }
-//   /poll-messages    PollMessagesRequest    → PollMessagesResponse
+//   /poll-messages    PollMessagesRequest    → PollMessagesResponse  (v0.2.3: LEASES rows, does not deliver)
+//   /ack              AckRequest             → { ok: true }          (v0.2.3: marks leased messages delivered)
 //   /unregister       UnregisterRequest      → { ok: true }
 //   /costs            CostsRequest           → CostsResponse
 //   /observe-session  ObserveSessionRequest  → { ok: boolean }   (v0.2 Layer 2; see kill criterion)
@@ -133,6 +134,17 @@ export interface SendMessageRequest {
 }
 export interface PollMessagesRequest {
   id: SeatId;
+}
+// v0.2.3 lease/ack delivery. /poll-messages now LEASES rows (sets leased_at,
+// returns them) rather than marking them delivered — a message is delivered
+// ONLY when the consumer /ack's it after the reply/notification is durably
+// out. Unacked leases expire after LEASE_TTL and redeliver, so a consumer that
+// dies mid-work (a codex turn can run 10 min) loses nothing. message_ids are
+// the DeliveredMessage.id values from the poll batch; acking an unknown/foreign
+// id is a no-op.
+export interface AckRequest {
+  id: SeatId;
+  message_ids: number[];
 }
 // Dereg by id (seat-server shutdown) or by pid (SessionEnd hook: the hook's
 // $PPID is the registered Claude process pid). Exactly one required.
@@ -232,6 +244,13 @@ export interface SeatSpec {
   profile?: ProfileSpec | string; // string = named preset: "lite" | "peer" | "full"
   prompt?: string; // optional initial prompt (briefing) passed at launch
   silent?: boolean; // v0.2: skip seat-token marker injection (seat stays on Layer-3 heuristic attribution)
+  // v0.2.3, codex seats only: sandbox the codex process runs under. DEFAULT
+  // read-only — a codex seat cannot touch files unless the yaml opts in. The
+  // ADAPTER builds the codex argv, so a message can never escalate this. A
+  // write-enabled seat additionally runs a vetted PreToolUse deny-hook that
+  // blocks destructive commands (rm -rf, git push --force, curl|sh, out-of-cwd
+  // writes) — spike-verified 2026-07-14 to block even under workspace-write.
+  sandbox?: "read-only" | "workspace-write" | "danger-full-access";
 }
 
 export interface ProfileSpec {
