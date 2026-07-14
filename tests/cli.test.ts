@@ -104,6 +104,7 @@ beforeAll(async () => {
       }
       if (url.pathname === "/send-message") {
         lastSend = body;
+        if (body.from_id === "garbage") return Response.json({ ok: false, error: 'from_id garbage is not a live seat (or "cli")' });
         if (body.to_id === "ghost") return Response.json({ ok: false, error: 'no live seat "ghost"' });
         return Response.json({ ok: true });
       }

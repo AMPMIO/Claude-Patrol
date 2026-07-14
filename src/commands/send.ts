@@ -1,4 +1,10 @@
 // patrol send <seat-id> <message> — thin broker call, from_id="cli".
+//
+// There is deliberately no `--as <seat-id>` flag: it would be a one-flag
+// provenance-forgery primitive (anyone could speak as any seat), which contradicts
+// the seat trust model — the [from ...] header is the ONLY trusted identity. The
+// codex adapter doesn't need it either; it replies under its own real seat id.
+// Returns in v0.3 with per-seat capability tokens, where ownership is proven.
 import type { SendMessageRequest } from "../../shared/types.ts";
 import { brokerPost, BrokerError } from "./_client.ts";
 
