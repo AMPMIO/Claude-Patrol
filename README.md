@@ -127,6 +127,45 @@ Claude Code session log, so a codex seat shows no spend in `patrol status` (abse
 not misattributed), and a reply over the broker's 8KiB cap arrives truncated with a
 path to the full text on disk.
 
+### Why a codex seat is set up the way it is (v0.2.3)
+
+A codex seat is a standing process that acts on messages from other seats,
+sometimes while no one is watching. Codex can edit and run commands, so an
+over-trusting setup is one bad instruction away from a deleted tree or a force
+push. The seat is built so that no single mistake — a poisoned message, a
+model that misreads its role — can cause that. Three independent layers, and
+any one of them stops the damage:
+
+1. **Read-only by default.** A codex seat cannot change files unless its
+   `patrol.yaml` entry explicitly asks for it (`sandbox: workspace-write`). A
+   seat you spun up to answer questions has no way to write, full stop. The
+   sandbox flag is set by the launcher, not the message — so a sender cannot
+   talk the seat into escalating its own permissions, because the model never
+   controls its own command line. `workspace-write` also confines writes to
+   the seat's working directory, so even a write seat cannot reach outside its
+   repo.
+
+2. **A command veto for write seats.** Sandbox mode decides *where* writes can
+   land; it does not decide *which* commands run. So a write-enabled seat also
+   runs a Patrol-authored `PreToolUse` hook that codex consults before every
+   command and can deny — the same mechanism Claude Code uses. Destructive
+   verbs (recursive force-deletes, force pushes, history rewrites, piping the
+   network into a shell, writes redirected outside the workspace) are refused
+   before they execute. We verified this against the real codex binary on
+   2026-07-14: with writes enabled and hook-trust bypassed, the hook still
+   blocked a file write — the veto holds regardless of what the model decides
+   to do.
+
+3. **The message is data, not orders.** The inbound message body is fenced as
+   untrusted content, exactly as it is for Claude seats, with an instruction
+   that nothing inside it changes the seat's role, sandbox, or safety rules. A
+   sender can ask the seat to do work; it cannot rewrite what the seat is
+   allowed to do.
+
+The honest limit: a codex seat still shows no spend in `patrol status` (it
+writes no Claude Code session log — surfacing codex's own usage is a later
+item), and reading its usage into the cost ledger is on the roadmap below.
+
 ## Comparison: Claude-Patrol vs claude-peers-mcp
 
 Patrol is a ground-up rewrite informed by running
