@@ -7,18 +7,18 @@ answers messages from accumulated context, instead of a fresh codex subagent per
 task. 173 tests.
 
 ### Added
-- **`backend: codex` — the codex adapter seat.** A bun daemon that registers with
-  the broker like any other seat and drives ONE persistent `codex exec resume`
+- **`backend: codex`, the codex adapter seat.** A bun daemon that registers with
+  the broker like any other seat and drives one persistent `codex exec resume`
   thread. Each inbound patrol message becomes exactly one codex turn; replies come
   back under the seat's own id. Turns are FIFO-serialized: a turn in flight makes
-  later messages wait, so reply order and thread coherence hold. (Concurrent
-  `resume` on one thread was measured as safe — both turns append, no corruption —
-  so serialization is a coherence choice, not a lock.)
+  later messages wait, so reply order and thread coherence hold. Concurrent `resume`
+  on one thread was measured as safe (both turns append, nothing corrupts), so the
+  serialization is a coherence choice rather than a lock.
 - **Thread retirement on cumulative billed tokens.** Resumed turns resend a growing
   prefix, so a long-lived thread's cost climbs per turn. Past
   `CODEX_THREAD_RETIRE_BILLED_TOKENS` (default 300k) the next turn starts a fresh
-  thread carrying a one-line handoff. The budget is a cost proxy — cumulative billed
-  input, cached tokens included — not a live context-size ceiling.
+  thread carrying a one-line handoff. The budget is a cost proxy: cumulative billed
+  input, cached tokens included, not a live context-size ceiling.
 - **Truncate + spill for oversize replies.** The broker caps a message at 8KiB and
   codex routinely returns more for code. Replies over the cap are truncated to fit
   and the full text written to `~/.claude-patrol/replies/<seat>/<msg>.txt`, with the
@@ -33,8 +33,8 @@ task. 173 tests.
 ### Known limits (v1 of this feature)
 - **Codex spend is not attributed.** `patrol status` shows no per-seat cost for a
   codex seat: attribution reads Claude Code session logs, and codex writes none.
-  Its spend is not misattributed to another seat — it simply does not appear.
-  Parsing codex's own usage into the ledger is a v0.4 item.
+  The spend is absent, not charged to some other seat. Parsing codex's own usage
+  into the ledger is a v0.4 item.
 - **Effort and sandbox cannot be set in `patrol.yaml`.** `SeatSpec` is frozen for
   v0.2, so a codex seat takes them from adapter defaults (`medium`,
   `workspace-write`) or from `CODEX_REASONING_EFFORT` / `CODEX_SANDBOX_MODE` in the

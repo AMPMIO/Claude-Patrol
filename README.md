@@ -77,18 +77,17 @@ Patrol exists to make that topology cheap to run and easy to operate.
    seat on the machine (whatever project it sits in), a running log of the
    messages flowing between them, and a send bar — Tab picks a target, Enter
    messages it. Fleet operation stops meaning six tmux windows and a prayer.
-8. **Codex seats: a standing codex thread, not a fresh subagent per task.**
-   `backend: codex` boots an adapter that registers as an ordinary seat and
-   keeps one persistent `codex exec resume` thread alive. You message it like
-   a teammate and it answers from what it already knows. The usual way to use
-   codex from an agent is to spawn it per task, which means it re-reads the
-   repo and rebuilds its picture every single time; a standing thread pays
-   that once. Turns are serialized so the thread stays coherent, and the
-   thread retires itself once its resent prefix has cost enough to be worth
-   restarting. Two honest limits: codex writes no Claude Code session log, so
-   a codex seat shows no spend in `patrol status` (it is absent, not
-   misattributed), and replies over the broker's 8KiB cap arrive truncated
-   with a path to the full text.
+8. **Codex seats.** `backend: codex` boots an adapter that registers as an
+   ordinary seat and keeps one `codex exec resume` thread alive behind it. You
+   message it like any other seat and it answers from the context that thread
+   has already built. The usual way to reach codex from an agent is to spawn it
+   per task, which re-explores the repo on every run; a standing thread pays
+   for that once. Turns are serialized, so the thread stays coherent, and it
+   retires itself once its resent prefix crosses a billed-token budget (default
+   300k). Two limits worth knowing before you rely on it: codex writes no Claude
+   Code session log, so a codex seat shows no spend in `patrol status` (absent,
+   not misattributed), and a reply over the broker's 8KiB cap arrives truncated
+   with a path to the full text on disk.
 
 ## Comparison: Claude-Patrol vs claude-peers-mcp
 
@@ -188,17 +187,17 @@ Sequenced, not parallel: v0.2 has to prove itself in real use before v0.3 starts
 No dates.
 
 **v0.2.x — now.** Per-seat cost attribution, the `patrol watch` TUI, codex seats.
-Being dogfooded: a real fleet runs on this repo, and the last three waves of work
-here were built and reviewed by seats Patrol launched.
+Dogfooded: a real fleet runs on this repo, and recent work here was built and
+reviewed by seats Patrol launched.
 
 **v0.3 — the publish gate.** Nothing ships to a marketplace until these land.
 - Auth redesign: a unix domain socket plus per-seat capability tokens, so a seat's
-  identity is bound rather than asserted. This is also what makes a safe
-  `patrol send --as <seat>` possible — the token proves ownership, which is why the
-  flag was cut from v0.2.2 rather than shipped.
+  identity is bound rather than asserted. A bound identity is also what a safe
+  `patrol send --as <seat>` needs, which is why that flag was cut from v0.2.2
+  instead of shipped.
 - Lease/ack delivery, so a failed push cannot silently drop a message.
-- Plugin packaging, so a marketplace install resolves its own paths. This is also
-  the real fix for headless seats never hearing pushes.
+- Plugin packaging, so a marketplace install resolves its own paths. It is also the
+  real fix for headless seats never hearing pushes.
 
 **v0.4 — after it has proven itself.** A Rust CLI; SSE or long-poll replacing the
 1s poll; codex cost parsing, so non-Claude seats get per-seat spend too; a retention
