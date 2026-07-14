@@ -211,10 +211,26 @@ export function computeCosts(opts: ComputeCostsOptions = {}): CostsResponse {
 // is never stranded. This is why the cursor advances by bytes, not by parsed
 // records. Truncation (size < fromByte) is the caller's to detect; it then
 // passes fromByte=0.
+// This runs INSIDE the broker process, synchronously, on the index tick. Allocating the
+// whole unseen tail in one Buffer (what v0.2.2 did) means a large transcript stalls every
+// broker HTTP request and heartbeat behind one giant allocation + parse. So read in bounded
+// chunks and carry only the partial trailing line across them: peak memory is
+// chunkBytes + at most maxRecordBytes, whatever the file's size.
+export const TAIL_CHUNK_BYTES = 1 << 20; // 1 MiB per read
+// A single JSONL record this large is not a real Claude Code entry; it is a corrupt or
+// adversarial line. Cap it rather than growing the partial-line buffer without bound, and
+// skip past it so the cursor still advances (otherwise it would jam the indexer forever).
+export const TAIL_MAX_RECORD_BYTES = 8 << 20; // 8 MiB
+
+const EMPTY = Buffer.alloc(0);
+
 export function parseFileTail(
   file: string,
-  fromByte: number
+  fromByte: number,
+  opts: { chunkBytes?: number; maxRecordBytes?: number } = {}
 ): { records: UsageDelta[]; bytesParsed: number; size: number } {
+  const chunkBytes = Math.max(1, opts.chunkBytes ?? TAIL_CHUNK_BYTES);
+  const maxRecordBytes = Math.max(1, opts.maxRecordBytes ?? TAIL_MAX_RECORD_BYTES);
   let size: number;
   try {
     size = statSync(file).size;
@@ -230,23 +246,55 @@ export function parseFileTail(
     return { records: [], bytesParsed: start, size };
   }
   try {
-    const len = size - start;
-    const buf = Buffer.alloc(len);
-    let read = 0;
-    while (read < len) {
-      const n = readSync(fd, buf, read, len - read, start + read);
-      if (n <= 0) break;
-      read += n;
-    }
-    const slice = buf.subarray(0, read);
-    const lastNl = slice.lastIndexOf(0x0a); // byte offset — must not use string length (UTF-8 multibyte)
-    if (lastNl < 0) return { records: [], bytesParsed: start, size }; // no complete line yet
     const records: UsageDelta[] = [];
-    for (const line of slice.subarray(0, lastNl + 1).toString("utf8").split("\n")) {
-      const rec = parseUsageLine(line);
-      if (rec) records.push(rec);
+    const chunk = Buffer.alloc(Math.min(chunkBytes, size - start));
+    let pending = EMPTY; // bytes of the current line, still waiting for its newline
+    let skipping = false; // the current line blew the cap; discard bytes until it ends
+    // Cursor semantics are unchanged from v0.2.2: only COMPLETE lines are consumed, so
+    // bytesParsed lands just past the last newline and a torn trailing write is re-read
+    // next tick.
+    let consumed = start;
+    let pos = start;
+
+    while (pos < size) {
+      const want = Math.min(chunk.length, size - pos);
+      const n = readSync(fd, chunk, 0, want, pos);
+      if (n <= 0) break;
+      const view = chunk.subarray(0, n);
+      let off = 0;
+      while (off < view.length) {
+        const nl = view.indexOf(0x0a, off); // byte scan — never string length (UTF-8 multibyte)
+        if (nl === -1) {
+          const rest = view.subarray(off);
+          if (skipping) {
+            // still inside the oversize line: drop these bytes
+          } else if (pending.length + rest.length > maxRecordBytes) {
+            skipping = true;
+            pending = EMPTY;
+          } else {
+            pending = pending.length ? Buffer.concat([pending, rest]) : Buffer.from(rest);
+          }
+          break; // need the next chunk to finish this line
+        }
+        if (skipping) {
+          skipping = false; // the oversize line ends at this newline; it is discarded
+          pending = EMPTY;
+        } else {
+          const seg = view.subarray(off, nl);
+          const line = pending.length ? Buffer.concat([pending, seg]) : seg;
+          pending = EMPTY;
+          if (line.length <= maxRecordBytes) {
+            const rec = parseUsageLine(line.toString("utf8"));
+            if (rec) records.push(rec);
+          }
+        }
+        consumed = pos + nl + 1; // byte offset just past this newline
+        off = nl + 1;
+      }
+      pos += n;
     }
-    return { records, bytesParsed: start + lastNl + 1, size };
+    // No complete line in the tail yet -> consumed is still `start`, matching v0.2.2.
+    return { records, bytesParsed: consumed, size };
   } finally {
     closeSync(fd);
   }

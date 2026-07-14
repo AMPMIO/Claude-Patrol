@@ -244,6 +244,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         // Same fenced composition as channel push — the fallback path must not
         // be the weaker (injectable) rendering.
         const { content } = composeNotification(messages);
+        // Ack only once the text is composed: /poll-messages LEASES, and the lease is
+        // what makes a crash between here and the return redeliver instead of vanish.
+        // Returning this content to the model IS the delivery, so settle the batch now.
+        await ackMessages(messages);
         return {
           content: [
             { type: "text" as const, text: `${messages.length} new message(s):\n\n${content}` },
@@ -260,6 +264,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     };
   }
 });
+
+// Settle a leased batch (v0.2.3). Every consumer of /poll-messages MUST call this once
+// the messages are durably out, or the leases expire and the batch redelivers forever.
+// A failed ack is logged, not thrown: the worst case is one redelivery, which is the
+// side this design deliberately errs on.
+async function ackMessages(msgs: DeliveredMessage[]): Promise<void> {
+  if (!myId || msgs.length === 0) return;
+  try {
+    await brokerFetch("/ack", { id: myId, message_ids: msgs.map((m) => m.id) });
+  } catch (e) {
+    log(`Ack failed (batch will redeliver): ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
 
 // Coalesce the whole poll batch into ONE channel notification: each
 // notification wakes the session for a full turn at full context price, so N
@@ -279,6 +296,10 @@ async function pollAndPushMessages() {
       method: "notifications/claude/channel",
       params: { content, meta },
     });
+    // Ack AFTER the notification resolves, never before: /poll-messages only LEASES, so
+    // if this seat dies mid-push the lease expires and the batch redelivers. Acking first
+    // would re-open exactly the hole lease/ack exists to close.
+    await ackMessages(msgs);
     log(`Pushed ${msgs.length} message(s) in one notification`);
   } catch (e) {
     log(`Poll error: ${e instanceof Error ? e.message : String(e)}`);
