@@ -98,3 +98,31 @@ is a re-verification, not a gamble).
   coalescing + launcher); bolting cost-tracking onto agmsg means living in
   someone else's architecture for the flagship feature. Reverses if: agmsg
   ships cost tracking before Patrol v0.1 lands.
+
+## D8 — Delivery: lease/ack, and exactly what it does NOT buy (v0.2.3)
+
+`/poll-messages` leases rather than delivers: it stamps `leased_at`, returns the
+rows, and the message is marked delivered only when the consumer `/ack`s it after
+the message is out. An unacked lease is re-offered once it passes `LEASE_TTL`
+(15 min, chosen to clear the codex adapter's 10-minute per-turn cap).
+
+- Winning option: lease/ack. A failed push (notification threw, broker briefly
+  unreachable) no longer drops the message silently, and a broker restart
+  mid-flight re-offers it.
+- Losing option: mark-delivered-on-poll (v0.2.2) — rejected: the broker asserted
+  delivery it had no evidence of, so any failure between poll and push ate the
+  message with no trace.
+- **Scope, stated because it is easy to overclaim:** this does NOT survive the
+  consumer process CRASHING. `cleanStaleSeats` sees the dead pid within 30s and
+  `endSeat()` deletes that seat's undelivered mail long before a 15-minute lease
+  could expire — and a restarted seat registers under a NEW id, so its old mail is
+  orphaned by `to_id` regardless. Crash recovery needs seat identity that is stable
+  across restarts, which is v0.3's capability tokens. Do not write crash-survival
+  claims against the v0.2.3 code.
+- Redelivery is bounded: after `MAX_DELIVERY_ATTEMPTS` (3) leases without an ack, a
+  row is dead-lettered — it stops being handed out and stops logging wake-ups, but
+  is kept as undelivered for `/log`. Unbounded redelivery would wake and bill a seat
+  forever, and would inflate the coalescing and cost telemetry that is this
+  project's whole differentiator.
+- **Kill criterion:** if seats routinely hit the dead-letter cap in normal use, the
+  ack contract is wrong (not the consumers) — revisit before adding retries.

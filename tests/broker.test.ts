@@ -1187,6 +1187,31 @@ describe("lease/ack delivery", () => {
     expect((await poll(victim)).map((m) => m.text)).toEqual(["not-yours"]);
   });
 
+  test("an unackable batch is dead-lettered after MAX_DELIVERY_ATTEMPTS, not redelivered forever", async () => {
+    const id = await seat(process.pid);
+    await lpost("/send-message", { from_id: "cli", to_id: id, text: "nobody-can-ack-me" });
+
+    // A consumer that leases and never acks, over and over. Without a cap this loops forever:
+    // every expiry re-offers the batch, wakes the seat, and logs another paid notification —
+    // which would quietly corrupt the cost/coalescing telemetry that is the point of Patrol.
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      expect((await poll(id)).map((m) => m.text)).toEqual(["nobody-can-ack-me"]);
+      await new Promise((r) => setTimeout(r, L_TTL_MS + 250));
+    }
+
+    // Third strike: it stops being handed out.
+    expect(await poll(id)).toHaveLength(0);
+    await new Promise((r) => setTimeout(r, L_TTL_MS + 250));
+    expect(await poll(id)).toHaveLength(0); // and stays that way — no more wake-ups, no more billing
+
+    // But it is NOT deleted: it survives as an undelivered dead-letter, which is the evidence
+    // you want when asking why a seat never answered.
+    const log = (await (await lpost("/log", {})).json()) as { messages: Array<{ text: string; delivered: boolean }> };
+    const dead = log.messages.find((m) => m.text === "nobody-can-ack-me");
+    expect(dead).toBeDefined();
+    expect(dead!.delivered).toBe(false);
+  });
+
   test("ack validates its shape", async () => {
     const id = await seat(process.pid);
     expect((await lpost("/ack", { id, message_ids: "nope" })).status).toBe(400);

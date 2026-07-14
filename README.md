@@ -235,10 +235,17 @@ reviewed by seats Patrol launched.
 **v0.3 — hardening.** The work that has to land before I'd suggest anyone depend on
 this for real:
 - Auth redesign: a unix domain socket plus per-seat capability tokens, so a seat's
-  identity is bound rather than asserted. A bound identity is also what a safe
-  `patrol send --as <seat>` needs, which is why that flag was cut from v0.2.2
-  instead of shipped.
-- Lease/ack delivery, so a failed push cannot silently drop a message.
+  identity is bound rather than asserted. The tokens must gate `/poll-messages` and
+  `/ack`, not just sending: today any caller holding the broker secret can read
+  another seat's mail, and with `/ack` can silently destroy it — acking a victim's
+  batch marks it delivered and it is never seen. A bound identity is also what a safe
+  `patrol send --as <seat>` needs, which is why that flag was cut from v0.2.2 instead
+  of shipped.
+- Consumer-crash redelivery. v0.2.3's lease/ack covers a *live* seat whose push failed
+  or whose broker blipped; it does **not** survive the seat process dying, because the
+  stale-seat sweep deletes a dead seat's undelivered mail and a restarted seat comes
+  back under a new id. Surviving a crash needs identity that is stable across restarts,
+  so it is gated on the capability tokens above rather than shippable on its own.
 - Plugin packaging, so a cloned install resolves its own paths. It is also the real
   fix for headless seats never hearing pushes.
 
