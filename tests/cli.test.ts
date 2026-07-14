@@ -104,6 +104,7 @@ beforeAll(async () => {
       }
       if (url.pathname === "/send-message") {
         lastSend = body;
+        if (body.from_id === "garbage") return Response.json({ ok: false, error: 'from_id garbage is not a live seat (or "cli")' });
         if (body.to_id === "ghost") return Response.json({ ok: false, error: 'no live seat "ghost"' });
         return Response.json({ ok: true });
       }
@@ -161,6 +162,19 @@ test("send posts the right envelope and returns 0", async () => {
   expect(r.code).toBe(0);
   expect(r.out).toContain("sent to aaaa1111bbbb2222");
   expect(lastSend).toEqual({ from_id: "cli", to_id: "aaaa1111bbbb2222", text: "hello world" });
+});
+
+test("send --as passes a live seat id through as from_id", async () => {
+  lastSend = null;
+  const r = await capture(() => send(["--as", "aaaa1111bbbb2222", "cccc3333dddd4444", "hello"]));
+  expect(r.code).toBe(0);
+  expect(lastSend).toEqual({ from_id: "aaaa1111bbbb2222", to_id: "cccc3333dddd4444", text: "hello" });
+});
+
+test("send --as surfaces the broker's forged-sender error", async () => {
+  const r = await capture(() => send(["--as", "garbage", "aaaa1111bbbb2222", "hello"]));
+  expect(r.code).toBe(1);
+  expect(r.err).toContain("not a live seat");
 });
 
 test("send without a message is a usage error (exit 2)", async () => {

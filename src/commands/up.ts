@@ -57,6 +57,9 @@ function readInstalledPlugins(): Record<string, boolean> {
 // Stable (not temp) so a re-boot overwrites cleanly and humans can inspect —
 // mirrors ccl keeping lite-settings.json around.
 function materialize(plan: SeatPlan): ComposePaths {
+  // A codex adapter has no Claude settings or MCP surface. Avoid even writing
+  // unused per-seat MCP files so its launch remains entirely adapter-owned.
+  if (plan.backend === "codex") return { settingsFile: null, mcpConfigFile: null };
   let settingsFile: string | null = null;
   if (plan.settingsOverlay) {
     settingsFile = join(PROFILE_DIR, `${plan.spec.name}.settings.json`);
@@ -90,7 +93,9 @@ export default async function up(args: string[]): Promise<number> {
   const installed = readInstalledPlugins();
   const plans = config.seats.map((s) => planSeat(s, installed, configDir));
 
-  const tmuxSeats = plans.filter((p) => p.backend === "tmux");
+  // Codex adapter seats intentionally run as visible tmux windows too; tmux
+  // session teardown therefore stops them along with ordinary tmux seats.
+  const tmuxSeats = plans.filter((p) => p.backend === "tmux" || p.backend === "codex");
   if (tmuxSeats.length > 0 && hasSession()) {
     console.error(`patrol up: tmux session "patrol" already exists — run \`patrol down\` first`);
     return 1;
@@ -108,7 +113,7 @@ export default async function up(args: string[]): Promise<number> {
 
   // tmux seats
   const tmuxLaunch: TmuxSeat[] = composed
-    .filter((c) => c.plan.backend === "tmux")
+    .filter((c) => c.plan.backend === "tmux" || c.plan.backend === "codex")
     .map((c) => ({ name: c.plan.spec.name, cwd: c.plan.cwd, env: c.env, argv: c.argv }));
   if (tmuxLaunch.length > 0) {
     launchTmux(tmuxLaunch);

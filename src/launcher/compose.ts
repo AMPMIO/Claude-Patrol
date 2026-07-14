@@ -9,6 +9,9 @@ import { seatMarker, SEAT_TOKEN_ENV, type PatrolConfig, type SeatSpec } from "..
 import { resolveProfile, buildSettingsOverlay, PRESET_NAMES, NAMED_PROFILES, type ResolvedProfile } from "../profiles.ts";
 
 export const TMUX_SESSION = "patrol";
+// Kept here (rather than in up.ts) so composeSeat remains pure and callers can
+// assert the executable adapter path without touching the filesystem.
+export const CODEX_SEAT = resolve(import.meta.dir, "../codex-seat.ts");
 const EMPTY_MCP = '{"mcpServers":{}}';
 
 // A seat name becomes a filesystem path segment (per-seat overlay files) and a
@@ -52,8 +55,8 @@ export function validateConfig(config: PatrolConfig): void {
       throw new Error(`seat "${name}" has no model — a seat never boots on the default model (would leak the Fable default)`);
     }
     const backend = seat.backend ?? "tmux";
-    if (backend !== "tmux" && backend !== "bg" && backend !== "current") {
-      throw new Error(`seat "${name}" has invalid backend "${backend}" (expected tmux | bg | current)`);
+    if (backend !== "tmux" && backend !== "bg" && backend !== "current" && backend !== "codex") {
+      throw new Error(`seat "${name}" has invalid backend "${backend}" (expected tmux | bg | current | codex)`);
     }
     if (backend === "current" && seat.profile !== undefined) {
       throw new Error(`seat "${name}" uses backend "current" with a profile — a running session cannot be re-profiled; drop the profile or change the backend`);
@@ -62,11 +65,6 @@ export function validateConfig(config: PatrolConfig): void {
     // clean config error, not a crash later in planSeat/resolveProfile.
     if (typeof seat.profile === "string" && !(seat.profile in NAMED_PROFILES)) {
       throw new Error(`seat "${name}" has unknown profile "${seat.profile}" (expected ${PRESET_NAMES.join(" | ")}, or an inline profile map)`);
-    }
-    // Contract frozen ahead of the adapter (v0.2.2 WP-J): fail the fleet loudly
-    // rather than silently launching a codex seat down the tmux path.
-    if (seat.backend === "codex") {
-      throw new Error(`seat "${name}": backend "codex" is not implemented yet (v0.2.2 in progress)`);
     }
   }
 }
@@ -106,6 +104,21 @@ export interface Composed {
 // generated here — so tests can assert the exact argv+env.
 export function composeSeat(plan: SeatPlan, paths: ComposePaths, seatToken: string | null = null): Composed {
   const { spec, resolved } = plan;
+
+  // Codex seats are broker adapters, not Claude sessions. They deliberately
+  // receive no Claude argv, marker, settings, or MCP configuration.
+  if (plan.backend === "codex") {
+    const argv = ["bun", CODEX_SEAT, "--cwd", plan.cwd, "--role", plan.role, "--model", spec.model];
+    if (spec.prompt) argv.push("--prompt", spec.prompt);
+    return {
+      argv,
+      env: {
+        CLAUDE_PATROL_ROLE: plan.role,
+        CLAUDE_PATROL_MODEL: spec.model,
+      },
+    };
+  }
+
   const argv = ["claude", "--model", spec.model, "--name", spec.name];
 
   if (plan.backend === "bg") argv.push("--bg");

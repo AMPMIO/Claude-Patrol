@@ -6,7 +6,7 @@ import {
   resolveProfile, buildEnabledPlugins, buildSettingsOverlay, matchPlugin, NAMED_PROFILES,
 } from "../src/profiles.ts";
 import {
-  validateConfig, planSeat, composeSeat, shQuote, seatShellLine, tmuxCommands,
+  validateConfig, planSeat, composeSeat, shQuote, seatShellLine, tmuxCommands, CODEX_SEAT,
   selectBgPidsToKill, patrolMcpConfig, type SeatPlan, type ComposePaths,
 } from "../src/launcher/compose.ts";
 import { seatMarker, SEAT_TOKEN_ENV, type PatrolConfig, type SeatSpec } from "../shared/types.ts";
@@ -172,6 +172,14 @@ function pathsFor(p: SeatPlan): ComposePaths {
 const CHAN = ["--dangerously-load-development-channels", "server:patrol"];
 
 describe("composeSeat argv+env", () => {
+  test("codex seat plans and composes the adapter argv without Claude extras", () => {
+    const p = plan({ name: "codex", role: "reviewer", model: "gpt-5.6-terra", backend: "codex", profile: "peer", prompt: "review changes" });
+    expect(() => validateConfig(cfg([p.spec]))).not.toThrow();
+    const { argv, env } = composeSeat(p, pathsFor(p), "cp-0375a012");
+    expect(argv).toEqual(["bun", CODEX_SEAT, "--cwd", "/work", "--role", "reviewer", "--model", "gpt-5.6-terra", "--prompt", "review changes"]);
+    expect(env).toEqual({ CLAUDE_PATROL_ROLE: "reviewer", CLAUDE_PATROL_MODEL: "gpt-5.6-terra" });
+  });
+
   test("tmux full seat: no mcp flags, no settings, prompt positional", () => {
     const p = plan({ name: "orchestrator", role: "lead", model: "opus", backend: "tmux", profile: "full", prompt: "go" });
     const { argv, env } = composeSeat(p, pathsFor(p));
