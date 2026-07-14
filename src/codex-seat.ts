@@ -175,8 +175,12 @@ function byteClamp(text: string, maxBytes: number): string {
     const over = Buffer.byteLength(kept, "utf8") - maxBytes;
     kept = kept.slice(0, Math.max(0, kept.length - Math.max(1, Math.ceil(over / 4))));
   }
-  const last = kept.charCodeAt(kept.length - 1);
-  if (last >= 0xd800 && last <= 0xdbff) kept = kept.slice(0, -1); // unpaired high surrogate
+  // `while`, not `if`: a cut can strand consecutive lone surrogates.
+  while (kept.length > 0) {
+    const last = kept.charCodeAt(kept.length - 1);
+    if (last < 0xd800 || last > 0xdbff) break; // not an unpaired high surrogate
+    kept = kept.slice(0, -1);
+  }
   return kept;
 }
 
@@ -304,10 +308,19 @@ function getTty(): string | null {
   }
 }
 
+// A thread that fails this many times IN A ROW is abandoned and the next turn starts
+// fresh. 2, not 1: a single transient blip should not discard an otherwise good thread.
+// Without this, adopting the thread id of a failed first turn can wedge the seat forever —
+// a failed resume emits no thread.started (so the id never changes) and may emit no usage
+// (so retirement, the only other reset, never fires), leaving every future message to hit
+// the same broken thread and answer "Codex error" for the life of the seat.
+const MAX_CONSECUTIVE_THREAD_FAILURES = 2;
+
 export class CodexThread {
   private threadId: string | null = null;
   private billedTokens = 0;
   private lastReply = "";
+  private consecutiveFailures = 0;
 
   // executable is injectable only for tests; production always uses "codex".
   constructor(
@@ -372,14 +385,28 @@ export class CodexThread {
     // A failed FIRST turn may still have opened a thread; adopt the id so the retry resumes
     // it rather than orphaning a thread we are already being billed for.
     if (parsed.threadId) this.threadId = parsed.threadId;
-    if (exitCode !== 0 || timedOut) {
-      const detail = timedOut
-        ? "Codex turn exceeded 10-minute limit"
-        : (err.trim() || out.trim() || `codex exited ${exitCode}`);
+
+    const fail = (detail: string): CodexTurnResult => {
+      // Abandon a thread that keeps failing, or an adopted half-initialised id would wedge
+      // the seat forever (see MAX_CONSECUTIVE_THREAD_FAILURES).
+      this.consecutiveFailures++;
+      if (this.threadId && this.consecutiveFailures >= MAX_CONSECUTIVE_THREAD_FAILURES) {
+        log(`Abandoning Codex thread ${this.threadId} after ${this.consecutiveFailures} consecutive failures; next turn starts fresh`);
+        this.threadId = null;
+        this.billedTokens = 0;
+        this.consecutiveFailures = 0;
+      }
       return { ...parsed, ok: false, error: detail };
+    };
+
+    if (exitCode !== 0 || timedOut) {
+      return fail(timedOut
+        ? "Codex turn exceeded 10-minute limit"
+        : (err.trim() || out.trim() || `codex exited ${exitCode}`));
     }
-    if (!parsed.reply) return { ...parsed, ok: false, error: "codex completed without an agent_message" };
+    if (!parsed.reply) return fail("codex completed without an agent_message");
     this.lastReply = parsed.reply;
+    this.consecutiveFailures = 0;
     return { ...parsed, ok: true, error: null };
   }
 }

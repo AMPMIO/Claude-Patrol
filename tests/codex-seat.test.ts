@@ -40,9 +40,18 @@ beforeAll(() => {
 printf '%s\\n' "$*" >> "$FAKE_CODEX_LOG"
 last=""
 for value in "$@"; do last="$value"; done
+if [ "$last" = "failinit" ]; then
+  # A first turn that OPENS a thread and then fails: codex emitted thread.started (so the
+  # id is adoptable) but the turn still exited nonzero. This is the adopt path.
+  echo '{"type":"thread.started","thread_id":"fake-thread"}'
+  echo '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":0,"reasoning_output_tokens":0}}'
+  echo "fake codex init failure" >&2
+  exit 7
+fi
 if [ "$last" = "fail" ]; then
   # A real turn can burn (and be billed for) its prefix and THEN fail, so emit usage
   # before exiting nonzero — that is the case the billing fix has to cover.
+  # NOTE: no thread.started — a failed *resume* never emits one.
   echo '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":0,"reasoning_output_tokens":0}}'
   echo "fake codex failure" >&2
   exit 7
@@ -181,4 +190,40 @@ test("a failed turn is still billed toward retirement", async () => {
   expect(failed.ok).toBe(false);
   await thread.run("next"); // 24 > 20 -> retire, so this turn carries a handoff
   expect(readFileSync(invocationLog, "utf8")).toContain("continuing prior thread; summary:");
+});
+
+test("a failed first turn adopts the thread it opened, and two consecutive failures abandon it", async () => {
+  // (a) ADOPT: a first turn that opened a thread then failed must still be resumed — we are
+  //     already being billed for that thread; starting fresh would orphan it.
+  // (b) ESCAPE HATCH: but a permanently-broken adopted thread must not wedge the seat. A
+  //     failed resume emits no thread.started (id never changes), so without a failure
+  //     counter every later message would hit the same dead thread forever.
+  writeFileSync(invocationLog, "");
+  const thread = fakeThread();
+
+  const first = await thread.run("failinit"); // opens fake-thread, then fails
+  expect(first).toMatchObject({ ok: false, threadId: "fake-thread" });
+
+  const second = await thread.run("fail"); // must RESUME the adopted id -> proves (a)
+  expect(second.ok).toBe(false);
+
+  const third = await thread.run("works"); // 2 consecutive failures cleared it -> fresh
+  expect(third).toMatchObject({ ok: true, reply: "reply:works" });
+
+  const calls = readFileSync(invocationLog, "utf8").trim().split("\n");
+  expect(calls).toHaveLength(3);
+  expect(calls[1]).toContain("exec resume fake-thread"); // (a) the adopted id was resumed
+  expect(calls[2]).not.toContain("resume"); // (b) turn 3 started a FRESH thread
+  expect(calls[2]).toContain("exec --json");
+});
+
+test("a single failure does not discard an otherwise good thread", async () => {
+  // The counter is 2, not 1: one transient blip must not throw away a working thread.
+  writeFileSync(invocationLog, "");
+  const thread = fakeThread();
+  await thread.run("one"); // success -> thread open
+  await thread.run("fail"); // one failure only
+  await thread.run("two"); // must still RESUME, not start fresh
+  const calls = readFileSync(invocationLog, "utf8").trim().split("\n");
+  expect(calls[2]).toContain("exec resume fake-thread");
 });
