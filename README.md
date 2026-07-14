@@ -77,6 +77,18 @@ Patrol exists to make that topology cheap to run and easy to operate.
    seat on the machine (whatever project it sits in), a running log of the
    messages flowing between them, and a send bar — Tab picks a target, Enter
    messages it. Fleet operation stops meaning six tmux windows and a prayer.
+8. **Codex seats: a standing codex thread, not a fresh subagent per task.**
+   `backend: codex` boots an adapter that registers as an ordinary seat and
+   keeps one persistent `codex exec resume` thread alive. You message it like
+   a teammate and it answers from what it already knows. The usual way to use
+   codex from an agent is to spawn it per task, which means it re-reads the
+   repo and rebuilds its picture every single time; a standing thread pays
+   that once. Turns are serialized so the thread stays coherent, and the
+   thread retires itself once its resent prefix has cost enough to be worth
+   restarting. Two honest limits: codex writes no Claude Code session log, so
+   a codex seat shows no spend in `patrol status` (it is absent, not
+   misattributed), and replies over the broker's 8KiB cap arrive truncated
+   with a path to the full text.
 
 ## Comparison: Claude-Patrol vs claude-peers-mcp
 
@@ -98,7 +110,7 @@ Patrol is a ground-up rewrite informed by running
 | Boot latency | LLM auto-summary API call (up to 3s, external dep) | opt-in only; seats self-describe |
 | Message table | grows forever | delivered messages purged after 7 days |
 | Packaging | manual clone + .mcp.json | Claude Code plugin (commands, skill, hook, MCP) + CLI/daemon |
-| Tests | none | 110 across broker, costs, launcher, CLI, integration |
+| Tests | none | 173 across broker, costs, launcher, CLI, codex adapter, integration |
 
 ## Quickstart
 
@@ -110,6 +122,7 @@ bun install && bun link
 cp patrol.yaml.example patrol.yaml   # edit seats
 patrol up
 patrol status
+patrol watch                          # live fleet board + message log
 ```
 
 `patrol.yaml`:
@@ -124,10 +137,19 @@ seats:
     profile: peer          # no plugins, patrol MCP only — cheap seat
   - name: scout
     model: sonnet
-    backend: bg            # headless via `claude --bg`
+    backend: bg            # headless via `claude --bg` — see the caveat below
     profile: peer
     prompt: "You are a research scout. Await tasks via patrol."
+  - name: cx
+    model: gpt-5.6-terra
+    backend: codex         # standing codex thread, messaged like any seat
+    prompt: "You are the codex seat. Answer from the thread's accumulated context."
 ```
+
+A `bg` seat registers and shows up in `patrol status`, but it never receives
+message pushes: the development-channels flag sits behind an interactive consent
+gate a headless session cannot answer. Use `tmux` (or `codex`) for anything
+message-driven; `bg` is for seats that only need to exist.
 
 Profiles: `lite` (no plugins, no MCP), `peer` (no plugins + patrol seat
 server), `full` (inherit everything), or an inline map with a per-seat
@@ -160,13 +182,35 @@ plugin subset:
   content match first, then the SessionStart hook, then a window heuristic
   that reports "unattributed" rather than guess wrong.
 
+## Roadmap
+
+Sequenced, not parallel: v0.2 has to prove itself in real use before v0.3 starts.
+No dates.
+
+**v0.2.x — now.** Per-seat cost attribution, the `patrol watch` TUI, codex seats.
+Being dogfooded: a real fleet runs on this repo, and the last three waves of work
+here were built and reviewed by seats Patrol launched.
+
+**v0.3 — the publish gate.** Nothing ships to a marketplace until these land.
+- Auth redesign: a unix domain socket plus per-seat capability tokens, so a seat's
+  identity is bound rather than asserted. This is also what makes a safe
+  `patrol send --as <seat>` possible — the token proves ownership, which is why the
+  flag was cut from v0.2.2 rather than shipped.
+- Lease/ack delivery, so a failed push cannot silently drop a message.
+- Plugin packaging, so a marketplace install resolves its own paths. This is also
+  the real fix for headless seats never hearing pushes.
+
+**v0.4 — after it has proven itself.** A Rust CLI; SSE or long-poll replacing the
+1s poll; codex cost parsing, so non-Claude seats get per-seat spend too; a retention
+sweep for the ledger; per-task cost tags; a Warp launch backend.
+
 ## Status / caveats
 
 v0.2. Cost attribution now survives the case that broke it in v0.1: several
 seats working in the same repo. It also keeps history across seat teardown
 and broker restarts, serves `/costs` from an incrementally indexed ledger
 instead of walking every log on request, fences delivered messages against
-header forgery, and validates all broker input. 110 tests.
+header forgery, and validates all broker input. 173 tests.
 
 Single-machine by design. The `claude/channel` capability is a
 research-preview Claude Code feature (`--dangerously-load-development-channels`);

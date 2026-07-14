@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.2.2 — 2026-07-14
+
+Codex seats: a standing `codex` thread that registers as a real Patrol seat and
+answers messages from accumulated context, instead of a fresh codex subagent per
+task. 173 tests.
+
+### Added
+- **`backend: codex` — the codex adapter seat.** A bun daemon that registers with
+  the broker like any other seat and drives ONE persistent `codex exec resume`
+  thread. Each inbound patrol message becomes exactly one codex turn; replies come
+  back under the seat's own id. Turns are FIFO-serialized: a turn in flight makes
+  later messages wait, so reply order and thread coherence hold. (Concurrent
+  `resume` on one thread was measured as safe — both turns append, no corruption —
+  so serialization is a coherence choice, not a lock.)
+- **Thread retirement on cumulative billed tokens.** Resumed turns resend a growing
+  prefix, so a long-lived thread's cost climbs per turn. Past
+  `CODEX_THREAD_RETIRE_BILLED_TOKENS` (default 300k) the next turn starts a fresh
+  thread carrying a one-line handoff. The budget is a cost proxy — cumulative billed
+  input, cached tokens included — not a live context-size ceiling.
+- **Truncate + spill for oversize replies.** The broker caps a message at 8KiB and
+  codex routinely returns more for code. Replies over the cap are truncated to fit
+  and the full text written to `~/.claude-patrol/replies/<seat>/<msg>.txt`, with the
+  path in the footer. Truncation is right even ignoring the cap: a 100KB dump inside
+  a channel wake bills the receiver's whole context, whereas a path lets them opt in
+  with a Read.
+- **Poll backpressure.** A codex seat stops draining the broker while a turn is
+  queued or running. A turn can hold the queue for the full 10-minute cap, and
+  anything pulled would live only in RAM — lost if the seat dies. Undelivered work
+  now stays broker-side, so a restart re-delivers it.
+
+### Known limits (v1 of this feature)
+- **Codex spend is not attributed.** `patrol status` shows no per-seat cost for a
+  codex seat: attribution reads Claude Code session logs, and codex writes none.
+  Its spend is not misattributed to another seat — it simply does not appear.
+  Parsing codex's own usage into the ledger is a v0.4 item.
+- **Effort and sandbox cannot be set in `patrol.yaml`.** `SeatSpec` is frozen for
+  v0.2, so a codex seat takes them from adapter defaults (`medium`,
+  `workspace-write`) or from `CODEX_REASONING_EFFORT` / `CODEX_SANDBOX_MODE` in the
+  environment it is launched from. Moving them into the yaml needs a contract change.
+- **Replies over 8KiB are truncated**, not chunked. The receiver gets a spill path,
+  not the whole reply inline.
+
+### Changed
+- **`patrol send --as <seat-id>` was cut.** It would let any local caller speak as
+  any seat, which contradicts the trust model where the `[from …]` header is the only
+  trusted identity — and the codex adapter never needed it, since it replies under its
+  own real seat id. It returns in v0.3 alongside per-seat capability tokens, where
+  ownership is proven rather than asserted.
+
+### Also
+- **Headless (`backend: bg`) seats never receive channel pushes.** The
+  development-channels flag sits behind an interactive consent gate a headless session
+  can't answer, so a bg seat registers and appears in `patrol status` but never wakes
+  on a message. Use `tmux` for anything message-driven; `bg` is for seats that only
+  need to exist. The real fix is plugin packaging (v0.3).
+
 ## 0.2.1 — 2026-07-10
 
 A Codex adversarial review of v0.2 found three correctness holes in the
