@@ -227,3 +227,23 @@ test("a single failure does not discard an otherwise good thread", async () => {
   const calls = readFileSync(invocationLog, "utf8").trim().split("\n");
   expect(calls[2]).toContain("exec resume fake-thread");
 });
+
+test("thread-less failures do not abandon the next thread on arrival", async () => {
+  // Regression: a failure with no thread open still incremented consecutiveFailures (the
+  // abandon guard needs a threadId, so it never fired to reset it). After two such
+  // failures the counter sat at 2, so the NEXT turn that actually opened a thread adopted
+  // it and abandoned it in the same breath — orphaning a thread we are billed for, which
+  // is precisely what the adopt exists to prevent. Adopting a new id resets the count.
+  writeFileSync(invocationLog, "");
+  const thread = fakeThread();
+  await thread.run("fail"); // thread-less failure (no thread.started)
+  await thread.run("fail"); // thread-less failure -> naive counter would now be 2
+  const opened = await thread.run("failinit"); // opens fake-thread, then fails
+  expect(opened).toMatchObject({ ok: false, threadId: "fake-thread" });
+
+  await thread.run("works"); // must RESUME the adopted thread, not start fresh
+  const calls = readFileSync(invocationLog, "utf8").trim().split("\n");
+  expect(calls).toHaveLength(4);
+  expect(calls[3]).toContain("exec resume fake-thread");
+  expect(calls[3]).not.toContain("--cd"); // resume shape, i.e. genuinely not a fresh exec
+});

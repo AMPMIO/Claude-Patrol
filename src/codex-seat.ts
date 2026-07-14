@@ -384,7 +384,14 @@ export class CodexThread {
     }
     // A failed FIRST turn may still have opened a thread; adopt the id so the retry resumes
     // it rather than orphaning a thread we are already being billed for.
-    if (parsed.threadId) this.threadId = parsed.threadId;
+    if (parsed.threadId && parsed.threadId !== this.threadId) {
+      this.threadId = parsed.threadId;
+      // The failure count belongs to the OLD thread. Carrying it over would defeat the
+      // adopt: thread-less failures (which never open an id, so the abandon guard never
+      // fires) inflate the counter, and the next adopted thread would be abandoned on
+      // arrival — orphaning the very thread we are already billed for.
+      this.consecutiveFailures = 0;
+    }
 
     const fail = (detail: string): CodexTurnResult => {
       // Abandon a thread that keeps failing, or an adopted half-initialised id would wedge
