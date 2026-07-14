@@ -445,6 +445,12 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
   return { ok: true };
 }
 
+// DO NOT MAKE THIS ASYNC. The SELECT and the lease UPDATEs below are one atomic claim ONLY
+// because this runs synchronously in a single-process broker: no await means nothing can
+// interleave between them. Add an await (or a second broker process) and two concurrent
+// polls — the push loop and a check_messages call — can select the same rows before either
+// leases them, and the batch gets delivered twice. Nothing here will fail loudly if that
+// happens; it will just double-wake a seat and bill it twice.
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   const now = Date.now();
   const expiry = new Date(now - LEASE_TTL_MS).toISOString();
