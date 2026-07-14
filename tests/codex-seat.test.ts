@@ -41,6 +41,9 @@ printf '%s\\n' "$*" >> "$FAKE_CODEX_LOG"
 last=""
 for value in "$@"; do last="$value"; done
 if [ "$last" = "fail" ]; then
+  # A real turn can burn (and be billed for) its prefix and THEN fail, so emit usage
+  # before exiting nonzero — that is the case the billing fix has to cover.
+  echo '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":0,"reasoning_output_tokens":0}}'
   echo "fake codex failure" >&2
   exit 7
 fi
@@ -79,7 +82,7 @@ test("parses the documented thread, reply, and structured usage events", () => {
 
 test("argv and environment configure the adapter without running Codex", () => {
   const parsed = parseCodexSeatArgs(["--cwd", "/repo", "--role", "reviewer", "--model", "gpt-test", "--effort", "high", "--sandbox", "read-only"], {
-    CODEX_THREAD_RETIRE_TOKENS: "42",
+    CODEX_THREAD_RETIRE_BILLED_TOKENS: "42",
   });
   expect(parsed).toEqual({
     cwd: "/repo", role: "reviewer", model: "gpt-test", effort: "high", sandbox: "read-only", retireTokens: 42, initialPrompt: "",
@@ -150,4 +153,32 @@ test("oversize replies are truncated under the broker cap and point at the spill
   const cutMb = truncateForBroker(multibyte, path);
   expect(Buffer.byteLength(cutMb.text, "utf8")).toBeLessThanOrEqual(MAX_SEND_BYTES);
   expect(cutMb.text).not.toContain("�");
+
+  // Astral chars are TWO UTF-16 units: a naive slice can strand a high surrogate, which
+  // encodes as U+FFFD. Cut must drop the unpaired half instead of corrupting the reply.
+  const emoji = "🙂".repeat(MAX_SEND_BYTES);
+  const cutEmoji = truncateForBroker(emoji, path);
+  expect(Buffer.byteLength(cutEmoji.text, "utf8")).toBeLessThanOrEqual(MAX_SEND_BYTES);
+  expect(cutEmoji.text).not.toContain("�");
+  expect(Buffer.from(cutEmoji.text, "utf8").toString("utf8")).toBe(cutEmoji.text); // round-trips clean
+
+  // Contract holds even when the footer alone would blow the budget (absurd spill path).
+  const longPath = "/x".repeat(4000);
+  const tiny = truncateForBroker("y".repeat(100), longPath, 64);
+  expect(Buffer.byteLength(tiny.text, "utf8")).toBeLessThanOrEqual(64);
+});
+
+test("a failed turn is still billed toward retirement", async () => {
+  // The prefix was sent and charged even though the turn errored — not billing it would
+  // let the re-sent-prefix tax grow unbounded across a run of failures.
+  // Fixture bills 12 (10 input + 2 cached) per turn. Threshold 20 means ONE success alone
+  // (12) must NOT retire, but success + failed turn (24) MUST — so this passes only if the
+  // failed turn is counted.
+  writeFileSync(invocationLog, "");
+  const thread = fakeThread(20);
+  await thread.run("one"); // success: billed 12, opens the thread
+  const failed = await thread.run("fail"); // errors, but its usage was emitted and billed -> 24
+  expect(failed.ok).toBe(false);
+  await thread.run("next"); // 24 > 20 -> retire, so this turn carries a handoff
+  expect(readFileSync(invocationLog, "utf8")).toContain("continuing prior thread; summary:");
 });

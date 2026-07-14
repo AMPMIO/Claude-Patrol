@@ -66,7 +66,7 @@ export function parseCodexSeatArgs(args: string[], env: NodeJS.ProcessEnv = proc
     }
     values[key] = value;
   }
-  const parsedRetire = Number(env.CODEX_THREAD_RETIRE_TOKENS ?? "300000");
+  const parsedRetire = Number(env.CODEX_THREAD_RETIRE_BILLED_TOKENS ?? "300000");
   return {
     cwd: values.cwd ?? env.CLAUDE_PATROL_CWD ?? process.cwd(),
     role: values.role ?? env.CLAUDE_PATROL_ROLE ?? "codex",
@@ -137,10 +137,13 @@ export function parseCodexJsonl(output: string): ParsedCodexEvents {
   return { threadId, reply: replies.join("\n"), usage };
 }
 
-// Retirement happens before the next turn, after a completed turn has pushed
-// accumulated input over the configured limit.
-export function shouldRetireThread(accumulatedInputTokens: number, retireTokens: number): boolean {
-  return accumulatedInputTokens > retireTokens;
+// Retirement happens before the next turn, once billed input has crossed the limit.
+// The budget is CUMULATIVE BILLED TOKENS: a cost proxy, not live context size. Retiring
+// exists to stop the growing re-sent-prefix tax, and billed input IS that tax — so the
+// running SUM (not the last turn's context) is the right quantity, and cached input
+// counts because it is still billed.
+export function shouldRetireThread(billedTokens: number, retireBilledTokens: number): boolean {
+  return billedTokens > retireBilledTokens;
 }
 
 // Mirrors the broker's MAX_TEXT_BYTES (src/broker.ts) — a send above it is a hard 400.
@@ -159,6 +162,24 @@ export interface DeliverableReply {
   spilled: boolean;
 }
 
+/**
+ * Longest prefix of `text` that fits in `maxBytes` of UTF-8, cut on a codepoint
+ * boundary. `.slice()` indexes UTF-16 code UNITS, so a naive cut can leave a
+ * trailing unpaired high surrogate (an astral char like an emoji is two units) —
+ * that encodes as U+FFFD and corrupts the delivered reply, so it is dropped.
+ */
+function byteClamp(text: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  let kept = text;
+  while (Buffer.byteLength(kept, "utf8") > maxBytes) {
+    const over = Buffer.byteLength(kept, "utf8") - maxBytes;
+    kept = kept.slice(0, Math.max(0, kept.length - Math.max(1, Math.ceil(over / 4))));
+  }
+  const last = kept.charCodeAt(kept.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) kept = kept.slice(0, -1); // unpaired high surrogate
+  return kept;
+}
+
 /** Fit `text` under the broker cap, pointing at `spillPath` when it had to be cut. */
 export function truncateForBroker(text: string, spillPath: string, limit = MAX_SEND_BYTES): DeliverableReply {
   const total = Buffer.byteLength(text, "utf8");
@@ -167,12 +188,14 @@ export function truncateForBroker(text: string, spillPath: string, limit = MAX_S
   // never longer than the budget we reserved for it.
   const footerFor = (n: number) => `\n…[truncated ${n} bytes; full reply: ${spillPath}]`;
   const budget = limit - Buffer.byteLength(footerFor(total), "utf8");
-  if (budget <= 0) return { text: footerFor(total).trimStart(), spilled: true };
-  // Cut on a character boundary, never mid-codepoint.
-  let kept = text;
-  while (Buffer.byteLength(kept, "utf8") > budget) {
-    kept = kept.slice(0, Math.max(0, kept.length - Math.ceil((Buffer.byteLength(kept, "utf8") - budget) / 4)));
+  if (budget <= 0) {
+    // A spill path long enough to eat the whole budget still must not exceed the cap —
+    // the function's contract is "always fits", independent of the caller.
+    const footer = footerFor(total).trimStart();
+    return { text: byteClamp(footer, limit), spilled: true };
   }
+  // Cut on a character boundary, never mid-codepoint.
+  let kept = byteClamp(text, budget);
   return { text: kept + footerFor(total - Buffer.byteLength(kept, "utf8")), spilled: true };
 }
 
@@ -190,21 +213,34 @@ export function replyDestination(fromId: string): "reply" | "summary" {
   return fromId === "cli" ? "summary" : "reply";
 }
 
-export function buildTurnPrompt(config: Pick<CodexSeatConfig, "role" | "initialPrompt">, message: DeliveredMessage, handoff: string | null): string {
-  const prefix = handoff ? `${handoff}\n\n` : "";
+// The retirement handoff is prepended inside CodexThread.run (it owns thread state), so
+// this builds only the per-message prompt.
+export function buildTurnPrompt(config: Pick<CodexSeatConfig, "role" | "initialPrompt">, message: DeliveredMessage): string {
   const briefing = config.initialPrompt ? `\n\nSeat briefing:\n${config.initialPrompt}` : "";
-  return `${prefix}You are patrol seat ${config.role}. Reply directly and usefully to this message from ${message.from_id}.${briefing}\n\n${message.text}`;
+  return `You are patrol seat ${config.role}. Reply directly and usefully to this message from ${message.from_id}.${briefing}\n\n${message.text}`;
 }
 
 // A deliberately tiny FIFO used by the daemon and tests. Codex itself permits
 // concurrent turns, but a patrol seat must preserve one coherent thread.
 export class SerialTurnQueue {
   private tail = Promise.resolve();
+  private pending = 0;
 
   enqueue(task: () => Promise<void>): void {
-    this.tail = this.tail.then(task).catch((error: unknown) => {
-      log(`Turn error: ${error instanceof Error ? error.message : String(error)}`);
-    });
+    this.pending++;
+    this.tail = this.tail
+      .then(task)
+      .catch((error: unknown) => {
+        log(`Turn error: ${error instanceof Error ? error.message : String(error)}`);
+      })
+      .finally(() => {
+        this.pending--;
+      });
+  }
+
+  /** Backpressure signal: true while any turn is queued or running. */
+  busy(): boolean {
+    return this.pending > 0;
   }
 
   async idle(): Promise<void> {
@@ -270,7 +306,7 @@ function getTty(): string | null {
 
 export class CodexThread {
   private threadId: string | null = null;
-  private accumulatedInputTokens = 0;
+  private billedTokens = 0;
   private lastReply = "";
 
   // executable is injectable only for tests; production always uses "codex".
@@ -282,11 +318,11 @@ export class CodexThread {
 
   async run(prompt: string): Promise<CodexTurnResult> {
     let handoff: string | null = null;
-    if (this.threadId && shouldRetireThread(this.accumulatedInputTokens, this.config.retireTokens)) {
+    if (this.threadId && shouldRetireThread(this.billedTokens, this.config.retireTokens)) {
       handoff = `continuing prior thread; summary: ${this.lastReply.slice(0, 500).replace(/\s+/g, " ")}`;
-      log(`Retiring Codex thread ${this.threadId} after ${this.accumulatedInputTokens} input tokens`);
+      log(`Retiring Codex thread ${this.threadId} after ${this.billedTokens} billed tokens`);
       this.threadId = null;
-      this.accumulatedInputTokens = 0;
+      this.billedTokens = 0;
     }
     const effectivePrompt = handoff ? `${handoff}\n\n${prompt}` : prompt;
     const argv = this.threadId
@@ -327,16 +363,23 @@ export class CodexThread {
     clearTimeout(timeout);
     const [out, err] = await Promise.all([stdout, stderr]);
     const parsed = parseCodexJsonl(out);
+    // Bill BEFORE any early return: a turn that failed or timed out still sent its prefix
+    // and was still charged for it. Cached input is billed too (at a discount), so it counts
+    // toward the retire budget — undercounting here would let the prefix tax run unbounded.
+    if (parsed.usage) {
+      this.billedTokens += parsed.usage.input_tokens + parsed.usage.cached_input_tokens;
+    }
+    // A failed FIRST turn may still have opened a thread; adopt the id so the retry resumes
+    // it rather than orphaning a thread we are already being billed for.
+    if (parsed.threadId) this.threadId = parsed.threadId;
     if (exitCode !== 0 || timedOut) {
       const detail = timedOut
         ? "Codex turn exceeded 10-minute limit"
         : (err.trim() || out.trim() || `codex exited ${exitCode}`);
       return { ...parsed, ok: false, error: detail };
     }
-    if (parsed.threadId) this.threadId = parsed.threadId;
     if (!parsed.reply) return { ...parsed, ok: false, error: "codex completed without an agent_message" };
     this.lastReply = parsed.reply;
-    this.accumulatedInputTokens += parsed.usage?.input_tokens ?? 0;
     return { ...parsed, ok: true, error: null };
   }
 }
@@ -365,7 +408,7 @@ async function main() {
   const queue = new SerialTurnQueue();
   const enqueue = (message: DeliveredMessage) => {
     queue.enqueue(async () => {
-      const result = await thread.run(buildTurnPrompt(config, message, null));
+      const result = await thread.run(buildTurnPrompt(config, message));
       const full = result.ok ? result.reply : `Codex error: ${result.error ?? "unknown failure"}`;
       const seatId = myId ?? "unknown";
       const delivered = truncateForBroker(full, spillPathFor(seatId, message.id));
@@ -388,7 +431,11 @@ async function main() {
   };
 
   const pollMessages = async () => {
-    if (!myId || polling) return;
+    // Backpressure: don't drain the broker while a turn is queued or running. A turn can
+    // hold the queue for the full 10-minute cap, and anything we pulled would sit only in
+    // RAM — lost if the seat dies. Leaving it undelivered broker-side means a restart
+    // re-delivers it.
+    if (!myId || polling || queue.busy()) return;
     polling = true;
     try {
       const { messages } = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
