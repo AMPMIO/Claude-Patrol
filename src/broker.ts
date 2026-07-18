@@ -54,7 +54,12 @@ const PROJECTS_ROOT = process.env.CLAUDE_PATROL_PROJECTS_ROOT; // undefined -> d
 const ROOT = PROJECTS_ROOT ?? `${process.env.HOME}/.claude/projects`;
 // Background cost-index cadence. Low in tests so /costs reflects a just-written
 // fixture within a poll; ~12s in production (mirrors cleanStaleSeats).
-const INDEX_INTERVAL_MS = parseInt(process.env.CLAUDE_PATROL_INDEX_INTERVAL_MS ?? "12000", 10);
+// 60s default (was 12s): indexTick re-walks + re-stats every fleet project dir
+// and re-tails growing live logs each pass. On a large ~/.claude/projects
+// (measured 1.8 GB / 2.4k jsonl during the dogfood week) a 12s cadence held a
+// core near 50% continuously. 60s cuts that ~5x; the sweep-skip below takes it
+// to idle when the fleet is quiet. Cost view is at most one interval stale.
+const INDEX_INTERVAL_MS = parseInt(process.env.CLAUDE_PATROL_INDEX_INTERVAL_MS ?? "60000", 10);
 const HOUR_MS = 3_600_000;
 const BROKER_START = new Date().toISOString();
 
@@ -952,6 +957,11 @@ function resolvePendingRuns() {
 
 function indexTick() {
   try {
+    // No live seat means nothing to attribute — a broker left running after
+    // `patrol down` must not keep scanning 1.8 GB of session logs. Cost history
+    // already on disk is unaffected; it resumes indexing when a seat registers.
+    const liveSeats = (selectAllSeats.all() as { pid: number }[]).some((s) => pidAlive(s.pid));
+    if (!liveSeats) return;
     for (const [file, , parent] of sessionFiles(ROOT, interestedProjects())) {
       try {
         indexFile(file, parent); // isolate: one unindexable file must not starve the rest
