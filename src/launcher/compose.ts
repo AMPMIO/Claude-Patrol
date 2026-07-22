@@ -24,7 +24,9 @@ export interface SeatPlan {
   spec: SeatSpec;
   role: string;
   cwd: string;
-  backend: "tmux" | "bg" | "current" | "codex";
+  // Derived from the frozen contract — never restate the union here, or a new
+  // backend silently fails to typecheck at exactly one call site.
+  backend: NonNullable<SeatSpec["backend"]>;
   resolved: ResolvedProfile | null;
   settingsOverlay: Record<string, unknown> | null;
 }

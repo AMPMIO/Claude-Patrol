@@ -68,7 +68,69 @@ export interface CostRow {
 //   /observe-session  ObserveSessionRequest  → { ok: boolean }   (v0.2 Layer 2; see kill criterion)
 //   /stats            StatsRequest           → StatsResponse     (v0.2 telemetry)
 //   /log              LogRequest             → LogResponse       (v0.2.1 message history for `patrol watch`)
+//   /claim-port       ClaimPortRequest       → ClaimPortResponse (v0.2.4 localhost collision fix)
+//   /claim-path       ClaimPathRequest       → ClaimPathResponse (v0.2.4 file ownership; denies on conflict)
+//   /release-claims   ReleaseClaimsRequest   → { ok: true }      (v0.2.4)
+//   /list-claims      ListClaimsRequest      → PathClaim[]       (v0.2.4 raw array)
 //   GET /health       (no auth)              → { status: "ok"; seats: number }
+
+// --- v0.2.4: billing source ---
+// The June 15 2026 split: programmatic launches (`claude -p`, Agent SDK, CI)
+// draw a SEPARATE monthly Agent-SDK credit at API rates, not the interactive
+// subscription pool, and hard-stop when exhausted unless extra usage is on.
+// Interactive sessions — including `--background`, /bg and the agents dashboard
+// — still bill the subscription pool. Codex seats bill OpenAI entirely.
+// These pools MUST NOT be summed into one number: `patrol status` reporting a
+// single total would misstate both. Derived from backend, never configured.
+export type BillingSource = "subscription" | "agent-sdk" | "external";
+
+export function billingSource(backend: SeatSpec["backend"]): BillingSource {
+  switch (backend) {
+    case "codex":
+      return "external";
+    case "bg":
+    case "headless":
+      return "agent-sdk";
+    default:
+      return "subscription";
+  }
+}
+
+// --- v0.2.4: port + path claims ---
+// Both are leases keyed to a seat and reaped by the same stale-seat sweep that
+// already purges dead seats — a claim outliving its holder is the failure mode
+// that makes any locking scheme worse than none.
+export interface ClaimPortRequest {
+  id: SeatId;
+  count?: number; // default 1
+}
+export interface ClaimPortResponse {
+  ports: number[];
+}
+
+export interface PathClaim {
+  path: string; // absolute, realpath-resolved at claim time
+  owner_id: SeatId;
+  owner_role: string | null;
+  claimed_at: string; // ISO
+}
+export interface ClaimPathRequest {
+  id: SeatId;
+  paths: string[];
+}
+// Advisory by default: a denied claim reports the holder so the caller can
+// coordinate. Enforcement is opt-in via the seat's PreToolUse deny hook.
+export interface ClaimPathResponse {
+  granted: string[];
+  denied: PathClaim[]; // each carries the CURRENT holder, not the requester
+}
+export interface ReleaseClaimsRequest {
+  id: SeatId;
+  paths?: string[]; // omit = release all this seat holds
+}
+export interface ListClaimsRequest {
+  git_root?: string | null;
+}
 
 // --- v0.2 cost attribution: launcher-issued seat token (Layer 1, primary) ---
 // The launcher injects the SAME token into the seat's env and its launch
@@ -240,7 +302,17 @@ export interface SeatSpec {
   // survives resume; fresh spawn ≈ 15.8k tokens, resumed turns pay a growing
   // half-price prefix — the adapter retires and restarts its thread past a
   // budget (see CODEX_THREAD_RETIRE_TOKENS in the adapter).
-  backend?: "tmux" | "bg" | "current" | "codex";
+  // v0.2.4: `headless` is `bg` done properly — a bun adapter daemon (same shape
+  // as the codex adapter) driving repeated `claude -p --resume` turns over a
+  // FIFO, settling each message with /ack. It exists because a headless session
+  // CANNOT receive channel pushes (consent gate; live-verified 2026-07-10), so
+  // delivery must be pull-based. `bg` stays as the deprecated outbound-only
+  // form. BILLING DIFFERS BY BACKEND — see billingSource() below.
+  backend?: "tmux" | "bg" | "current" | "codex" | "headless";
+  // v0.2.4: ports the seat needs. The broker allocates them from PORT_RANGE and
+  // exports PATROL_PORT (+ PATROL_PORT_1..N) into the seat env, so parallel
+  // seats never collide on localhost:3000. Released when the seat dies.
+  ports?: number;
   profile?: ProfileSpec | string; // string = named preset: "lite" | "peer" | "full"
   prompt?: string; // optional initial prompt (briefing) passed at launch
   silent?: boolean; // v0.2: skip seat-token marker injection (seat stays on Layer-3 heuristic attribution)
