@@ -197,6 +197,21 @@ export const MAX_SEND_BYTES = 8 * 1024;
 export const MAX_CODEX_OUTPUT_BYTES = 8 * 1024 * 1024;
 
 /**
+ * L3(b): tokens to charge a turn toward the retire budget. Usage present → the
+ * real billed input (input + cached, cached is billed at a discount). Usage
+ * ABSENT but the turn overflowed → a floor estimate (maxBytes/4, the ~4-bytes-
+ * per-token rule of thumb), because a flood truncates the final turn.completed
+ * line so usage never parses — yet the turn was billed for every byte it spewed.
+ * Without this floor a flooding turn would drive NO retirement and escape the
+ * budget entirely, the inverse of the "bill the prefix" intent.
+ */
+export function billableTokens(usage: CodexUsage | null, overflow: boolean, maxBytes: number): number {
+  if (usage) return usage.input_tokens + usage.cached_input_tokens;
+  if (overflow) return Math.floor(maxBytes / 4);
+  return 0;
+}
+
+/**
  * Drain a byte stream, keeping at most `maxBytes`. On overflow it stops reading
  * BEFORE appending the offending chunk (so retained bytes never exceed the cap —
  * no unbounded allocation), invokes `onCap` once (to kill the child, since a
@@ -313,21 +328,42 @@ export interface BrokerClient {
   ack(messageIds: number[]): Promise<void>;
 }
 
+// A turn that fails is retried by leaving the lease unacked (it redelivers ~15 min
+// later). Without a ceiling that is a POISON LOOP: a permanently-failing message
+// re-fails forever, spamming the requester and never draining. Cap the attempts,
+// then drain with a single terminal notice.
+export const MAX_TURN_ATTEMPTS = 3;
+
 /**
- * F2 (consumer half): deliver a turn's result, then /ack the message ONLY after
- * a successful reply is durably out. A FAILED turn is deliberately left unacked —
- * its lease expires (~15 min) and the broker redelivers it for a retry, so a
- * transient codex failure never silently drops a message. Ack after delivery, not
- * before, so a crash between poll and send also redelivers rather than loses.
- * Truncate/spill behaviour is unchanged.
+ * F2 (consumer half) + M2 (bounded retry): deliver a turn's result and settle the
+ * lease. Returns { settled } — true when the message has been acked and its
+ * per-message attempt count can be dropped, false when it was left unacked for a
+ * silent retry.
+ *
+ * - SUCCESS: deliver the reply, ack. settled.
+ * - FAILURE, attempt < maxAttempts: send NOTHING, ack NOTHING — the lease
+ *   redelivers for a silent retry, so a transient blip never spams the requester.
+ * - FAILURE, attempt === maxAttempts (final): send ONE "gave up after N" notice
+ *   AND ack, so the requester hears exactly once and the message drains for good.
+ *
+ * Ack comes after delivery, so a crash between poll and send redelivers rather
+ * than loses. Truncate/spill behaviour is unchanged.
  */
 export async function deliverTurnResult(
   seatId: string,
   message: DeliveredMessage,
   result: CodexTurnResult,
-  broker: BrokerClient
-): Promise<void> {
-  const full = result.ok ? result.reply : `Codex error: ${result.error ?? "unknown failure"}`;
+  broker: BrokerClient,
+  attempt = 1,
+  maxAttempts = MAX_TURN_ATTEMPTS
+): Promise<{ settled: boolean }> {
+  // Silent retry: under the cap, a failed turn neither replies nor acks.
+  if (!result.ok && attempt < maxAttempts) {
+    return { settled: false };
+  }
+  const full = result.ok
+    ? result.reply
+    : `Codex gave up after ${maxAttempts} attempt${maxAttempts === 1 ? "" : "s"}: ${result.error ?? "unknown failure"}`;
   const spillPath = spillPathFor(seatId, message.id);
   const delivered = truncateForBroker(full, spillPath);
   // Spill BEFORE delivering: the footer promises a path, so the file must already exist.
@@ -345,9 +381,10 @@ export async function deliverTurnResult(
   } else {
     await broker.send(message.from_id, delivered.text);
   }
-  // The reply is durably out; settle the lease. On failure we skip this so the
-  // message redelivers. If the send above threw, we never reach here — same effect.
-  if (result.ok) await broker.ack([message.id]);
+  // The reply is durably out — settle. Both a success and a final give-up drain
+  // the message; only the under-cap failure above leaves it for redelivery.
+  await broker.ack([message.id]);
+  return { settled: true };
 }
 
 // F1: mirror src/seat-server.ts fenceBody EXACTLY (same glyphs, same format) so
@@ -554,9 +591,7 @@ export class CodexThread {
     // Bill BEFORE any early return: a turn that failed or timed out still sent its prefix
     // and was still charged for it. Cached input is billed too (at a discount), so it counts
     // toward the retire budget — undercounting here would let the prefix tax run unbounded.
-    if (parsed.usage) {
-      this.billedTokens += parsed.usage.input_tokens + parsed.usage.cached_input_tokens;
-    }
+    this.billedTokens += billableTokens(parsed.usage, overflowed, this.maxOutputBytes);
     // A failed FIRST turn may still have opened a thread; adopt the id so the retry resumes
     // it rather than orphaning a thread we are already being billed for.
     if (parsed.threadId && parsed.threadId !== this.threadId) {
@@ -617,6 +652,11 @@ async function main() {
   });
   myId = reg.id;
   log(`Registered as seat ${myId} (cwd: ${config.cwd})`);
+  if (config.sandbox === "danger-full-access") {
+    // The deny-hook is a best-effort backstop; the OS sandbox is the real boundary.
+    // danger-full-access removes that boundary — use only for fully trusted work.
+    log("WARNING: sandbox=danger-full-access — the OS sandbox boundary is OFF; only the best-effort deny-hook remains. Use only for fully trusted work.");
+  }
 
   const thread = new CodexThread(config);
   const queue = new SerialTurnQueue();
@@ -625,10 +665,18 @@ async function main() {
     setSummary: async (summary) => { await brokerFetch("/set-summary", { id: myId, summary }); },
     ack: async (messageIds) => { await brokerFetch("/ack", { id: myId, message_ids: messageIds }); },
   };
+  // M2: per-message attempt counter, so a permanently-failing message drains after
+  // MAX_TURN_ATTEMPTS instead of redelivering forever. Keyed by the stable broker
+  // message id (a redelivered lease keeps its id). Independent of CodexThread's
+  // consecutiveFailures escape-hatch — that resets thread state, never this map.
+  const attempts = new Map<number, number>();
   const enqueue = (message: DeliveredMessage) => {
     queue.enqueue(async () => {
+      const attempt = (attempts.get(message.id) ?? 0) + 1;
+      attempts.set(message.id, attempt);
       const result = await thread.run(buildTurnPrompt(config, message));
-      await deliverTurnResult(myId ?? "unknown", message, result, broker);
+      const { settled } = await deliverTurnResult(myId ?? "unknown", message, result, broker, attempt);
+      if (settled) attempts.delete(message.id);
     });
   };
 

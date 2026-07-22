@@ -1,52 +1,67 @@
 #!/bin/sh
 # Patrol PreToolUse deny-hook for WRITE-ENABLED codex seats (F1 defense-in-depth).
 #
-# A codex seat driven by messages from other seats is an untrusted execution
-# path. Codex's own -s workspace-write sandbox already confines writes to the
-# --cd root; this hook is the command-level layer on top of it, blocking
-# destructive shell commands the OS sandbox would still permit INSIDE the
-# workspace (history rewrites, force pushes, pipe-to-shell). It is intentionally
-# deny-biased: a false block costs one retry, a false allow can be irreversible.
+# BEST-EFFORT BACKSTOP, NOT A GUARANTEE. The OS sandbox (codex -s workspace-write)
+# is the real security boundary; this hook is a command-level backstop on top of
+# it. A blocklist over raw shell is fundamentally unwinnable — obfuscation and
+# equivalent syntaxes always leak — so this closes the KNOWN destructive shapes
+# and nothing more. danger-full-access removes the OS boundary entirely, leaving
+# only this backstop; use it only for fully trusted work. A real allow-list model
+# is v0.3 design, not this hook.
 #
-# Contract (verified against codex-cli 0.144.0 --dangerously-bypass-hook-trust):
-# emitting a permissionDecision=deny object on stdout blocks the tool call. The
-# equivalent alternate form is exit 2 with a stderr reason; we use the stdout
-# form. No output + exit 0 = allow.
+# Wire schema (confirmed against codex-cli 0.144.0): a hook that exits 2 with a
+# reason on stderr DENIES the tool call; exit 0 ALLOWS it. This is the decision
+# path — matched, not flag-spelled.
 #
-# The tool-call payload arrives on stdin as JSON. We match against the RAW
-# payload rather than a parsed field so the hook does not depend on a specific
-# tool-input schema (one fewer assumed interface — the v0.2.2 lesson). The
-# command text appears verbatim in that payload, so a raw-text match is sound.
+# The tool-call payload arrives on stdin as JSON. We match against the RAW payload
+# rather than a parsed field so the hook does not depend on a specific tool-input
+# schema (one fewer assumed interface — the v0.2.2 lesson). The command text
+# appears verbatim in that payload, so a raw-text match is sound. Deny-biased: a
+# false block costs one retry; a false allow can be irreversible.
 
 payload=$(cat)
 
 deny() {
-  # Escape nothing fancy: reasons are fixed literals with no JSON metacharacters.
-  printf '%s\n' "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"patrol-blocked: $1\"}}"
-  exit 0
+  printf 'patrol-blocked: %s\n' "$1" >&2
+  exit 2
 }
 
-# Recursive force-remove of an absolute or home-rooted path, or of a parent dir.
-if printf '%s' "$payload" | grep -Eq 'rm[[:space:]]+(-[a-zA-Z]*[rf][a-zA-Z]*[[:space:]]+)+(-[a-zA-Z]+[[:space:]]+)*(/|~|\.\.)'; then
-  deny "recursive force remove of an absolute/home/parent path"
+# --- remove: blanket-deny the remove verb ---
+# Flag spelling is not a reliable signal: `rm -rf`, `rm --recursive --force`,
+# `rm -r --force`, `rm -fr a/../../home` are all destructive and all spelled
+# differently. A write-enabled seat can already write, so a legitimate need to
+# delete is rare enough to route through the human. Gate the VERB, not the flags.
+# `rm` must be a command token (start-of-string, or after a shell separator/quote),
+# not a substring of confirm/form/npm or a path like /usr/bin/rm.
+if printf '%s' "$payload" | grep -Eq '(^|[^A-Za-z0-9_./-])rm([[:space:]]|$)'; then
+  deny "file removal (rm) is blocked for automated seats"
 fi
-# git force push (--force, -f, --force-with-lease, in any argument order). Two
-# stages so a bare trailing `-f` matches regardless of what precedes it — POSIX
-# ERE is leftmost-longest without backtracking, so a single greedy pattern drops
-# the `git push … -f` case. The end anchor allows a non-word char (a quote from
-# the surrounding JSON) as well as whitespace/EOL.
-if printf '%s' "$payload" | grep -Eq 'git[[:space:]]+push([[:space:]]|$)' \
-  && printf '%s' "$payload" | grep -Eq '(--force|--force-with-lease|[[:space:]]-f([^a-zA-Z0-9_]|$))'; then
-  deny "git force push"
+
+# --- git: force push (any flag/refspec form) + verify-skipping + history rewrite ---
+if printf '%s' "$payload" | grep -Eq 'git[[:space:]]+push([[:space:]]|$)'; then
+  # --force / -f / --force-with-lease / --no-verify, OR a '+'-prefixed refspec
+  # (git's own force-update syntax, e.g. `git push origin +main:main`).
+  if printf '%s' "$payload" | grep -Eq '(--force|--force-with-lease|--no-verify|[[:space:]]-f([^a-zA-Z0-9_]|$)|[[:space:]]\+[A-Za-z0-9_./@~^-]+:)'; then
+    deny "git force / verify-skipping push"
+  fi
 fi
-# git history rewrites.
 if printf '%s' "$payload" | grep -Eq 'git[[:space:]]+(reset[[:space:]]+--hard|rebase|filter-branch|filter-repo|update-ref[[:space:]]+-d)'; then
   deny "git history rewrite"
 fi
-# curl|sh / wget|sh — running remote content as a shell script. The interpreter
-# may be followed by a JSON quote, so anchor on a non-word char, not just space.
-if printf '%s' "$payload" | grep -Eq '(curl|wget)[[:space:]][^|]*\|[[:space:]]*(sudo[[:space:]]+)?(sh|bash|zsh|dash)([^a-zA-Z0-9_]|$)'; then
+
+# --- pipe-to-shell of remote content, all three shapes ---
+# Forward: `curl URL | sh`.
+if printf '%s' "$payload" | grep -Eq '(curl|wget|fetch)[[:space:]][^|]*\|[[:space:]]*(sudo[[:space:]]+)?(sh|bash|zsh|dash)([^a-zA-Z0-9_]|$)'; then
   deny "pipe-to-shell of remote content"
+fi
+# Interpreter-first: `sh -c "$(curl URL)"` — an interpreter -c with a fetch anywhere.
+if printf '%s' "$payload" | grep -Eq '(sh|bash|zsh|dash|ksh)[[:space:]]+-c([[:space:]]|$|")' \
+   && printf '%s' "$payload" | grep -Eq '(curl|wget|fetch)([[:space:]]|$)'; then
+  deny "shell -c executing fetched content"
+fi
+# Process substitution: `bash <(curl URL)`.
+if printf '%s' "$payload" | grep -Eq '<\([^)]*(curl|wget|fetch)'; then
+  deny "process substitution of remote content"
 fi
 
 # No destructive pattern matched: allow.
