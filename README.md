@@ -9,7 +9,7 @@
 [Why](#why-standing-seats) · [Features](#what-patrol-does-that-raw-terminals-dont) · [Quickstart](#quickstart) · [Architecture](#architecture) · [Roadmap](#roadmap) · [Contributing](#contributing)
 
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square)](LICENSE)
-[![tests](https://img.shields.io/badge/tests-173%20passing-brightgreen?style=flat-square)](tests)
+[![tests](https://img.shields.io/badge/tests-189%20passing-brightgreen?style=flat-square)](tests)
 [![bun](https://img.shields.io/badge/Bun-1.2+-black?style=flat-square&logo=bun)](https://bun.sh)
 [![typescript](https://img.shields.io/badge/TypeScript-strict-3178C6?style=flat-square&logo=typescript&logoColor=white)](tsconfig.json)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-orange?style=flat-square)](#contributing)
@@ -186,7 +186,7 @@ patching it — several Patrol features were prototyped there first.
 | Boot latency | LLM auto-summary API call (up to 3s, external dep) | opt-in only; seats self-describe |
 | Message table | grows forever | delivered messages purged after 7 days |
 | Packaging | manual clone + .mcp.json | Claude Code plugin (commands, skill, hook, MCP) + CLI/daemon |
-| Tests | none | 173 across broker, costs, launcher, CLI, codex adapter, integration |
+| Tests | none | 189 across broker, costs, launcher, CLI, codex adapter, integration |
 
 ## Quickstart
 
@@ -267,9 +267,30 @@ seats:
 Sequenced, not parallel: v0.2 has to prove itself in real use before v0.3 starts.
 No dates.
 
-**v0.2.x — now.** Per-seat cost attribution, the `patrol watch` TUI, codex seats.
-Dogfooded: a real fleet runs on this repo, and recent work here was built and
-reviewed by seats Patrol launched.
+**v0.2.3 — shipped.** Lease/ack delivery (`/poll-messages` leases, `/ack` settles,
+unacked leases redeliver), so a live seat whose push failed doesn't silently drop
+work. Codex seats hardened: read-only sandbox by default, a command-veto
+`PreToolUse` deny hook for write-enabled seats, and an unforgeable prompt-injection
+fence around inbound message bodies. Broker cost indexer bounded in both memory and
+CPU. 189 tests.
+
+**v0.2.4 — now, in progress.** Building on the fleet, by the fleet:
+- **`backend: headless`** — a `claude -p --resume` adapter daemon (same shape as the
+  codex seat). Pull-based by necessity: a headless session cannot receive
+  `claude/channel` pushes, so the adapter polls and drives one turn per message.
+- **Billing-source attribution.** After the 2026-06-15 split, programmatic
+  (`claude -p`) launches draw a separate Agent-SDK credit pool, not the interactive
+  subscription. `patrol status` now reports subscription / agent-sdk / external as
+  three separate totals — never summed, because they bill different accounts.
+- **Port broker.** The broker allocates a port per seat and exports `PATROL_PORT`, so
+  parallel seats stop killing each other over `localhost:3000`.
+- **File-ownership claims.** `patrol claim <path>` registers a seat as a path's owner;
+  a competing claim is denied and names the holder. Advisory by default, with opt-in
+  hook enforcement.
+- **Command-center dashboard.** A single static HTML page served by the broker: a
+  question inbox (agent questions surface in one place instead of scattered
+  terminals), a work kanban derived from git worktrees + open PRs, the fleet board,
+  and a live comms audit log.
 
 **v0.3 — hardening.** The work that has to land before I'd suggest anyone depend on
 this for real:
@@ -285,20 +306,24 @@ this for real:
   stale-seat sweep deletes a dead seat's undelivered mail and a restarted seat comes
   back under a new id. Surviving a crash needs identity that is stable across restarts,
   so it is gated on the capability tokens above rather than shippable on its own.
-- Plugin packaging, so a cloned install resolves its own paths. It is also the real
-  fix for headless seats never hearing pushes.
+- A writable-worktree root for codex seats. Today a codex seat's sandbox is scoped to
+  its launch checkout, so it cannot implement in the per-package worktrees the fleet
+  runs on — it's confined to read-only review and spec work until this lands.
+- Plugin packaging, so a cloned install resolves its own paths.
 
 **v0.4 — after it has proven itself.** A Rust CLI; SSE or long-poll replacing the 1s
-poll; codex cost parsing, so non-Claude seats get per-seat spend too; a retention
-sweep for the ledger; per-task cost tags; a Warp launch backend.
+poll; codex cost parsing, so non-Claude seats get their own per-seat spend (v0.2.4
+tags *which pool*, not codex's own dollar figure); a retention sweep for the ledger;
+per-task cost tags; a Warp launch backend.
 
 ## Status and caveats
 
-**v0.2.2, 173 tests.** Cost attribution survives the case that broke it in v0.1:
+**v0.2.3, 189 tests.** Cost attribution survives the case that broke it in v0.1:
 several seats working in the same repo. It keeps history across seat teardown and
 broker restarts, serves `/costs` from an incrementally indexed ledger instead of
-walking every log on request, fences delivered messages against header forgery, and
-validates all broker input.
+walking every log on request, leases-and-acks delivery so a failed push doesn't drop
+a live seat's mail, defaults codex seats to a read-only sandbox behind a command-veto
+hook, fences delivered messages against header forgery, and validates all broker input.
 
 This is a tool I built for my own fleet and then opened up. It is used daily, but by
 one person on one machine, so expect sharp edges outside that path.
@@ -321,7 +346,7 @@ the coverage I cannot give it myself.
 
 ```bash
 bun install
-bun test              # 173 tests
+bun test              # 189 tests
 bunx tsc --noEmit     # strict, must stay clean
 ```
 
