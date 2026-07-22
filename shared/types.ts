@@ -48,6 +48,11 @@ export interface CostRow {
   cache_write: number;
   cache_read: number;
   cost_usd: number;
+  // v0.2.4, optional+additive: which wallet this spend drew from. Written by the
+  // indexer from the transcript's `entrypoint` (sdk-cli/sdk-py => agent-sdk), and
+  // "external" for codex seats that have no transcript. Absent on pre-0.2.4
+  // ledgers, which read as "subscription" downstream — never sum across sources.
+  billing_source?: BillingSource;
 }
 
 // --- Broker HTTP API (localhost only, POST + x-patrol-token; GET /health open) ---
@@ -228,6 +233,11 @@ export interface CostsRequest {
 export interface CostsResponse {
   rows: CostRow[];
   total_usd: number;
+  // v0.2.4, optional+additive: per-wallet totals for the `patrol status` pool
+  // split. Present once the broker ledger carries billing_source; absent = a
+  // single-pool caller. total_usd stays the grand total, but a UI MUST show the
+  // three pools separately — they are billed against different accounts.
+  by_source?: Partial<Record<BillingSource, number>>;
 }
 
 // --- v0.2 telemetry (/stats) — the evidence layer for the cost claims ---
