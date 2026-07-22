@@ -243,6 +243,13 @@ seats:
 
 ## Architecture
 
+<div align="center">
+<img src="assets/architecture.png" alt="One broker, N seats, a shared SQLite ledger, messages on a bus between them" width="760" />
+</div>
+
+One authenticated broker at the center; every seat registers with it, and messages
+flow seat-to-seat across it. The precise wiring:
+
 ```
 ┌─ terminal 1 ─┐  ┌─ terminal 2 ─┐  ┌─ headless ──┐
 │ claude       │  │ claude       │  │ claude --bg │
