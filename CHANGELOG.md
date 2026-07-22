@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.2.3 — 2026-07-23
+
+Security + reliability wave. A whole-project Codex adversarial review returned 4
+HIGH findings (three in the v0.2.2 codex adapter, one pre-existing broker-memory
+risk); a second fable-review pass on the fixes found 5 more (2 blockers). All
+closed. Lease/ack delivery pulled forward from v0.3 — it is finding #2's only real
+fix and benefits every seat. 189 tests.
+
+### Added
+- **Lease/ack delivery.** `/poll-messages` now LEASES rows rather than marking them
+  delivered; a message settles only on `/ack`. Unacked leases expire after
+  `LEASE_TTL` (~15 min) and redeliver, so a consumer that crashes mid-batch does
+  not silently drop work. Seat-server and the CLI ack after the notification is
+  durably written; the codex adapter acks after a reply is sent.
+- **`SeatSpec.sandbox`** (`read-only` | `workspace-write` | `danger-full-access`).
+  Codex seats now default to **read-only** — a seat cannot touch files unless the
+  yaml opts in, and a message can never escalate it (the adapter builds argv, not
+  the model). Write-enabled seats additionally run a vetted `PreToolUse` deny hook
+  (`src/codex/deny-hook.sh`) that blocks destructive commands by verb, not flag
+  spelling. `danger-full-access` logs a startup warning: the OS sandbox boundary is
+  off and only the best-effort backstop remains.
+
+### Fixed
+- **F1 — prompt injection / over-permissive codex sandbox.** Inbound message bodies
+  are wrapped in an unforgeable per-message fence (random boundary) and labeled as
+  untrusted data that cannot change a seat's role, sandbox, or safety rules.
+- **F2 — crash-during-delivery data loss.** Fixed by lease/ack (above). Poison
+  messages that deterministically fail no longer spam the requester or loop forever:
+  bounded retry (3), then one "gave up" notice + ack so the message drains.
+- **F3 — unbounded codex subprocess output.** stdout/stderr stream under an 8 MB
+  cap; on overflow the child is killed and the turn fails while the daemon survives.
+  A flooding turn is billed a floor estimate so it still drives thread retirement.
+- **F4 — unbounded broker memory in the cost indexer.** `parseFileTail` reads in
+  bounded chunks with a retained partial-line buffer; it never allocates a whole
+  transcript tail in the broker process.
+- **CPU bleed.** The cost indexer re-walked and re-tailed `~/.claude/projects`
+  every 12 s forever, holding ~50 % of a core even after `patrol down`. Interval
+  raised to 60 s and the tick skips entirely when no seat is live.
+- **Deny-hook bypasses.** Long-form/mixed recursive-force removes, relative-path
+  escapes, `+`-refspec and `--no-verify` force pushes, and interpreter-first /
+  process-substitution pipe-to-shell all now denied.
+- **Flaky cost-attribution test.** Polls on a wall-clock deadline instead of a
+  fixed iteration count, which shrank silently under CPU contention.
+
+### Note
+- `package.json` was still 0.2.1 through the 0.2.2 release; corrected to 0.2.3.
+
 ## 0.2.2 — 2026-07-14
 
 Codex seats: a standing `codex` thread that registers as a real Patrol seat and
