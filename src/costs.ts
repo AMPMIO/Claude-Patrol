@@ -10,9 +10,21 @@
  */
 import { readdirSync, readFileSync, statSync, openSync, readSync, closeSync } from "node:fs";
 import { join } from "node:path";
-import { PRICES, DEFAULT_PRICE, type CostRow, type CostsResponse } from "../shared/types.ts";
+import { PRICES, DEFAULT_PRICE, type BillingSource, type CostRow, type CostsResponse } from "../shared/types.ts";
 
 const DEFAULT_PROJECTS_ROOT = `${process.env.HOME}/.claude/projects`;
+
+// v0.2.4 billing_source: which WALLET a transcript's spend draws on, derived from
+// the record's top-level `entrypoint` field (verified against real claude -p output:
+// sdk-cli / sdk-py on Agent-SDK sessions, `cli` or absent on interactive ones). A
+// codex seat has NO transcript, so its "external" pool is derived from the backend
+// via the frozen billingSource(), never from here — this function only sees Claude
+// transcripts and thus never returns "external". Unknown/absent => subscription,
+// the safe default (mis-billing agent-sdk spend as a cheaper pool is worse than the
+// reverse, and interactive is the overwhelming majority).
+export function billingSourceFromEntrypoint(entrypoint: string | null | undefined): BillingSource {
+  return typeof entrypoint === "string" && entrypoint.startsWith("sdk") ? "agent-sdk" : "subscription";
+}
 
 // $/MTok substring match, same precedence as token-audit.py (first key hit).
 export function priceFor(model: string | null): [number, number, number, number] {
@@ -81,6 +93,7 @@ export interface UsageDelta {
   output: number;
   cache_write: number;
   cache_read: number;
+  entrypoint: string | null; // top-level record field; drives billing_source (v0.2.4)
 }
 
 // Parse ONE jsonl line to a UsageDelta, or null when the line is blank,
@@ -107,6 +120,7 @@ export function parseUsageLine(line: string): UsageDelta | null {
     output: u.output_tokens ?? 0,
     cache_write: u.cache_creation_input_tokens ?? 0,
     cache_read: u.cache_read_input_tokens ?? 0,
+    entrypoint: typeof d.entrypoint === "string" ? d.entrypoint : null,
   };
 }
 
@@ -118,6 +132,7 @@ interface Tally {
   output: number;
   cache_write: number;
   cache_read: number;
+  billing_source: BillingSource; // from the record entrypoint; all records in a session share it
 }
 
 export interface ComputeCostsOptions {
@@ -172,7 +187,7 @@ export function computeCosts(opts: ComputeCostsOptions = {}): CostsResponse {
       const key = `${ownSessionId}\0${rec.model}`;
       let t = tally.get(key);
       if (!t) {
-        t = { session_id: ownSessionId, attr_session_id: attrSessionId, model: rec.model, input: 0, output: 0, cache_write: 0, cache_read: 0 };
+        t = { session_id: ownSessionId, attr_session_id: attrSessionId, model: rec.model, input: 0, output: 0, cache_write: 0, cache_read: 0, billing_source: billingSourceFromEntrypoint(rec.entrypoint) };
         tally.set(key, t);
       }
       t.input += rec.input;
@@ -184,10 +199,14 @@ export function computeCosts(opts: ComputeCostsOptions = {}): CostsResponse {
 
   const rows: CostRow[] = [];
   let total = 0;
+  // Per-wallet running totals. These MUST stay separate — they bill different
+  // accounts — so `patrol status` renders three columns, never one sum.
+  const bySource: Partial<Record<BillingSource, number>> = {};
   for (const t of [...tally.values()].sort((a, b) => a.session_id.localeCompare(b.session_id))) {
     const [pi, po, pcw, pcr] = priceFor(t.model);
     const cost = (t.input * pi + t.output * po + t.cache_write * pcw + t.cache_read * pcr) / 1e6;
     total += cost;
+    bySource[t.billing_source] = (bySource[t.billing_source] ?? 0) + cost;
     rows.push({
       seat_id: seatSessions.get(t.attr_session_id) ?? null,
       session_id: t.session_id,
@@ -197,9 +216,11 @@ export function computeCosts(opts: ComputeCostsOptions = {}): CostsResponse {
       cache_write: t.cache_write,
       cache_read: t.cache_read,
       cost_usd: Math.round(cost * 1e4) / 1e4,
+      billing_source: t.billing_source,
     });
   }
-  return { rows, total_usd: Math.round(total * 1e4) / 1e4 };
+  for (const k of Object.keys(bySource) as BillingSource[]) bySource[k] = Math.round(bySource[k]! * 1e4) / 1e4;
+  return { rows, total_usd: Math.round(total * 1e4) / 1e4, by_source: bySource };
 }
 
 // Incremental single-file parser for the broker's background indexer. Reads the
