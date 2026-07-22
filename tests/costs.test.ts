@@ -336,3 +336,78 @@ test("parseFileTail: a partial final line (mid-write) is not consumed until it c
   expect(r.bytesParsed).toBe(Buffer.byteLength(full)); // cursor stops at the last newline
   rmSync(d, { recursive: true, force: true });
 });
+
+// --- v0.2.3 F4: the tail parser must be BOUNDED ---------------------------------
+// parseFileTail runs synchronously inside the broker on every index tick. v0.2.2 allocated
+// the entire unseen tail in one Buffer, so a large transcript stalled all broker HTTP and
+// heartbeats behind one giant allocation. These pin the bounded behaviour.
+
+function usageLine(id: string, input: number): string {
+  return JSON.stringify({
+    type: "assistant",
+    sessionId: "chunkS",
+    timestamp: "2026-07-14T10:00:00Z",
+    message: { id, model: "claude-opus-4-8", usage: { input_tokens: input, output_tokens: 1 } },
+  });
+}
+
+test("tail parses across chunk boundaries: records split by a chunk are not lost or doubled", () => {
+  const d = mkdtempSync(join(tmpdir(), "patrol-tail-"));
+  const f = join(d, "big.jsonl");
+  const N = 200;
+  writeFileSync(f, Array.from({ length: N }, (_, i) => usageLine(`m${i}`, i + 1)).join("\n") + "\n");
+
+  // A chunk far smaller than a single record forces lines to straddle chunk reads, which is
+  // exactly where a partial-line bug shows up. The whole-file read could never hit this.
+  const tiny = parseFileTail(f, 0, { chunkBytes: 7 });
+  expect(tiny.records).toHaveLength(N);
+  expect(tiny.records.map((r) => r.input)).toEqual(Array.from({ length: N }, (_, i) => i + 1));
+  expect(tiny.bytesParsed).toBe(statSync(f).size);
+
+  // Identical result to the default (1 MiB) path: chunking must not change semantics.
+  const dflt = parseFileTail(f, 0);
+  expect(tiny.records).toEqual(dflt.records);
+  expect(tiny.bytesParsed).toBe(dflt.bytesParsed);
+  rmSync(d, { recursive: true, force: true });
+});
+
+test("tail size-guard: an oversize record is skipped and the cursor still advances", () => {
+  const d = mkdtempSync(join(tmpdir(), "patrol-tail-cap-"));
+  const f = join(d, "fat.jsonl");
+  // A single absurd line between two good ones. It is a VALID, parseable usage record on
+  // purpose — otherwise it would be dropped for being unparseable and the test would pass
+  // whether or not a cap exists. Only the size guard can reject this one.
+  const fat = JSON.stringify({
+    type: "assistant",
+    sessionId: "chunkS",
+    timestamp: "2026-07-14T10:00:00Z",
+    junk: "x".repeat(5000),
+    message: { id: "FAT", model: "claude-opus-4-8", usage: { input_tokens: 999, output_tokens: 1 } },
+  });
+  writeFileSync(f, [usageLine("good1", 10), fat, usageLine("good2", 20)].join("\n") + "\n");
+
+  // Sanity: without the guard this line DOES parse to a record, so the assertion below is
+  // pinning the cap and nothing else.
+  expect(parseFileTail(f, 0).records.map((r) => r.msgId)).toEqual(["good1", "FAT", "good2"]);
+
+  const out = parseFileTail(f, 0, { chunkBytes: 64, maxRecordBytes: 500 });
+  // The two real records survive; the oversize one is dropped, not fatal.
+  expect(out.records.map((r) => r.msgId)).toEqual(["good1", "good2"]);
+  // Cursor reached EOF: the fat line was consumed, so the next tick does not re-read it.
+  expect(out.bytesParsed).toBe(statSync(f).size);
+  rmSync(d, { recursive: true, force: true });
+});
+
+test("tail keeps the incremental-cursor contract: a torn trailing write is not consumed", () => {
+  const d = mkdtempSync(join(tmpdir(), "patrol-tail-torn-"));
+  const f = join(d, "torn.jsonl");
+  // Complete line, then a half-written one with no newline (a live append caught mid-write).
+  writeFileSync(f, usageLine("done", 5) + "\n" + '{"type":"assistant","half');
+
+  const out = parseFileTail(f, 0, { chunkBytes: 8 });
+  expect(out.records.map((r) => r.msgId)).toEqual(["done"]);
+  // bytesParsed stops just past the LAST NEWLINE, so the torn tail is re-read next tick.
+  expect(out.bytesParsed).toBeLessThan(statSync(f).size);
+  expect(out.bytesParsed).toBe(usageLine("done", 5).length + 1);
+  rmSync(d, { recursive: true, force: true });
+});

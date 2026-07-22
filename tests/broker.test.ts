@@ -4,7 +4,7 @@
  * metadata (incl. profile), the sender-context join on poll, and the /costs
  * endpoint (attribution + subagents-aware totals wired through the broker).
  */
-import { test, expect, beforeAll, afterAll } from "bun:test";
+import { test, expect, beforeAll, afterAll, describe } from "bun:test";
 import { Database } from "bun:sqlite";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -154,10 +154,19 @@ test("poll joins sender context onto messages", async () => {
   expect(messages[0]!.from_summary).toBe("orchestrator summary");
   expect(messages[0]!.from_role).toBe("orchestrator");
   expect(messages[0]!.from_model).toBe("fable");
-  expect(messages[0]!.delivered).toBe(true);
+  // v0.2.3: a poll LEASES, it does not deliver. delivered flips only on /ack.
+  expect(messages[0]!.delivered).toBe(false);
 
+  // The lease is held, so an immediate re-poll returns nothing (no double-delivery to a
+  // live consumer) even though the message is still undelivered.
   const again = await post("/poll-messages", { id: sender });
   expect(((await again.json()) as { messages: unknown[] }).messages).toHaveLength(0);
+
+  // Ack settles it, and it stays gone.
+  const ids = (messages as unknown as Array<{ id: number }>).map((m) => m.id);
+  expect((await post("/ack", { id: sender, message_ids: ids })).status).toBe(200);
+  const afterAck = await post("/poll-messages", { id: sender });
+  expect(((await afterAck.json()) as { messages: unknown[] }).messages).toHaveLength(0);
 });
 
 test("send to unknown seat fails cleanly", async () => {
@@ -427,8 +436,16 @@ test("queue-depth cap: /send-message returns 429 once the target backlog hits th
   }
   const over = await post("/send-message", { from_id: "cli", to_id: id, text: "overflow" });
   expect(over.status).toBe(429);
-  // draining the queue frees it again
-  await post("/poll-messages", { id });
+  // v0.2.3: a poll only LEASES, so it does NOT free the queue — a leased-but-unacked
+  // message is still unsettled and still counts against the cap. That is the point: the
+  // backlog is not "drained" until the consumer confirms the messages are out.
+  const leased = await post("/poll-messages", { id });
+  const leasedIds = ((await leased.json()) as { messages: Array<{ id: number }> }).messages.map((m) => m.id);
+  const stillFull = await post("/send-message", { from_id: "cli", to_id: id, text: "still full" });
+  expect(stillFull.status).toBe(429);
+
+  // Acking the batch is what actually drains it.
+  expect((await post("/ack", { id, message_ids: leasedIds })).status).toBe(200);
   const after = await post("/send-message", { from_id: "cli", to_id: id, text: "ok again" });
   expect(after.status).toBe(200);
 });
@@ -1000,12 +1017,15 @@ test("B: /log returns history with both endpoints' context, honoring after_id an
   for (const t of ["one", "two", "three"]) {
     expect((await post("/send-message", { from_id: sender, to_id: recv, text: t })).status).toBe(200);
   }
-  await post("/poll-messages", { id: recv }); // deliver them
+  // v0.2.3: poll LEASES, ack DELIVERS — so settle the batch to make these delivered.
+  const polled = await post("/poll-messages", { id: recv });
+  const polledIds = ((await polled.json()) as { messages: Array<{ id: number }> }).messages.map((m) => m.id);
+  await post("/ack", { id: recv, message_ids: polledIds });
 
   const all = (await (await post("/log", { after_id: base })).json()) as LogBody;
   expect(all.messages.map((m) => m.text)).toEqual(["one", "two", "three"]); // id ASC
   expect(all.messages.every((m) => m.from_id === sender && m.to_id === recv)).toBe(true);
-  expect(all.messages.every((m) => m.delivered === true)).toBe(true); // polled
+  expect(all.messages.every((m) => m.delivered === true)).toBe(true); // polled AND acked
   const m0 = all.messages[0]!;
   expect(m0.from_role).toBe("orchestrator");
   expect(m0.from_model).toBe("fable");
@@ -1051,4 +1071,151 @@ test("B: /log is auth-gated and rejects a bad after_id/limit", async () => {
   expect((await post("/log", { after_id: -1 })).status).toBe(400);
   expect((await post("/log", { limit: 0 })).status).toBe(400);
   expect((await post("/log", { limit: -5 })).status).toBe(400);
+});
+
+// --- v0.2.3 lease/ack delivery -------------------------------------------------
+// The whole point of lease/ack: a consumer that dies between poll and push must not
+// swallow the message. These run against their OWN broker with a tiny LEASE_TTL, so an
+// abandoned lease can actually expire inside a test instead of in 15 minutes.
+describe("lease/ack delivery", () => {
+  const L_PORT = 17903;
+  const L_BASE = `http://127.0.0.1:${L_PORT}`;
+  const L_TTL_MS = 400;
+  const ldir = mkdtempSync(join(tmpdir(), "patrol-lease-"));
+  const L_SECRET = join(ldir, "secret");
+  let lbroker: ReturnType<typeof Bun.spawn>;
+  let LTOKEN = "";
+
+  const lpost = (path: string, body: unknown) =>
+    fetch(`${L_BASE}${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-patrol-token": LTOKEN },
+      body: JSON.stringify(body),
+    });
+  const poll = async (id: string) =>
+    ((await (await lpost("/poll-messages", { id })).json()) as { messages: Array<{ id: number; text: string }> }).messages;
+  const seat = async (pid: number) =>
+    ((await (await lpost("/register", {
+      pid, cwd: "/l", git_root: null, tty: null, summary: "", role: "r", model: "m", profile: "peer",
+    })).json()) as { id: string }).id;
+
+  beforeAll(async () => {
+    lbroker = Bun.spawn(["bun", new URL("../src/broker.ts", import.meta.url).pathname], {
+      env: {
+        ...process.env,
+        CLAUDE_PATROL_PORT: String(L_PORT),
+        CLAUDE_PATROL_DB: join(ldir, "l.db"),
+        CLAUDE_PATROL_SECRET_FILE: L_SECRET,
+        CLAUDE_PATROL_PROJECTS_ROOT: join(ldir, "projects"),
+        CLAUDE_PATROL_LEASE_TTL_MS: String(L_TTL_MS),
+      },
+      stdio: ["ignore", "ignore", "inherit"],
+    });
+    for (let i = 0; i < 50; i++) {
+      try { if ((await fetch(`${L_BASE}/health`)).ok) break; } catch {}
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    LTOKEN = (await Bun.file(L_SECRET).text()).trim();
+  });
+  afterAll(() => {
+    lbroker.kill();
+    rmSync(ldir, { recursive: true, force: true });
+  });
+
+  test("crash during a batch: an unacked lease expires and the message REDELIVERS", async () => {
+    const id = await seat(process.pid);
+    await lpost("/send-message", { from_id: "cli", to_id: id, text: "survive-the-crash" });
+
+    // Consumer leases the batch, then "dies" — it never acks.
+    const leased = await poll(id);
+    expect(leased.map((m) => m.text)).toEqual(["survive-the-crash"]);
+
+    // While the lease is held, the message is NOT handed to anyone else.
+    expect(await poll(id)).toHaveLength(0);
+
+    // Once the lease expires, the work is assumed lost and comes back. Without this, a
+    // seat that crashed mid-push would have silently eaten the message.
+    await new Promise((r) => setTimeout(r, L_TTL_MS + 250));
+    const redelivered = await poll(id);
+    expect(redelivered.map((m) => m.text)).toEqual(["survive-the-crash"]);
+    expect(redelivered[0]!.id).toBe(leased[0]!.id); // same row, not a copy
+  });
+
+  test("ack settles the batch: it never comes back, even after the lease would have expired", async () => {
+    const id = await seat(process.pid);
+    await lpost("/send-message", { from_id: "cli", to_id: id, text: "settled" });
+
+    const leased = await poll(id);
+    expect(leased).toHaveLength(1);
+    expect((await lpost("/ack", { id, message_ids: [leased[0]!.id] })).status).toBe(200);
+
+    // Past the TTL — an acked row must NOT be resurrected by lease expiry.
+    await new Promise((r) => setTimeout(r, L_TTL_MS + 250));
+    expect(await poll(id)).toHaveLength(0);
+  });
+
+  test("double-ack is idempotent", async () => {
+    const id = await seat(process.pid);
+    await lpost("/send-message", { from_id: "cli", to_id: id, text: "twice" });
+    const leased = await poll(id);
+    const ids = leased.map((m) => m.id);
+
+    expect((await lpost("/ack", { id, message_ids: ids })).status).toBe(200);
+    expect((await lpost("/ack", { id, message_ids: ids })).status).toBe(200); // retry, double push
+    expect(await poll(id)).toHaveLength(0);
+  });
+
+  test("acking a foreign or unknown message id is a no-op", async () => {
+    // Distinct live pids on purpose: registering a second seat on the SAME pid is treated
+    // as that seat re-registering, which endSeat's the old row and purges its undelivered
+    // mail — the victim's message would vanish for the wrong reason and the test would lie.
+    const victim = await seat(process.pid);
+    const attacker = await seat(process.ppid);
+    expect(attacker).not.toBe(victim);
+    await lpost("/send-message", { from_id: "cli", to_id: victim, text: "not-yours" });
+
+    const leased = await poll(victim);
+    const victimMsgId = leased[0]!.id;
+
+    // Another seat tries to settle mail addressed to the victim, and an id that does not
+    // exist at all. Both must change nothing: ack is scoped by to_id.
+    expect((await lpost("/ack", { id: attacker, message_ids: [victimMsgId] })).status).toBe(200);
+    expect((await lpost("/ack", { id: attacker, message_ids: [999_999] })).status).toBe(200);
+
+    // The victim's message was never settled, so it redelivers to the victim on expiry.
+    await new Promise((r) => setTimeout(r, L_TTL_MS + 250));
+    expect((await poll(victim)).map((m) => m.text)).toEqual(["not-yours"]);
+  });
+
+  test("an unackable batch is dead-lettered after MAX_DELIVERY_ATTEMPTS, not redelivered forever", async () => {
+    const id = await seat(process.pid);
+    await lpost("/send-message", { from_id: "cli", to_id: id, text: "nobody-can-ack-me" });
+
+    // A consumer that leases and never acks, over and over. Without a cap this loops forever:
+    // every expiry re-offers the batch, wakes the seat, and logs another paid notification —
+    // which would quietly corrupt the cost/coalescing telemetry that is the point of Patrol.
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      expect((await poll(id)).map((m) => m.text)).toEqual(["nobody-can-ack-me"]);
+      await new Promise((r) => setTimeout(r, L_TTL_MS + 250));
+    }
+
+    // Third strike: it stops being handed out.
+    expect(await poll(id)).toHaveLength(0);
+    await new Promise((r) => setTimeout(r, L_TTL_MS + 250));
+    expect(await poll(id)).toHaveLength(0); // and stays that way — no more wake-ups, no more billing
+
+    // But it is NOT deleted: it survives as an undelivered dead-letter, which is the evidence
+    // you want when asking why a seat never answered.
+    const log = (await (await lpost("/log", {})).json()) as { messages: Array<{ text: string; delivered: boolean }> };
+    const dead = log.messages.find((m) => m.text === "nobody-can-ack-me");
+    expect(dead).toBeDefined();
+    expect(dead!.delivered).toBe(false);
+  });
+
+  test("ack validates its shape", async () => {
+    const id = await seat(process.pid);
+    expect((await lpost("/ack", { id, message_ids: "nope" })).status).toBe(400);
+    expect((await lpost("/ack", { id, message_ids: [1.5] })).status).toBe(400);
+    expect((await lpost("/ack", { id: "BAD", message_ids: [1] })).status).toBe(400);
+  });
 });

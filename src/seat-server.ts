@@ -244,6 +244,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         // Same fenced composition as channel push — the fallback path must not
         // be the weaker (injectable) rendering.
         const { content } = composeNotification(messages);
+        // The asymmetry with pollAndPushMessages is DELIBERATE — do not "fix" it into an
+        // ack-on-next-poll. The push path acks after `await mcp.notification`, a real
+        // round-trip that can fail, so waiting tells us something. Here there is nothing to
+        // wait on: composing the content IS the delivery, and returning it is a synchronous
+        // same-process handoff with no failure signal to observe. Acking now is the closest
+        // achievable point. check_messages is also the FALLBACK path; the primary (push loop,
+        // codex adapter) acks durably.
+        await ackMessages(messages);
         return {
           content: [
             { type: "text" as const, text: `${messages.length} new message(s):\n\n${content}` },
@@ -260,6 +268,26 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     };
   }
 });
+
+// Settle a leased batch (v0.2.3). Every consumer of /poll-messages MUST call this once the
+// messages are out, or the batch is re-offered on lease expiry (bounded: the broker
+// dead-letters a row after MAX_DELIVERY_ATTEMPTS rather than waking the seat forever).
+// A failed ack is logged, not thrown: the worst case is one redelivery, which is the side
+// this design deliberately errs on.
+//
+// Scope, stated honestly: this protects a LIVE seat whose notification threw or whose broker
+// was briefly unreachable. It does NOT make the seat crash-proof — if this process dies, the
+// broker's stale-seat sweep deletes its undelivered mail within 30s, and a restarted seat
+// registers under a new id anyway. Consumer-crash recovery needs stable identity across
+// restarts (v0.3 capability tokens).
+async function ackMessages(msgs: DeliveredMessage[]): Promise<void> {
+  if (!myId || msgs.length === 0) return;
+  try {
+    await brokerFetch("/ack", { id: myId, message_ids: msgs.map((m) => m.id) });
+  } catch (e) {
+    log(`Ack failed (batch will redeliver): ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
 
 // Coalesce the whole poll batch into ONE channel notification: each
 // notification wakes the session for a full turn at full context price, so N
@@ -279,6 +307,11 @@ async function pollAndPushMessages() {
       method: "notifications/claude/channel",
       params: { content, meta },
     });
+    // Ack AFTER the notification resolves, never before. This await is a real round-trip that
+    // can throw — a rejected notification means the batch never reached the session, and not
+    // acking is what lets it be re-offered. Acking first would re-open the hole lease/ack
+    // exists to close.
+    await ackMessages(msgs);
     log(`Pushed ${msgs.length} message(s) in one notification`);
   } catch (e) {
     log(`Poll error: ${e instanceof Error ? e.message : String(e)}`);

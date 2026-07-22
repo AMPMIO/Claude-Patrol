@@ -120,7 +120,13 @@ test("patrol status attributes fixture spend to the seat", async () => {
   // appears within a tick — poll status until it lands on the seat row.
   let out = "";
   let code = 1;
-  for (let i = 0; i < 60; i++) {
+  // Wall-clock deadline, not a fixed iteration count: each `status` spawns a CLI
+  // subprocess whose own spawn cost balloons under CPU contention, so a counted
+  // loop silently shrinks its real budget exactly when the indexer is starving
+  // (the I5 flake). A deadline keeps ~15s of true wall-time regardless of how
+  // slow each poll runs.
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
     ({ code, out } = await cli(["status"]));
     if (code === 0 && /builder.*\$0\.0[5-6]/.test(out)) break;
     await new Promise((r) => setTimeout(r, 50));

@@ -33,6 +33,7 @@ import type {
   SendMessageRequest,
   PollMessagesRequest,
   PollMessagesResponse,
+  AckRequest,
   UnregisterRequest,
   ObserveSessionRequest,
   CostsRequest,
@@ -61,6 +62,20 @@ const ROOT = PROJECTS_ROOT ?? `${process.env.HOME}/.claude/projects`;
 // to idle when the fleet is quiet. Cost view is at most one interval stale.
 const INDEX_INTERVAL_MS = parseInt(process.env.CLAUDE_PATROL_INDEX_INTERVAL_MS ?? "60000", 10);
 const HOUR_MS = 3_600_000;
+// v0.2.3 lease/ack: how long a leased-but-unacked message waits before a LIVE consumer may
+// re-lease it. Must exceed the codex adapter's 10-minute per-turn cap, or a slow-but-alive
+// consumer would have its work redelivered underneath it. Overridable so a test can expire a
+// lease without waiting 15 minutes (same pattern as INDEX_INTERVAL_MS).
+//
+// READ THIS BEFORE TRUSTING THE LEASE: it does NOT survive a consumer CRASH. cleanStaleSeats
+// runs every 30s, sees the dead pid, and endSeat() DELETES that seat's undelivered mail long
+// before this 15-minute lease could expire — and a restarted seat registers under a NEW slug,
+// so its old mail is orphaned by to_id anyway. What the lease actually buys in v0.2.3 is
+// narrower and still worth having: a live seat whose notification throws, or whose broker was
+// briefly unreachable, redelivers instead of dropping; and a broker restart mid-flight
+// redelivers. Real consumer-crash recovery needs stable seat identity across restarts, which
+// is v0.3's capability tokens. Do not write crash-survival claims against this code.
+const LEASE_TTL_MS = parseInt(process.env.CLAUDE_PATROL_LEASE_TTL_MS ?? String(15 * 60_000), 10);
 const BROKER_START = new Date().toISOString();
 
 function log(msg: string) {
@@ -137,6 +152,16 @@ db.run(`CREATE INDEX IF NOT EXISTS idx_seat_runs_ended ON seat_runs(ended_at)`);
 for (const col of ["bound_via TEXT"]) {
   try {
     db.run(`ALTER TABLE seat_runs ADD COLUMN ${col}`);
+  } catch {
+    // column already exists
+  }
+}
+
+// v0.2.3 lease/ack. Additive, same try/catch pattern: an existing db keeps its rows,
+// and leased_at NULL reads as "never leased", which is exactly right for them.
+for (const col of ["leased_at TEXT", "delivery_attempts INTEGER NOT NULL DEFAULT 0"]) {
+  try {
+    db.run(`ALTER TABLE messages ADD COLUMN ${col}`);
   } catch {
     // column already exists
   }
@@ -250,6 +275,15 @@ function cleanStaleSeats() {
   }
   const cutoff = new Date(Date.now() - 7 * 86_400_000).toISOString();
   db.run("DELETE FROM messages WHERE delivered = 1 AND sent_at < ?", [cutoff]);
+  // Release leases a live seat never settled (its notification threw, or the broker was
+  // briefly unreachable), so the message is offered again rather than sitting leased forever.
+  // The poll itself also treats an expired lease as leasable, so this is belt-and-braces.
+  // NOTE: this does NOT rescue a CRASHED consumer's mail — endSeat() above already deleted a
+  // dead seat's undelivered rows on this same pass, and a restarted seat gets a new id. See
+  // LEASE_TTL_MS.
+  db.run("UPDATE messages SET leased_at = NULL WHERE delivered = 0 AND leased_at IS NOT NULL AND leased_at <= ?", [
+    new Date(Date.now() - LEASE_TTL_MS).toISOString(),
+  ]);
 }
 
 cleanStaleSeats();
@@ -288,15 +322,32 @@ const selectSeatsByGitRoot = db.prepare(`SELECT * FROM seats WHERE git_root = ?`
 const insertMessage = db.prepare(`
   INSERT INTO messages (from_id, to_id, text, sent_at, delivered) VALUES (?, ?, ?, ?, 0)
 `);
-const selectUndelivered = db.prepare(`
+// v0.2.3: a poll LEASES. Rows already leased by a live consumer are skipped — returning
+// them would hand the same message to two consumers. A lease older than LEASE_TTL is
+// treated as abandoned (the consumer died mid-work) and becomes leasable again, so the
+// message redelivers instead of being lost. LEASE_TTL exceeds the codex adapter's 10-minute
+// per-turn cap, so a slow-but-alive consumer is never treated as dead.
+// A batch nobody can ack must not wake-and-bill a seat forever. After MAX_DELIVERY_ATTEMPTS
+// leases the row is dead-lettered: it stops being handed out and stops logging wake-ups, but
+// it is NOT deleted — it stays visible to /log as undelivered, which is the evidence you want
+// when asking why a seat never answered. Unbounded redelivery would also corrupt the
+// coalescing and cost telemetry that is this project's whole differentiator.
+const MAX_DELIVERY_ATTEMPTS = 3;
+const selectLeasable = db.prepare(`
   SELECT m.id, m.from_id, m.to_id, m.text, m.sent_at, m.delivered,
          s.summary AS from_summary, s.cwd AS from_cwd,
          s.role AS from_role, s.model AS from_model
   FROM messages m LEFT JOIN seats s ON s.id = m.from_id
   WHERE m.to_id = ? AND m.delivered = 0
+    AND (m.leased_at IS NULL OR m.leased_at <= ?)
+    AND m.delivery_attempts < ?
   ORDER BY m.sent_at ASC
 `);
-const markDelivered = db.prepare(`UPDATE messages SET delivered = 1 WHERE id = ?`);
+const leaseMessage = db.prepare(`UPDATE messages SET leased_at = ?, delivery_attempts = delivery_attempts + 1 WHERE id = ?`);
+// Ack is scoped to the recipient: a seat can only settle its OWN mail, so a foreign or
+// unknown id updates nothing. Re-acking an already-delivered row is a no-op, which makes
+// a duplicate ack (retry, double push) harmless.
+const ackMessage = db.prepare(`UPDATE messages SET delivered = 1 WHERE id = ? AND to_id = ?`);
 
 // Message history for `patrol watch` (/log). Sender AND recipient role/model come
 // from the LATEST seat_runs row per seat_id (runs persist past dereg, so a dead
@@ -418,16 +469,43 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
   return { ok: true };
 }
 
+// The select-then-lease pair is ONE atomic claim, enforced two ways: it runs inside a
+// db.transaction (structural), and this handler stays SYNCHRONOUS (no await can interleave).
+// DO NOT MAKE THIS ASYNC even with the transaction: two concurrent polls — the push loop and
+// a check_messages call — must never select the same rows before either leases them, or the
+// batch is handed out twice, double-waking a seat and billing it twice. Nothing fails loudly
+// when that happens; it just quietly costs money.
+const claimBatch = db.transaction((seatId: string, expiry: string, leasedAt: string) => {
+  const rows = selectLeasable.all(seatId, expiry, MAX_DELIVERY_ATTEMPTS) as PollMessagesResponse["messages"];
+  for (const m of rows) leaseMessage.run(leasedAt, m.id);
+  return rows;
+});
+
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
-  const rows = selectUndelivered.all(body.id) as PollMessagesResponse["messages"];
-  for (const m of rows) markDelivered.run(m.id);
-  // A non-empty batch is exactly one delivered notification == one paid wake-up;
-  // batch_size is the coalesced message count. Empty polls log nothing (no
-  // notification fired). This is the coalescing evidence /stats reports.
-  if (rows.length > 0) insertDelivery.run(body.id, rows.length, new Date().toISOString());
-  // These rows were undelivered at SELECT and are delivered by this response;
-  // report delivered=true (the DB int is 0 until markDelivered above runs).
-  return { messages: rows.map((m) => ({ ...m, delivered: true })) };
+  const now = Date.now();
+  const expiry = new Date(now - LEASE_TTL_MS).toISOString();
+  const leasedAt = new Date(now).toISOString();
+  const rows = claimBatch(body.id, expiry, leasedAt);
+  // A non-empty batch is exactly one delivered notification == one paid wake-up; batch_size
+  // is the coalesced message count. Empty polls log nothing (no notification fired). This is
+  // the coalescing evidence /stats reports. A re-lease logs again, correctly — it woke the
+  // seat a second time and was paid for twice — which is exactly why MAX_DELIVERY_ATTEMPTS
+  // exists: an unackable batch that redelivered forever would inflate this telemetry without
+  // bound.
+  if (rows.length > 0) insertDelivery.run(body.id, rows.length, leasedAt);
+  // Leased, NOT delivered: the row is delivered only when the consumer /ack's it, after the
+  // message is out. v0.2.2 reported delivered=true here, and that lie is what let a failed
+  // push drop a message silently.
+  return { messages: rows.map((m) => ({ ...m, delivered: false })) };
+}
+
+// Settle a leased batch. Called by a consumer only AFTER the message is durably out (the
+// channel notification resolved, or the tool returned it to the model) — that ordering is
+// the whole point: a consumer that dies before this leaves the lease to expire and the
+// message to redeliver.
+function handleAck(body: AckRequest): { ok: true } {
+  for (const id of body.message_ids) ackMessage.run(id, body.id);
+  return { ok: true };
 }
 
 // Idempotent dereg: by explicit id (seat-server shutdown) or by pid (SessionEnd
@@ -1024,6 +1102,14 @@ export function validate(path: string, body: unknown): string | null {
     case "/heartbeat":
     case "/poll-messages":
       return isSlug(b.id) ? null : "id must be an 8-char [a-z0-9] slug";
+    case "/ack": {
+      if (!isSlug(b.id)) return "id must be an 8-char [a-z0-9] slug";
+      if (!Array.isArray(b.message_ids)) return "message_ids must be an array of message ids";
+      if (!b.message_ids.every((n) => typeof n === "number" && Number.isInteger(n) && n > 0)) {
+        return "message_ids must be an array of positive integer message ids";
+      }
+      return null;
+    }
     case "/set-summary":
       if (!isSlug(b.id)) return "id must be an 8-char [a-z0-9] slug";
       return isStr(b.summary, MAX_SUMMARY) ? null : `summary must be a string ≤${MAX_SUMMARY} chars`;
@@ -1118,6 +1204,8 @@ Bun.serve({
         }
         case "/poll-messages":
           return Response.json(handlePollMessages(body as PollMessagesRequest));
+        case "/ack":
+          return Response.json(handleAck(body as AckRequest));
         case "/costs":
           return Response.json(handleCosts(body as CostsRequest));
         case "/stats":
