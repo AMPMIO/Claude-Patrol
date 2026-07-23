@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.2.4 — 2026-07-23
+
+Fleet legibility + a second billing pool. Headless seats that draw the Agent-SDK
+credit instead of the interactive subscription; per-wallet cost reporting; port
+and file-ownership coordination so parallel seats stop colliding; a semantic seat
+state model and a `/wait-for` primitive borrowed from herdr; and readable seat
+handles replacing the random hex ids. 237 tests.
+
+### Added
+- **`backend: headless`.** A `claude -p --resume` adapter daemon (same shape as the
+  codex seat). Pull-based by necessity — a headless session can't receive
+  `claude/channel` pushes, so the adapter polls and drives one turn per message,
+  settling each with `/ack`. Session-id lifecycle hardened: adopt-on-failure so a
+  created session is never orphaned, an escape hatch after K failures so an
+  un-resumable session can't black-hole the seat, and failed turns still bill toward
+  thread retirement.
+- **Billing-source attribution.** After the 2026-06-15 pool split, `claude -p`
+  launches draw a separate Agent-SDK credit at API rates, not the interactive
+  subscription. The cost ledger now tags every row `subscription | agent-sdk |
+  external` (from the transcript `entrypoint`; codex is external), and `patrol
+  status` reports the three wallets **separately — never summed**, because they bill
+  different accounts. Codex spend has no transcript, so it shows `$—`.
+- **Port broker.** `/claim-port` allocates ports from a range, persisted in the db
+  (survives a broker restart), reaped when the seat dies — so parallel seats stop
+  fighting over `localhost:3000`. Seat-side delivery of the port lands in 0.2.5.
+- **File-ownership claims.** `patrol claim <path>` registers a seat as a path's owner;
+  a competing claim is denied and names the holder. Advisory today (`patrol claims`
+  / `patrol release`), enforcement hook later.
+- **Seat state model** (`idle | working | blocked | done`). Self-reported via a
+  `set_state` MCP tool; drives the coming dashboard and `/wait-for`. `blocked` is the
+  question-inbox trigger.
+- **`/wait-for`.** A caller long-polls until a target seat reaches any of a set of
+  states, or times out — "builder waits until reviewer is done", so orchestration
+  stops meaning hand-polling. `patrol wait <seat> --until done --timeout 60`. Holds
+  no db transaction while waiting; a concurrent `/list-seats` stays responsive.
+- **Readable seat handles.** The broker assigns a stable, readable handle at
+  register — `builder` when unique, `patrol-builder` across projects, `verifier-mjji`
+  only as a last resort. `patrol status`/`list`/`watch` show it; `patrol send builder`
+  resolves it; `patrol rename` overrides it. The immutable hex id stays the internal
+  key and a fallback, and the two namespaces are kept disjoint (a rename can't shadow
+  another seat's id).
+
+### Fixed
+- Cost-attribution integration flake: the poll had a 15s deadline but bun's default
+  5s per-test timeout killed it under load. Raised the test timeout above the
+  deadline.
+
+### Known limits (carried to 0.3)
+- The v0.2.4 mutating routes (`/release-claims`, `/set-state`, `/claim-port`,
+  `/rename`) trust `body.id` under the machine-wide shared secret — the same
+  asserted-identity model as `/set-summary`, higher stakes. Folded into the
+  roadmapped per-seat capability-token gate.
+
 ## 0.2.3 — 2026-07-23
 
 Security + reliability wave. A whole-project Codex adversarial review returned 4

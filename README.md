@@ -9,7 +9,7 @@
 [Why](#why-standing-seats) · [Features](#what-patrol-does-that-raw-terminals-dont) · [Quickstart](#quickstart) · [Architecture](#architecture) · [Roadmap](#roadmap) · [Contributing](#contributing)
 
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square)](LICENSE)
-[![tests](https://img.shields.io/badge/tests-189%20passing-brightgreen?style=flat-square)](tests)
+[![tests](https://img.shields.io/badge/tests-237%20passing-brightgreen?style=flat-square)](tests)
 [![bun](https://img.shields.io/badge/Bun-1.2+-black?style=flat-square&logo=bun)](https://bun.sh)
 [![typescript](https://img.shields.io/badge/TypeScript-strict-3178C6?style=flat-square&logo=typescript&logoColor=white)](tsconfig.json)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-orange?style=flat-square)](#contributing)
@@ -47,6 +47,10 @@ patrol down        # tear it all down
 
 Spawning a subagent per task is the default way to run multiple agents. It is
 also the expensive way, and we measured how expensive.
+
+<div align="center">
+<img src="assets/why-standing-seats.png" alt="Subagents $6.22 vs standing seats $2.16 — a 65% cost cut" width="620" />
+</div>
 
 Measured on real workloads (July 2026, identical fixed-spec dev task, same
 quality gate, cost from session logs at list prices). Config-matched: both runs
@@ -90,7 +94,14 @@ transcripts out undercounted real runs by 63% before we caught it. Every launche
 seat carries a `[patrol-seat: cp-…]` token in its boot prompt, content-matched to
 its session log, so ten seats working in one repo each get their own number rather
 than a shared guess. The history lives in a SQLite ledger that survives seat
-teardown and broker restarts.
+teardown and broker restarts. As of v0.2.4 that spend is split across three billing
+wallets — the interactive subscription, the Agent-SDK credit pool (`claude -p`
+seats), and external (codex) — reported separately, never summed, because they bill
+different accounts.
+
+<div align="center">
+<img src="assets/billing-pools.png" alt="Three billing wallets — subscription, agent-sdk, external — never summed" width="620" />
+</div>
 
 **4. Coalesced wake-ups.**
 Every push notification wakes the receiving session for a full turn at full context
@@ -128,6 +139,10 @@ not misattributed), and a reply over the broker's 8KiB cap arrives truncated wit
 path to the full text on disk.
 
 ### Why a codex seat is set up the way it is (v0.2.3)
+
+<div align="center">
+<img src="assets/codex-safety.png" alt="Three nested safety layers: read-only sandbox, command-veto hook, message fence" width="600" />
+</div>
 
 A codex seat is a standing process that acts on messages from other seats,
 sometimes while no one is watching. Codex can edit and run commands, so an
@@ -186,7 +201,7 @@ patching it — several Patrol features were prototyped there first.
 | Boot latency | LLM auto-summary API call (up to 3s, external dep) | opt-in only; seats self-describe |
 | Message table | grows forever | delivered messages purged after 7 days |
 | Packaging | manual clone + .mcp.json | Claude Code plugin (commands, skill, hook, MCP) + CLI/daemon |
-| Tests | none | 189 across broker, costs, launcher, CLI, codex adapter, integration |
+| Tests | none | 237 across broker, costs, launcher, CLI, codex adapter, integration |
 
 ## Quickstart
 
@@ -281,23 +296,27 @@ work. Codex seats hardened: read-only sandbox by default, a command-veto
 fence around inbound message bodies. Broker cost indexer bounded in both memory and
 CPU. 189 tests.
 
-**v0.2.4 — now, in progress.** Building on the fleet, by the fleet:
+**v0.2.4 — shipped.** Built on the fleet, by the fleet:
 - **`backend: headless`** — a `claude -p --resume` adapter daemon (same shape as the
   codex seat). Pull-based by necessity: a headless session cannot receive
   `claude/channel` pushes, so the adapter polls and drives one turn per message.
 - **Billing-source attribution.** After the 2026-06-15 split, programmatic
   (`claude -p`) launches draw a separate Agent-SDK credit pool, not the interactive
-  subscription. `patrol status` now reports subscription / agent-sdk / external as
-  three separate totals — never summed, because they bill different accounts.
-- **Port broker.** The broker allocates a port per seat and exports `PATROL_PORT`, so
-  parallel seats stop killing each other over `localhost:3000`.
-- **File-ownership claims.** `patrol claim <path>` registers a seat as a path's owner;
-  a competing claim is denied and names the holder. Advisory by default, with opt-in
-  hook enforcement.
-- **Command-center dashboard.** A single static HTML page served by the broker: a
-  question inbox (agent questions surface in one place instead of scattered
-  terminals), a work kanban derived from git worktrees + open PRs, the fleet board,
-  and a live comms audit log.
+  subscription. `patrol status` reports subscription / agent-sdk / external as three
+  separate totals — never summed, because they bill different accounts.
+- **Port + file-ownership claims.** `/claim-port` hands out ports so parallel seats
+  stop fighting over `localhost:3000`; `patrol claim <path>` registers a seat as a
+  path's owner and denies a competing claim, naming the holder.
+- **Seat state + `/wait-for`.** Seats self-report `idle | working | blocked | done`;
+  a caller can `patrol wait <seat> --until done` instead of hand-polling.
+- **Readable handles.** The broker assigns a stable `builder` / `reviewer` handle at
+  register, so `patrol status` and `patrol send builder` stop dealing in random hex
+  ids. The immutable id stays the internal key and a fallback.
+
+**v0.2.5 — next.** The command-center dashboard: a single broker-served page — a
+question inbox (agent questions surface in one place instead of scattered terminals),
+a work kanban from git worktrees + open PRs, the fleet board with live seat state, and
+a comms audit log. Plus seat-side port delivery (allocation shipped in 0.2.4).
 
 **v0.3 — hardening.** The work that has to land before I'd suggest anyone depend on
 this for real:
@@ -328,12 +347,14 @@ per-task cost tags; a Warp launch backend.
 
 ## Status and caveats
 
-**v0.2.3, 189 tests.** Cost attribution survives the case that broke it in v0.1:
-several seats working in the same repo. It keeps history across seat teardown and
-broker restarts, serves `/costs` from an incrementally indexed ledger instead of
-walking every log on request, leases-and-acks delivery so a failed push doesn't drop
-a live seat's mail, defaults codex seats to a read-only sandbox behind a command-veto
-hook, fences delivered messages against header forgery, and validates all broker input.
+**v0.2.4, 237 tests.** Cost attribution survives the case that broke it in v0.1:
+several seats working in the same repo, now split across three billing wallets. It
+keeps history across seat teardown and broker restarts, serves `/costs` from an
+incrementally indexed ledger instead of walking every log on request, leases-and-acks
+delivery so a failed push doesn't drop a live seat's mail, coordinates ports and file
+ownership so parallel seats don't collide, defaults codex seats to a read-only sandbox
+behind a command-veto hook, fences delivered messages against header forgery, and
+validates all broker input.
 
 This is a tool I built for my own fleet and then opened up. It is used daily, but by
 one person on one machine, so expect sharp edges outside that path.
@@ -356,7 +377,7 @@ the coverage I cannot give it myself.
 
 ```bash
 bun install
-bun test              # 189 tests
+bun test              # 237 tests
 bunx tsc --noEmit     # strict, must stay clean
 ```
 
