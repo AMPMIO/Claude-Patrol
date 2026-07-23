@@ -124,7 +124,9 @@ test("patrol status attributes fixture spend to the seat", async () => {
   // subprocess whose own spawn cost balloons under CPU contention, so a counted
   // loop silently shrinks its real budget exactly when the indexer is starving
   // (the I5 flake). A deadline keeps ~15s of true wall-time regardless of how
-  // slow each poll runs.
+  // slow each poll runs — but bun's DEFAULT per-test timeout is 5s, which would
+  // kill the test mid-deadline under load, so the test timeout below must exceed
+  // this deadline (the second half of the I5 fix).
   const deadline = Date.now() + 15_000;
   while (Date.now() < deadline) {
     ({ code, out } = await cli(["status"]));
@@ -137,7 +139,7 @@ test("patrol status attributes fixture spend to the seat", async () => {
   // registered session_id, resolved into the ledger by the background indexer
   expect(out).toMatch(/builder.*\$0\.0[5-6]/);
   expect(out).not.toContain("unattributed");
-});
+}, 20_000); // > the 15s in-test deadline, or bun kills it at the 5s default under load
 
 test("patrol doctor exits 0 against the live broker", async () => {
   const { code, out } = await cli(["doctor"]);
