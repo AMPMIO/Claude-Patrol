@@ -4,6 +4,12 @@
 
 export type SeatId = string;
 
+// v0.2.4: semantic seat state (borrowed from herdr's report_agent). Self-reported
+// by the seat; drives the dashboard at-a-glance view and the /wait-for primitive.
+// "blocked" is the question-inbox trigger — a seat needing a human answer is blocked.
+// A seat that never reports reads as "unknown", never guessed.
+export type SeatState = "idle" | "working" | "blocked" | "done" | "unknown";
+
 export interface Seat {
   id: SeatId;
   pid: number;
@@ -14,6 +20,7 @@ export interface Seat {
   role: string | null; // CLAUDE_PATROL_ROLE
   model: string | null; // CLAUDE_PATROL_MODEL
   profile: string | null; // CLAUDE_PATROL_PROFILE (lite|peer|full|custom name)
+  state?: SeatState; // v0.2.4, optional+additive: absent on pre-0.2.4 rows => "unknown"
   registered_at: string; // ISO
   last_seen: string; // ISO
 }
@@ -64,6 +71,8 @@ export interface CostRow {
 //   /register         RegisterRequest        → RegisterResponse
 //   /heartbeat        HeartbeatRequest       → { ok: true }
 //   /set-summary      SetSummaryRequest      → { ok: true }
+//   /set-state        SetStateRequest        → { ok: true }       (v0.2.4 semantic seat state)
+//   /wait-for         WaitForRequest         → WaitForResponse    (v0.2.4 block until a seat's state)
 //   /list-seats       ListSeatsRequest       → Seat[]            (raw array, no wrapper)
 //   /send-message     SendMessageRequest     → { ok: boolean; error?: string }
 //   /poll-messages    PollMessagesRequest    → PollMessagesResponse  (v0.2.3: LEASES rows, does not deliver)
@@ -105,6 +114,27 @@ export function billingSource(backend: SeatSpec["backend"]): BillingSource {
 // Both are leases keyed to a seat and reaped by the same stale-seat sweep that
 // already purges dead seats — a claim outliving its holder is the failure mode
 // that makes any locking scheme worse than none.
+// v0.2.4 seat state. A seat reports its own state; /set-state is idempotent.
+export interface SetStateRequest {
+  id: SeatId;
+  state: SeatState;
+}
+
+// v0.2.4 /wait-for (herdr's agent.wait): the caller blocks until `target` reaches
+// any state in `until`, or `timeout_ms` elapses. Long-poll on the broker — it holds
+// the response open, it does not busy-spin. reached=false on timeout, and `state`
+// carries the target's last-known state either way (so the caller can branch).
+export interface WaitForRequest {
+  id: SeatId; // the waiter (for auth + logging)
+  target: SeatId;
+  until: SeatState[]; // any-of
+  timeout_ms: number;
+}
+export interface WaitForResponse {
+  reached: boolean;
+  state: SeatState;
+}
+
 export interface ClaimPortRequest {
   id: SeatId;
   count?: number; // default 1
