@@ -9,7 +9,9 @@
  * to self-describe without shelling out) and check_messages (manual fallback if
  * channel push is unavailable).
  *
- * Usage: claude --dangerously-load-development-channels server:claude-patrol
+ * Usage: claude --dangerously-load-development-channels server:patrol
+ * (the value MUST match the MCP mount key `patrol` — a mismatched value mounts
+ * the server but registers no channel handler, so the seat is silently deaf.)
  */
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
