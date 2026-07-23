@@ -145,9 +145,18 @@ export function composeSeat(plan: SeatPlan, paths: ComposePaths, seatToken: stri
   if (mcp === "none") {
     argv.push("--strict-mcp-config", "--mcp-config", EMPTY_MCP);
   } else if (mcp === "patrol") {
+    // Patrol ONLY (strict) — the explicit lean choice; drops the user's global MCP.
     if (!paths.mcpConfigFile) throw new Error(`seat "${spec.name}" needs mcp=patrol config file path`);
     argv.push("--strict-mcp-config", "--mcp-config", paths.mcpConfigFile);
-  } // mcp === "full" or no profile -> inherit configured MCP servers, no flags
+  } else {
+    // full or no profile: mount patrol ADDITIVELY (NO --strict) so the seat keeps
+    // its inherited global MCP servers (serena, playwright, …) AND still gets the
+    // patrol seat-server that registers it and auto-starts the broker. Without
+    // this, a full-toolchain seat has no seat-server and silently never joins the
+    // fleet — the broker never starts and `patrol list` reports unreachable.
+    if (!paths.mcpConfigFile) throw new Error(`seat "${spec.name}" needs a patrol mcp-config file path`);
+    argv.push("--mcp-config", paths.mcpConfigFile);
+  }
 
   // Channel push is a research-preview CC capability: without this flag the
   // seat's MCP tools still work but inbound messages never wake the session

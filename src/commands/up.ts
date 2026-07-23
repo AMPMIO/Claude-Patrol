@@ -65,8 +65,12 @@ function materialize(plan: SeatPlan): ComposePaths {
     settingsFile = join(PROFILE_DIR, `${plan.spec.name}.settings.json`);
     writeFileSync(settingsFile, JSON.stringify(plan.settingsOverlay, null, 1));
   }
+  // Every participating seat needs the patrol seat-server mounted (that's what
+  // registers it + auto-starts the broker). Only mcp:"none" opts out. compose
+  // decides HOW to mount it: strict (patrol-only) for mcp:"patrol", additive
+  // (patrol + the seat's global servers) for full/no-profile.
   let mcpConfigFile: string | null = null;
-  if (plan.resolved?.mcp === "patrol") {
+  if (plan.resolved?.mcp !== "none") {
     mcpConfigFile = join(PROFILE_DIR, `${plan.spec.name}.mcp.json`);
     writeFileSync(mcpConfigFile, patrolMcpConfig(SEAT_SERVER));
   }
