@@ -60,9 +60,16 @@ import type {
   PathClaim,
   RenameRequest,
   RenameResponse,
+  WaitForRequest,
+  WaitForResponse,
 } from "../shared/types.ts";
 
 const PORT = parseInt(process.env.CLAUDE_PATROL_PORT ?? "7900", 10);
+// v0.2.4 /wait-for long-poll: re-check the target's state this often between reads,
+// and never let a caller pin a request open longer than the cap. Poll is env-
+// overridable so tests can tighten it.
+const WAITFOR_POLL_MS = parseInt(process.env.CLAUDE_PATROL_WAITFOR_POLL_MS ?? "200", 10);
+const WAITFOR_TIMEOUT_CAP_MS = 600_000;
 const DB_PATH = process.env.CLAUDE_PATROL_DB ?? `${process.env.HOME}/.claude-patrol.db`;
 const PROJECTS_ROOT = process.env.CLAUDE_PATROL_PROJECTS_ROOT; // undefined -> default below
 const ROOT = PROJECTS_ROOT ?? `${process.env.HOME}/.claude/projects`;
@@ -655,6 +662,26 @@ function handleSetState(body: SetStateRequest): { ok: boolean; error?: string } 
   if (!liveSeat(body.id)) return { ok: false, error: `${body.id} is not a live seat` };
   updateState.run(body.state, body.id);
   return { ok: true };
+}
+
+// /wait-for: block until `target` reaches any state in `until`, or timeout_ms
+// elapses. A read-WAIT, not a check-then-write — so it holds NO db transaction while
+// waiting; each iteration is an INDEPENDENT sync read, and the await between reads
+// yields the single Bun thread so other handlers (a concurrent /list-seats) still
+// respond. A target that no longer exists or whose pid is dead resolves immediately
+// (reached:false, "unknown") rather than hanging. NEVER mutates state.
+async function handleWaitFor(body: WaitForRequest): Promise<WaitForResponse> {
+  const until = new Set<SeatState>(body.until);
+  const deadline = Date.now() + Math.min(body.timeout_ms, WAITFOR_TIMEOUT_CAP_MS);
+  for (;;) {
+    const row = db.query("SELECT pid, state FROM seats WHERE id = ?").get(body.target) as { pid: number; state: string | null } | null;
+    // Gone or dead: don't wait on a seat that can never report again.
+    if (!row || !pidAlive(row.pid)) return { reached: false, state: "unknown" };
+    const state = (row.state as SeatState | null) ?? "unknown";
+    if (until.has(state)) return { reached: true, state };
+    if (Date.now() >= deadline) return { reached: false, state }; // timed out — carry last-known state
+    await new Promise((resolve) => setTimeout(resolve, WAITFOR_POLL_MS));
+  }
 }
 
 // Explicit rename: re-slug + re-dedupe the requested name and store it. Returns the
@@ -1425,6 +1452,19 @@ export function validate(path: string, body: unknown): string | null {
       if (!isSlug(b.id)) return "id must be an 8-char [a-z0-9] slug";
       if (!SEAT_STATES.has(b.state as string)) return `state must be one of ${[...SEAT_STATES].join("|")}`;
       return null;
+    case "/wait-for": {
+      // The waiter id is for auth/logging only (the handler reads `target`, not `id`).
+      // Allow "cli" like /send-message's from_id, so the CLI `patrol wait` can call it
+      // without owning a seat; a real seat waiter passes its own slug.
+      if (b.id !== "cli" && !isSlug(b.id)) return 'id must be a seat slug or "cli"';
+      if (!isSlug(b.target)) return "target must be an 8-char [a-z0-9] slug";
+      if (!Array.isArray(b.until) || b.until.length < 1) return "until must be a non-empty array of seat states";
+      if (!b.until.every((s) => typeof s === "string" && SEAT_STATES.has(s))) return `until must contain only ${[...SEAT_STATES].join("|")}`;
+      // Cap the timeout so a caller can't pin a request open forever (a resource DoS).
+      if (!(typeof b.timeout_ms === "number" && Number.isFinite(b.timeout_ms) && b.timeout_ms >= 0 && b.timeout_ms <= WAITFOR_TIMEOUT_CAP_MS))
+        return `timeout_ms must be a number between 0 and ${WAITFOR_TIMEOUT_CAP_MS}`;
+      return null;
+    }
     case "/claim-port":
       if (!isSlug(b.id)) return "id must be an 8-char [a-z0-9] slug";
       if (b.count != null && (!isPosInt(b.count) || (b.count as number) > MAX_PORT_COUNT))
@@ -1524,6 +1564,10 @@ Bun.serve({
           return Response.json({ ok: true });
         case "/set-state":
           return Response.json(handleSetState(body as SetStateRequest));
+        case "/wait-for":
+          // Long-poll: the await yields the Bun thread between reads, so a wedged
+          // wait never starves a concurrent /list-seats.
+          return Response.json(await handleWaitFor(body as WaitForRequest));
         case "/rename":
           return Response.json(handleRename(body as RenameRequest));
         case "/claim-port":

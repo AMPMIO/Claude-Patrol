@@ -3,6 +3,7 @@ import status from "../src/commands/status.ts";
 import list from "../src/commands/list.ts";
 import send from "../src/commands/send.ts";
 import rename from "../src/commands/rename.ts";
+import wait from "../src/commands/wait.ts";
 import stats from "../src/commands/stats.ts";
 import { bgPidState } from "../src/commands/down.ts";
 import { relTime, truncate, usd, renderTable, secretPermsOk, parseClaudeHelp, pidAlive, resolveSeatTarget, seatLabel, BrokerError } from "../src/commands/_client.ts";
@@ -14,6 +15,8 @@ let server: ReturnType<typeof Bun.serve>;
 let lastSend: any = null;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let lastRename: any = null;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let lastWait: any = null;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let lastStats: any = null;
 let costsFail = false; // when true the mock /costs returns 500, to prove status degrades
@@ -137,6 +140,13 @@ beforeAll(async () => {
         // Emulate the broker's dedupe: "dupe" is taken -> suffix; else echo the name.
         return Response.json({ ok: true, handle: body.name === "dupe" ? "dupe-2" : body.name });
       }
+      if (url.pathname === "/wait-for") {
+        lastWait = body;
+        // "done" in `until` => reached; otherwise emulate a timeout with a last state.
+        return body.until.includes("done")
+          ? Response.json({ reached: true, state: "done" })
+          : Response.json({ reached: false, state: "working" });
+      }
       if (url.pathname === "/stats") {
         if (statsDown) return new Response("not found", { status: 404 });
         lastStats = body;
@@ -201,6 +211,26 @@ test("send posts the right envelope and returns 0", async () => {
   expect(r.code).toBe(0);
   expect(r.out).toContain("sent to aaaa1111");
   expect(lastSend).toEqual({ from_id: "cli", to_id: "aaaa1111", text: "hello world" });
+});
+
+test("wait resolves a handle, reaches the state, and exits 0", async () => {
+  lastWait = null;
+  const r = await capture(() => wait(["executor", "--until", "done,blocked", "--timeout", "5"]));
+  expect(r.code).toBe(0);
+  expect(lastWait).toEqual({ id: "cli", target: "aaaa1111", until: ["done", "blocked"], timeout_ms: 5000 });
+  expect(r.out).toContain("executor reached state: done");
+});
+
+test("wait exits nonzero with the last state on timeout", async () => {
+  const r = await capture(() => wait(["executor", "--until", "idle", "--timeout", "1"]));
+  expect(r.code).toBe(1);
+  expect(r.err).toContain("timed out after 1s (last state: working)");
+});
+
+test("wait without --until is a usage error (exit 2)", async () => {
+  const r = await capture(() => wait(["executor"]));
+  expect(r.code).toBe(2);
+  expect(r.err).toContain("usage:");
 });
 
 test("send without a message is a usage error (exit 2)", async () => {
