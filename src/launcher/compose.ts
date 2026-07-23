@@ -12,6 +12,7 @@ export const TMUX_SESSION = "patrol";
 // Kept here (rather than in up.ts) so composeSeat remains pure and callers can
 // assert the executable adapter path without touching the filesystem.
 export const CODEX_SEAT = resolve(import.meta.dir, "../codex-seat.ts");
+export const HEADLESS_SEAT = resolve(import.meta.dir, "../headless-seat.ts");
 const EMPTY_MCP = '{"mcpServers":{}}';
 
 // A seat name becomes a filesystem path segment (per-seat overlay files) and a
@@ -57,8 +58,8 @@ export function validateConfig(config: PatrolConfig): void {
       throw new Error(`seat "${name}" has no model — a seat never boots on the default model (would leak the Fable default)`);
     }
     const backend = seat.backend ?? "tmux";
-    if (backend !== "tmux" && backend !== "bg" && backend !== "current" && backend !== "codex") {
-      throw new Error(`seat "${name}" has invalid backend "${backend}" (expected tmux | bg | current | codex)`);
+    if (backend !== "tmux" && backend !== "bg" && backend !== "current" && backend !== "codex" && backend !== "headless") {
+      throw new Error(`seat "${name}" has invalid backend "${backend}" (expected tmux | bg | current | codex | headless)`);
     }
     if (backend === "current" && seat.profile !== undefined) {
       throw new Error(`seat "${name}" uses backend "current" with a profile — a running session cannot be re-profiled; drop the profile or change the backend`);
@@ -111,6 +112,21 @@ export function composeSeat(plan: SeatPlan, paths: ComposePaths, seatToken: stri
   // receive no Claude argv, marker, settings, or MCP configuration.
   if (plan.backend === "codex") {
     const argv = ["bun", CODEX_SEAT, "--cwd", plan.cwd, "--role", plan.role, "--model", spec.model];
+    if (spec.prompt) argv.push("--prompt", spec.prompt);
+    return {
+      argv,
+      env: {
+        CLAUDE_PATROL_ROLE: plan.role,
+        CLAUDE_PATROL_MODEL: spec.model,
+      },
+    };
+  }
+
+  // Headless seats are also broker adapter daemons (bun, not `claude` sessions):
+  // the adapter itself drives `claude -p --resume` per turn, so like codex it takes
+  // no Claude marker/settings/MCP argv — its launch is entirely adapter-owned.
+  if (plan.backend === "headless") {
+    const argv = ["bun", HEADLESS_SEAT, "--cwd", plan.cwd, "--role", plan.role, "--model", spec.model];
     if (spec.prompt) argv.push("--prompt", spec.prompt);
     return {
       argv,

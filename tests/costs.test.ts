@@ -8,7 +8,8 @@ import { test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { computeCosts, priceFor, projectDirName, findSessionIdByHeuristic, attributeSeatsToSessions, resolveTokenToSession, parseFileTail } from "../src/costs.ts";
+import { computeCosts, priceFor, projectDirName, findSessionIdByHeuristic, attributeSeatsToSessions, resolveTokenToSession, parseFileTail, parseUsageLine, billingSourceFromEntrypoint } from "../src/costs.ts";
+import { readFileSync } from "node:fs";
 import { PRICES, DEFAULT_PRICE, seatMarker } from "../shared/types.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "patrol-costs-"));
@@ -115,6 +116,80 @@ test("project filter scopes unattributed rows but never drops attributed ones (i
   });
   expect(kept.rows.find((r) => r.session_id === "sessA")).toBeDefined();
   expect(kept.rows.find((r) => r.session_id === "subX")).toBeDefined();
+});
+
+test("billing_source: entrypoint maps to the wallet (real claude -p fixture)", () => {
+  // Drives off a fixture of REAL claude -p records: an sdk-cli assistant (Agent-SDK
+  // wallet) and a cli assistant (interactive subscription). See CONTEXT-5 lesson —
+  // the entrypoint field and usage shape are exactly what `claude -p` emits.
+  const fx = join(dir, "projects-fx");
+  const p = join(fx, "-tmp-fx");
+  mkdirSync(p, { recursive: true });
+  const real = readFileSync(join(import.meta.dir, "fixtures", "billing-source.jsonl"), "utf8").trim().split("\n");
+  writeFileSync(join(p, "real-sdk-sess.jsonl"), real[0]!);
+  writeFileSync(join(p, "real-cli-sess.jsonl"), real[1]!);
+
+  const { rows, by_source } = computeCosts({ projectsRoot: fx, since: "2026-07-22T00:00:00Z", until: "2026-07-22T23:59:59Z" });
+  const sdk = rows.find((r) => r.session_id === "real-sdk-sess")!;
+  const cli = rows.find((r) => r.session_id === "real-cli-sess")!;
+  expect(sdk.billing_source).toBe("agent-sdk"); // sdk-cli
+  expect(cli.billing_source).toBe("subscription"); // cli
+
+  // by_source keeps the wallets separate — never summed into one number.
+  expect(by_source).toBeDefined();
+  expect(by_source!["agent-sdk"]).toBeCloseTo(sdk.cost_usd, 4);
+  expect(by_source!["subscription"]).toBeCloseTo(cli.cost_usd, 4);
+  expect(by_source!.external).toBeUndefined(); // no codex transcript in this fixture
+});
+
+test("L5: billing_source scans ALL a session's records — a later sdk line wins over an absent-first one", () => {
+  // Real-interface risk: `entrypoint` can be absent on some records; freezing
+  // billing_source from the FIRST-seen line would mis-bill agent-sdk spend to the
+  // cheaper subscription wallet. The mixed fixture's first line lacks entrypoint and
+  // a LATER line carries sdk-cli — the whole session must tally as agent-sdk.
+  const fx = join(dir, "projects-mixed");
+  const p = join(fx, "-tmp-mixed");
+  mkdirSync(p, { recursive: true });
+  const lines = readFileSync(join(import.meta.dir, "fixtures", "billing-source-mixed.jsonl"), "utf8");
+  writeFileSync(join(p, "mixed-sess.jsonl"), lines);
+  const { rows } = computeCosts({ projectsRoot: fx, since: "2026-07-23T00:00:00Z", until: "2026-07-23T23:59:59Z" });
+  const mixed = rows.find((r) => r.session_id === "mixed-sess")!;
+  expect(mixed.billing_source).toBe("agent-sdk"); // NOT frozen to subscription by the first line
+});
+
+test("L4: by_source columns sum exactly to total_usd", () => {
+  // Two wallets that each round; total_usd must equal the sum of the ROUNDED
+  // buckets, so `patrol status` columns always add up to the displayed total.
+  const fx = join(dir, "projects-sum");
+  const p = join(fx, "-tmp-sum");
+  mkdirSync(p, { recursive: true });
+  const a = (id: string, ep: string | null, i: number, o: number, ts: string) =>
+    jl({ type: "assistant", sessionId: `s-${id}`, timestamp: ts, ...(ep ? { entrypoint: ep } : {}), message: { id, model: "claude-opus-4-8", usage: { input_tokens: i, output_tokens: o } } });
+  // Odd token counts so both buckets land on non-trivial fractions that round.
+  writeFileSync(join(p, "s-sdk.jsonl"), a("sdk", "sdk-cli", 1234, 567, "2026-07-23T12:00:00Z"));
+  writeFileSync(join(p, "s-sub.jsonl"), a("sub", "cli", 7777, 999, "2026-07-23T12:00:00Z"));
+  const { by_source, total_usd } = computeCosts({ projectsRoot: fx, since: "2026-07-23T00:00:00Z", until: "2026-07-23T23:59:59Z" });
+  const sum = Object.values(by_source!).reduce((acc, v) => acc + v, 0);
+  expect(Math.round(sum * 1e4) / 1e4).toBe(total_usd); // parts add up to the whole, exactly
+  expect(by_source!["agent-sdk"]).toBeGreaterThan(0);
+  expect(by_source!["subscription"]).toBeGreaterThan(0);
+});
+
+test("billingSourceFromEntrypoint: sdk* => agent-sdk, else subscription; never external", () => {
+  expect(billingSourceFromEntrypoint("sdk-cli")).toBe("agent-sdk");
+  expect(billingSourceFromEntrypoint("sdk-py")).toBe("agent-sdk");
+  expect(billingSourceFromEntrypoint("cli")).toBe("subscription");
+  expect(billingSourceFromEntrypoint(null)).toBe("subscription");
+  expect(billingSourceFromEntrypoint(undefined)).toBe("subscription");
+  // "external" is codex-only (no transcript), derived from backend — never from entrypoint.
+  expect(billingSourceFromEntrypoint("anything-else")).toBe("subscription");
+});
+
+test("parseUsageLine surfaces the top-level entrypoint field", () => {
+  const withEp = parseUsageLine(JSON.stringify({ type: "assistant", sessionId: "s", entrypoint: "sdk-py", message: { id: "m", model: "claude-opus-4-8", usage: { input_tokens: 1, output_tokens: 2 } } }));
+  expect(withEp!.entrypoint).toBe("sdk-py");
+  const noEp = parseUsageLine(JSON.stringify({ type: "assistant", sessionId: "s", message: { id: "m2", model: "claude-opus-4-8", usage: { input_tokens: 1, output_tokens: 2 } } }));
+  expect(noEp!.entrypoint).toBeNull();
 });
 
 test("priceFor: substring match, else default", () => {

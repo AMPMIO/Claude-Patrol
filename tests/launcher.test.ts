@@ -6,7 +6,7 @@ import {
   resolveProfile, buildEnabledPlugins, buildSettingsOverlay, matchPlugin, NAMED_PROFILES,
 } from "../src/profiles.ts";
 import {
-  validateConfig, planSeat, composeSeat, shQuote, seatShellLine, tmuxCommands, CODEX_SEAT,
+  validateConfig, planSeat, composeSeat, shQuote, seatShellLine, tmuxCommands, CODEX_SEAT, HEADLESS_SEAT,
   selectBgPidsToKill, patrolMcpConfig, type SeatPlan, type ComposePaths,
 } from "../src/launcher/compose.ts";
 import { seatMarker, SEAT_TOKEN_ENV, type PatrolConfig, type SeatSpec } from "../shared/types.ts";
@@ -178,6 +178,15 @@ describe("composeSeat argv+env", () => {
     const { argv, env } = composeSeat(p, pathsFor(p), "cp-0375a012");
     expect(argv).toEqual(["bun", CODEX_SEAT, "--cwd", "/work", "--role", "reviewer", "--model", "gpt-5.6-terra", "--prompt", "review changes"]);
     expect(env).toEqual({ CLAUDE_PATROL_ROLE: "reviewer", CLAUDE_PATROL_MODEL: "gpt-5.6-terra" });
+  });
+
+  test("headless seat plans and composes the adapter argv without Claude extras", () => {
+    const p = plan({ name: "headless", role: "answerer", model: "sonnet", backend: "headless", profile: "peer", prompt: "answer questions" });
+    expect(() => validateConfig(cfg([p.spec]))).not.toThrow();
+    const { argv, env } = composeSeat(p, pathsFor(p), "cp-0375a012");
+    // Like codex: a bun adapter daemon, no --name/marker/settings/mcp Claude argv.
+    expect(argv).toEqual(["bun", HEADLESS_SEAT, "--cwd", "/work", "--role", "answerer", "--model", "sonnet", "--prompt", "answer questions"]);
+    expect(env).toEqual({ CLAUDE_PATROL_ROLE: "answerer", CLAUDE_PATROL_MODEL: "sonnet" });
   });
 
   test("tmux full seat: no mcp flags, no settings, prompt positional", () => {
