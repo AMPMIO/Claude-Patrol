@@ -1,6 +1,6 @@
 // patrol list [machine|directory|repo] — compact seat list (default machine).
 import type { Seat, ListSeatsRequest } from "../../shared/types.ts";
-import { brokerPost, gitRoot, relTime, truncate, renderTable, BrokerError } from "./_client.ts";
+import { brokerPost, gitRoot, relTime, truncate, renderTable, seatLabel, BrokerError } from "./_client.ts";
 
 const SCOPES = ["machine", "directory", "repo"] as const;
 
@@ -15,14 +15,17 @@ export default async function list(args: string[]): Promise<number> {
       console.log("no seats.");
       return 0;
     }
+    // Handle is the primary identifier; the hex id stays as a secondary column
+    // (disambiguator + fallback).
     const rows = seats.map((s) => [
+      seatLabel(s),
       s.id.slice(0, 8),
       s.role ?? "-",
       s.model ?? "-",
       relTime(s.last_seen),
       truncate(s.summary, 50),
     ]);
-    console.log(renderTable(["SEAT", "ROLE", "MODEL", "SEEN", "SUMMARY"], rows));
+    console.log(renderTable(["SEAT", "ID", "ROLE", "MODEL", "SEEN", "SUMMARY"], rows));
     return 0;
   } catch (e) {
     console.error(e instanceof BrokerError ? e.message : String(e));

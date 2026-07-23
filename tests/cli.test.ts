@@ -2,15 +2,18 @@ import { test, expect, beforeAll, afterAll } from "bun:test";
 import status from "../src/commands/status.ts";
 import list from "../src/commands/list.ts";
 import send from "../src/commands/send.ts";
+import rename from "../src/commands/rename.ts";
 import stats from "../src/commands/stats.ts";
 import { bgPidState } from "../src/commands/down.ts";
-import { relTime, truncate, usd, renderTable, secretPermsOk, parseClaudeHelp, pidAlive } from "../src/commands/_client.ts";
+import { relTime, truncate, usd, renderTable, secretPermsOk, parseClaudeHelp, pidAlive, resolveSeatTarget, seatLabel, BrokerError } from "../src/commands/_client.ts";
 import type { Seat, CostsResponse, StatsResponse } from "../shared/types.ts";
 
 const TOKEN = "test-token";
 let server: ReturnType<typeof Bun.serve>;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let lastSend: any = null;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let lastRename: any = null;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let lastStats: any = null;
 let costsFail = false; // when true the mock /costs returns 500, to prove status degrades
@@ -19,7 +22,10 @@ let statsDown = false; // when true the mock /stats returns 404, to prove stats 
 const NOW = Date.now();
 const SEATS: Seat[] = [
   {
-    id: "aaaa1111bbbb2222",
+    // Real ids are 8 chars of [a-z0-9] (SLUG_RE/generateId) — the fixtures match, so
+    // they model the id/handle namespace-overlap surface (MED-1).
+    id: "aaaa1111",
+    handle: "executor",
     pid: process.pid, // alive
     cwd: "/x",
     git_root: "/x",
@@ -32,7 +38,8 @@ const SEATS: Seat[] = [
     last_seen: new Date(NOW - 3_000).toISOString(),
   },
   {
-    id: "cccc3333dddd4444",
+    id: "cccc3333",
+    handle: "orch",
     pid: 2 ** 30, // dead
     cwd: "/y",
     git_root: null,
@@ -44,10 +51,26 @@ const SEATS: Seat[] = [
     registered_at: new Date(NOW).toISOString(),
     last_seen: new Date(NOW - 120_000).toISOString(),
   },
+  {
+    // Shares the "aaaa" id-prefix with seat 1 — used to prove an ambiguous prefix
+    // ERRORS rather than resolving to the wrong seat.
+    id: "aaaa2222",
+    handle: "twin",
+    pid: process.pid,
+    cwd: "/z",
+    git_root: null,
+    tty: null,
+    summary: "twin",
+    role: "twin",
+    model: "haiku",
+    profile: "peer",
+    registered_at: new Date(NOW).toISOString(),
+    last_seen: new Date(NOW - 1_000).toISOString(),
+  },
 ];
 const COSTS: CostsResponse = {
   rows: [
-    { seat_id: "aaaa1111bbbb2222", session_id: "s1", model: "opus", input: 1000, output: 2000, cache_write: 0, cache_read: 0, cost_usd: 2.16, billing_source: "subscription" },
+    { seat_id: "aaaa1111", session_id: "s1", model: "opus", input: 1000, output: 2000, cache_write: 0, cache_read: 0, cost_usd: 2.16, billing_source: "subscription" },
     { seat_id: null, session_id: "s2", model: "sonnet", input: 500, output: 100, cache_write: 0, cache_read: 0, cost_usd: 0.42, billing_source: "agent-sdk" },
   ],
   total_usd: 2.58,
@@ -56,7 +79,7 @@ const COSTS: CostsResponse = {
 const STATS: StatsResponse = {
   seats: [
     {
-      seat_id: "aaaa1111bbbb2222",
+      seat_id: "aaaa1111",
       role: "executor-1",
       model: "opus",
       live: true,
@@ -70,7 +93,7 @@ const STATS: StatsResponse = {
       cost_usd: 1.2,
     },
     {
-      seat_id: "cccc3333dddd4444",
+      seat_id: "cccc3333",
       role: "orch",
       model: "sonnet",
       live: false,
@@ -108,6 +131,11 @@ beforeAll(async () => {
         if (body.from_id === "garbage") return Response.json({ ok: false, error: 'from_id garbage is not a live seat (or "cli")' });
         if (body.to_id === "ghost") return Response.json({ ok: false, error: 'no live seat "ghost"' });
         return Response.json({ ok: true });
+      }
+      if (url.pathname === "/rename") {
+        lastRename = body;
+        // Emulate the broker's dedupe: "dupe" is taken -> suffix; else echo the name.
+        return Response.json({ ok: true, handle: body.name === "dupe" ? "dupe-2" : body.name });
       }
       if (url.pathname === "/stats") {
         if (statsDown) return new Response("not found", { status: 404 });
@@ -169,10 +197,10 @@ test("list prints short ids and roles", async () => {
 
 test("send posts the right envelope and returns 0", async () => {
   lastSend = null;
-  const r = await capture(() => send(["aaaa1111bbbb2222", "hello", "world"]));
+  const r = await capture(() => send(["aaaa1111", "hello", "world"]));
   expect(r.code).toBe(0);
-  expect(r.out).toContain("sent to aaaa1111bbbb2222");
-  expect(lastSend).toEqual({ from_id: "cli", to_id: "aaaa1111bbbb2222", text: "hello world" });
+  expect(r.out).toContain("sent to aaaa1111");
+  expect(lastSend).toEqual({ from_id: "cli", to_id: "aaaa1111", text: "hello world" });
 });
 
 test("send without a message is a usage error (exit 2)", async () => {
@@ -181,10 +209,54 @@ test("send without a message is a usage error (exit 2)", async () => {
   expect(r.err).toContain("usage:");
 });
 
-test("send reports {ok:false} as a failure (exit 1, no false 'sent')", async () => {
+// --- v0.2.4 handle resolution + display ---
+
+test("resolveSeatTarget: exact handle wins; raw id + unique prefix resolve; ambiguous errors", async () => {
+  expect(await resolveSeatTarget("executor")).toBe("aaaa1111"); // exact handle
+  expect(await resolveSeatTarget("aaaa1111")).toBe("aaaa1111"); // raw full 8-char id (fallback unbroken)
+  expect(await resolveSeatTarget("cccc")).toBe("cccc3333"); // unique id-prefix
+  // "aaaa" prefixes BOTH seat 1 (aaaa1111) and the twin (aaaa2222) -> ambiguous -> error, not a wrong-seat pick.
+  await expect(resolveSeatTarget("aaaa")).rejects.toBeInstanceOf(BrokerError);
+  // A name matching nothing errors rather than silently hitting a live seat.
+  await expect(resolveSeatTarget("nobody")).rejects.toThrow(/no live seat matches/);
+});
+
+test("send resolves a handle to the right id before posting", async () => {
+  lastSend = null;
+  const r = await capture(() => send(["executor", "ship", "it"]));
+  expect(r.code).toBe(0);
+  expect(lastSend).toEqual({ from_id: "cli", to_id: "aaaa1111", text: "ship it" });
+});
+
+test("status and list show the handle as the primary identifier plus the hex id", async () => {
+  const s = await capture(() => status([]));
+  expect(s.out).toContain("executor"); // handle in the SEAT column
+  expect(s.out).toContain("aaaa1111"); // hex id still present as the secondary column
+  const l = await capture(() => list([]));
+  expect(l.out).toContain("executor");
+  expect(l.out).toContain("aaaa1111");
+  // seatLabel falls back to the short id when a seat has no handle.
+  expect(seatLabel({ id: "abcd1234ffff0000" })).toBe("abcd1234");
+  expect(seatLabel({ id: "abcd1234ffff0000", handle: "boss" })).toBe("boss");
+});
+
+test("rename resolves the target and prints the broker-assigned handle (deduped)", async () => {
+  lastRename = null;
+  const ok = await capture(() => rename(["executor", "captain"]));
+  expect(ok.code).toBe(0);
+  expect(lastRename).toEqual({ id: "aaaa1111", name: "captain" });
+  expect(ok.out).toContain("renamed to captain");
+  // A name the broker had to adjust surfaces the actual assigned handle.
+  const adj = await capture(() => rename(["executor", "dupe"]));
+  expect(adj.out).toContain("renamed to dupe-2");
+});
+
+test("send to an unknown target fails client-side (exit 1, no false 'sent')", async () => {
+  // "ghost" matches no handle or id, so resolveSeatTarget rejects it BEFORE any post —
+  // a typo can never silently hit a live seat.
   const r = await capture(() => send(["ghost", "hello"]));
   expect(r.code).toBe(1);
-  expect(r.err).toContain('no live seat "ghost"');
+  expect(r.err).toContain('no live seat matches "ghost"');
   expect(r.out).not.toContain("sent to");
 });
 

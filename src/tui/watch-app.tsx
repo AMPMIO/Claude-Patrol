@@ -219,12 +219,12 @@ function WatchApp() {
   };
 
   // ---- fleet board ----
-  const fixed = 8 + 12 + 8 + 4 + 8; // SEAT ROLE MODEL LIVE SPEND
+  const fixed = 14 + 12 + 8 + 4 + 8; // SEAT(handle) ROLE MODEL LIVE SPEND
   const budget = Math.max(20, cols - 4 - 7 * 2 - fixed); // borders/pad + 7 gaps
   const cwdW = Math.max(10, Math.floor(budget * 0.45));
   const sumW = Math.max(10, budget - cwdW);
   const boardCols: Column[] = [
-    { header: "SEAT", width: 8 },
+    { header: "SEAT", width: 14 },
     { header: "ROLE", width: 12 },
     { header: "MODEL", width: 8 },
     { header: "CWD", width: cwdW },
@@ -236,7 +236,7 @@ function WatchApp() {
     const alive = pidAlive(s.pid);
     const st = statsBySeat.get(s.id);
     return [
-      { text: shortId(s.id), dim: !alive },
+      { text: s.handle || shortId(s.id), dim: !alive }, // handle primary, hex id fallback
       { text: roleTag(s.role), dim: !alive },
       { text: s.model ?? "-", dim: !alive },
       { text: truncateCwd(shortenCwd(s.cwd, HOME), cwdW), dim: !alive },

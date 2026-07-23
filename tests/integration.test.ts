@@ -107,10 +107,13 @@ test("patrol list shows the live seat with role/model", async () => {
 });
 
 test("patrol send → seat's queue via real broker", async () => {
+  // v0.2.4: `patrol list` shows the readable HANDLE first, then the hex id. Grab the
+  // first data row's handle and send to it — exercising handle→id resolution end-to-end.
   const list = await cli(["list"]);
-  const id = list.out.match(/^([a-z0-9]{8})\b/m)?.[1];
-  expect(id).toBeTruthy();
-  const { code, out } = await cli(["send", id!, "integration ping"]);
+  const dataLine = list.out.split("\n").find((l) => /^[a-z0-9]/.test(l) && !l.startsWith("SEAT"));
+  const handle = dataLine?.trim().split(/\s+/)[0];
+  expect(handle).toBeTruthy();
+  const { code, out } = await cli(["send", handle!, "integration ping"]);
   expect(code).toBe(0);
   expect(out.toLowerCase()).toContain("sent");
 });

@@ -1,7 +1,7 @@
 // patrol status — the fleet board. Flagship view: per-seat spend is the
 // differentiator no competitor peer tool has (see research/r2).
 import type { Seat, CostsResponse } from "../../shared/types.ts";
-import { brokerPost, gitRoot, relTime, truncate, usd, renderTable, BrokerError } from "./_client.ts";
+import { brokerPost, gitRoot, relTime, truncate, usd, renderTable, seatLabel, BrokerError } from "./_client.ts";
 
 export default async function status(_args: string[]): Promise<number> {
   const cwd = process.cwd();
@@ -38,8 +38,11 @@ export default async function status(_args: string[]): Promise<number> {
   if (seats.length === 0) {
     console.log("no seats registered.");
   } else {
-    const headers = ["SEAT", "ROLE", "MODEL", "PROFILE", "TTY", "SEEN", "SPEND", "SUMMARY"];
+    // Handle is the primary identifier; the hex id stays as a secondary column
+    // (disambiguator + fallback). SPEND is column 7 now (after the added ID column).
+    const headers = ["SEAT", "ID", "ROLE", "MODEL", "PROFILE", "TTY", "SEEN", "SPEND", "SUMMARY"];
     const rows = seats.map((s) => [
+      seatLabel(s),
       s.id.slice(0, 8),
       s.role ?? "-",
       s.model ?? "-",
@@ -49,7 +52,7 @@ export default async function status(_args: string[]): Promise<number> {
       costs ? usd(spendBySeat.get(s.id) ?? 0) : "—",
       truncate(s.summary, 40),
     ]);
-    console.log(renderTable(headers, rows, new Set([6])));
+    console.log(renderTable(headers, rows, new Set([7])));
   }
 
   if (!costs) {
