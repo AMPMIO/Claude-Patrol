@@ -12,8 +12,8 @@
  *   bun src/broker.ts
  */
 import { Database } from "bun:sqlite";
-import { statSync, openSync, readSync, closeSync } from "node:fs";
-import { basename } from "node:path";
+import { statSync, openSync, readSync, closeSync, realpathSync } from "node:fs";
+import { basename, resolve as resolvePath } from "node:path";
 import { getSecret, TOKEN_HEADER } from "../shared/auth.ts";
 import {
   priceFor,
@@ -22,6 +22,7 @@ import {
   parseFileTail,
   resolveTokenToSession,
   findSessionIdByHeuristic,
+  billingSourceFromEntrypoint,
 } from "./costs.ts";
 import { SEAT_TOKEN_RE } from "../shared/types.ts";
 import type {
@@ -47,6 +48,16 @@ import type {
   LogRequest,
   LogResponse,
   LogMessage,
+  BillingSource,
+  SeatState,
+  SetStateRequest,
+  ClaimPortRequest,
+  ClaimPortResponse,
+  ClaimPathRequest,
+  ClaimPathResponse,
+  ReleaseClaimsRequest,
+  ListClaimsRequest,
+  PathClaim,
 } from "../shared/types.ts";
 
 const PORT = parseInt(process.env.CLAUDE_PATROL_PORT ?? "7900", 10);
@@ -62,6 +73,14 @@ const ROOT = PROJECTS_ROOT ?? `${process.env.HOME}/.claude/projects`;
 // to idle when the fleet is quiet. Cost view is at most one interval stale.
 const INDEX_INTERVAL_MS = parseInt(process.env.CLAUDE_PATROL_INDEX_INTERVAL_MS ?? "60000", 10);
 const HOUR_MS = 3_600_000;
+// v0.2.4 port allocation range [lo, hi] (inclusive). Seats claim from here so parallel
+// dev servers never collide on localhost:3000. Overridable for tests.
+const PORT_RANGE_LO = parseInt(process.env.CLAUDE_PATROL_PORT_RANGE_LO ?? "9000", 10);
+const PORT_RANGE_HI = parseInt(process.env.CLAUDE_PATROL_PORT_RANGE_HI ?? "9099", 10);
+// Bound a single claim so one request can't drain the whole range (or DoS the alloc scan).
+const MAX_PORT_COUNT = 16;
+// Bound a single path-claim batch (checklist #6 bounds-check).
+const MAX_CLAIM_PATHS = 64;
 // v0.2.3 lease/ack: how long a leased-but-unacked message waits before a LIVE consumer may
 // re-lease it. Must exceed the codex adapter's 10-minute per-turn cap, or a slow-but-alive
 // consumer would have its work redelivered underneath it. Overridable so a test can expire a
@@ -107,7 +126,8 @@ db.run(`
 
 // Additive migrations for DBs created before a column existed. Each ALTER is
 // idempotent-by-try: it throws (and is ignored) once the column is present.
-for (const col of ["role TEXT", "model TEXT", "profile TEXT", "session_id TEXT"]) {
+// v0.2.4 adds `state` (self-reported seat state; NULL reads as "unknown" downstream).
+for (const col of ["role TEXT", "model TEXT", "profile TEXT", "session_id TEXT", "state TEXT"]) {
   try {
     db.run(`ALTER TABLE seats ADD COLUMN ${col}`);
   } catch {
@@ -185,6 +205,39 @@ db.run(`
 `);
 db.run(`CREATE INDEX IF NOT EXISTS idx_ledger_attr ON cost_ledger(attr_session_id)`);
 db.run(`CREATE INDEX IF NOT EXISTS idx_ledger_bucket ON cost_ledger(bucket_ts)`);
+// v0.2.4 billing_source: which wallet a session's spend drew from, derived from
+// the transcript entrypoint by the indexer (WP-M's billingSourceFromEntrypoint).
+// Additive+default so pre-0.2.4 rows read as "subscription" — the interactive
+// majority — until re-indexed. A session's rows only ever UPGRADE to agent-sdk
+// (never downgrade), so an entrypoint-less line landing first can't mis-bill it.
+for (const col of ["billing_source TEXT NOT NULL DEFAULT 'subscription'"]) {
+  try {
+    db.run(`ALTER TABLE cost_ledger ADD COLUMN ${col}`);
+  } catch {
+    // column already exists
+  }
+}
+
+// v0.2.4 local-resource claims. DISJOINT tables (checklist #8): nothing here
+// touches the messages table or its leased_at delivery lease, despite the shared
+// "claim" verb. Both are reaped by owner_id in endSeat.
+db.run(`
+  CREATE TABLE IF NOT EXISTS port_claims (
+    port INTEGER PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    claimed_at TEXT NOT NULL
+  )
+`);
+db.run(`CREATE INDEX IF NOT EXISTS idx_port_claims_owner ON port_claims(owner_id)`);
+db.run(`
+  CREATE TABLE IF NOT EXISTS path_claims (
+    path TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    owner_role TEXT,
+    claimed_at TEXT NOT NULL
+  )
+`);
+db.run(`CREATE INDEX IF NOT EXISTS idx_path_claims_owner ON path_claims(owner_id)`);
 
 // Per-file incremental cursor (bytes_parsed) + resume-rewrite dedupe. session_index
 // persists across broker restarts, so a restart resumes tails instead of re-reading
@@ -264,6 +317,12 @@ function endSeat(seatId: string) {
     seatId,
   ]);
   db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [seatId]);
+  // Checklist #2/#4: reap the seat's resource claims HERE, the one removal path all
+  // three reap triggers (stale sweep, list-seats lazy drop, unregister) funnel
+  // through — so a port/path claim can never outlive its holder (a port allocated
+  // forever, a path owned by a ghost). By owner_id, not FK cascade (#3: no FKs).
+  db.run("DELETE FROM port_claims WHERE owner_id = ?", [seatId]);
+  db.run("DELETE FROM path_claims WHERE owner_id = ?", [seatId]);
   db.run("DELETE FROM seats WHERE id = ?", [seatId]);
 }
 
@@ -297,20 +356,24 @@ const insertSeat = db.prepare(`
 `);
 const updateLastSeen = db.prepare(`UPDATE seats SET last_seen = ? WHERE id = ?`);
 const updateSummary = db.prepare(`UPDATE seats SET summary = ? WHERE id = ?`);
+const updateState = db.prepare(`UPDATE seats SET state = ? WHERE id = ?`);
 const insertSeatRun = db.prepare(`
   INSERT INTO seat_runs (seat_id, session_id, seat_token, cwd, role, model, profile, registered_at, ended_at, bound_via)
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
 `);
 const insertDelivery = db.prepare(`INSERT INTO delivery_log (to_id, batch_size, delivered_at) VALUES (?, ?, ?)`);
 const upsertLedger = db.prepare(`
-  INSERT INTO cost_ledger (session_id, attr_session_id, model, bucket_ts, input, output, cache_write, cache_read)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO cost_ledger (session_id, attr_session_id, model, bucket_ts, input, output, cache_write, cache_read, billing_source)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   ON CONFLICT(session_id, model, bucket_ts) DO UPDATE SET
     input = input + excluded.input,
     output = output + excluded.output,
     cache_write = cache_write + excluded.cache_write,
     cache_read = cache_read + excluded.cache_read,
-    attr_session_id = excluded.attr_session_id
+    attr_session_id = excluded.attr_session_id,
+    -- UPGRADE-ONLY: once any record proves a session is agent-sdk it stays so; a
+    -- later entrypoint-less line must never downgrade it back to subscription.
+    billing_source = CASE WHEN excluded.billing_source = 'agent-sdk' THEN 'agent-sdk' ELSE billing_source END
 `);
 const seenGet = db.prepare(`SELECT 1 FROM seen_msgs WHERE session_id = ? AND msg_id = ?`);
 const seenIns = db.prepare(`INSERT OR IGNORE INTO seen_msgs (session_id, msg_id) VALUES (?, ?)`);
@@ -520,6 +583,125 @@ function handleUnregister(body: UnregisterRequest): void {
   if (id) endSeat(id);
 }
 
+// --- v0.2.4 seat state + local-resource claims ---
+
+// A claim/state owner must be a LIVE seat, so a claim can be reaped by endSeat when
+// it dies (checklist #2/#3: no orphan owned by a ghost). Mirrors send-message's
+// from_id liveness guard. Returns the seat row (with role) or null.
+function liveSeat(id: string): { pid: number; role: string | null } | null {
+  const s = db.query("SELECT pid, role FROM seats WHERE id = ?").get(id) as { pid: number; role: string | null } | null;
+  return s && pidAlive(s.pid) ? s : null;
+}
+
+// A seat reports its OWN state (the request's `id` IS the seat — the frozen
+// SetStateRequest carries no separate caller/target, unlike /wait-for). The update
+// touches ONLY that row, and only when it's a live seat, so no seat can invent a
+// state for a nonexistent id or bleed into another row. Reaped for free: `state` is
+// a column on the seats row endSeat already deletes.
+function handleSetState(body: SetStateRequest): { ok: boolean; error?: string } {
+  if (!liveSeat(body.id)) return { ok: false, error: `${body.id} is not a live seat` };
+  updateState.run(body.state, body.id);
+  return { ok: true };
+}
+
+// Allocate `count` free ports from [LO, HI], PERSISTED in port_claims (checklist
+// #4: no in-process Set — it dies on restart while a live seat's env still points
+// at the port). ONE db.transaction, handler stays SYNCHRONOUS (checklist #1: no
+// await between the free-scan and the insert, or two claims interleave onto one
+// port). The whole allocation is atomic — a partial claim never persists.
+const claimPortsTxn = db.transaction((ownerId: string, count: number, now: string): number[] => {
+  const taken = new Set(
+    (db.query("SELECT port FROM port_claims").all() as { port: number }[]).map((r) => r.port)
+  );
+  const allocated: number[] = [];
+  for (let p = PORT_RANGE_LO; p <= PORT_RANGE_HI && allocated.length < count; p++) {
+    if (taken.has(p)) continue;
+    db.run("INSERT INTO port_claims (port, owner_id, claimed_at) VALUES (?, ?, ?)", [p, ownerId, now]);
+    allocated.push(p);
+  }
+  if (allocated.length < count) {
+    // Not enough free ports: abort the WHOLE allocation (throw rolls the transaction
+    // back) so a seat never boots with a half-satisfied port set.
+    throw new Error(`port range ${PORT_RANGE_LO}-${PORT_RANGE_HI} exhausted: ${count} requested, ${allocated.length} free`);
+  }
+  return allocated;
+});
+
+function handleClaimPort(body: ClaimPortRequest): ClaimPortResponse {
+  if (!liveSeat(body.id)) throw new Error(`${body.id} is not a live seat`);
+  const count = body.count ?? 1;
+  return { ports: claimPortsTxn(body.id, count, new Date().toISOString()) };
+}
+
+// Absolute + realpath-resolved (contract). realpath collapses symlinks so two
+// spellings of one file can't be double-claimed; it throws on a not-yet-existing
+// path, so fall back to a plain absolute resolve for a claim on a file about to be
+// created (advisory claims are allowed ahead of the file existing).
+function normalizeClaimPath(p: string): string {
+  const abs = resolvePath(p);
+  try {
+    return realpathSync(abs);
+  } catch {
+    return abs;
+  }
+}
+
+// Check-then-insert for a whole batch in ONE db.transaction (checklist #1): a path
+// held by ANOTHER owner is denied with the current holder (advisory — no theft,
+// checklist #6 authz); a free path, or one this seat already holds, is granted
+// (idempotent re-claim).
+const claimPathsTxn = db.transaction((ownerId: string, ownerRole: string | null, paths: string[], now: string) => {
+  const granted: string[] = [];
+  const denied: PathClaim[] = [];
+  for (const raw of paths) {
+    const path = normalizeClaimPath(raw);
+    const holder = db.query("SELECT path, owner_id, owner_role, claimed_at FROM path_claims WHERE path = ?").get(path) as PathClaim | null;
+    if (holder && holder.owner_id !== ownerId) {
+      denied.push(holder);
+      continue;
+    }
+    db.run(
+      `INSERT INTO path_claims (path, owner_id, owner_role, claimed_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(path) DO UPDATE SET claimed_at = excluded.claimed_at, owner_role = excluded.owner_role`,
+      [path, ownerId, ownerRole, now]
+    );
+    granted.push(path);
+  }
+  return { granted, denied };
+});
+
+function handleClaimPath(body: ClaimPathRequest): ClaimPathResponse {
+  const seat = liveSeat(body.id);
+  if (!seat) throw new Error(`${body.id} is not a live seat`);
+  return claimPathsTxn(body.id, seat.role, body.paths, new Date().toISOString());
+}
+
+// Release only your OWN claims (checklist #6: a seat can't release another's).
+// paths given => release just those you hold; omitted => release everything you
+// hold. Idempotent: releasing a path you don't own matches nothing.
+function handleReleaseClaims(body: ReleaseClaimsRequest): { ok: true } {
+  if (body.paths && body.paths.length > 0) {
+    for (const raw of body.paths) {
+      db.run("DELETE FROM path_claims WHERE path = ? AND owner_id = ?", [normalizeClaimPath(raw), body.id]);
+    }
+  } else {
+    db.run("DELETE FROM path_claims WHERE owner_id = ?", [body.id]);
+  }
+  return { ok: true };
+}
+
+// Advisory read of current path claims. git_root scopes to claims on paths under
+// that repo root (prefix match); omitted => all claims. Raw rows — the caller
+// coordinates. (Port claims are lifecycle-only, reaped in endSeat, no read route.)
+function handleListClaims(body: ListClaimsRequest): PathClaim[] {
+  const rows = body.git_root
+    ? (db.query(
+        "SELECT path, owner_id, owner_role, claimed_at FROM path_claims WHERE path = ? OR path LIKE ? ORDER BY path"
+      ).all(body.git_root, `${body.git_root}/%`) as PathClaim[])
+    : (db.query("SELECT path, owner_id, owner_role, claimed_at FROM path_claims ORDER BY path").all() as PathClaim[]);
+  return rows;
+}
+
 // v0.2 Layer 2 (exact; any seat incl. manual): a plugin SessionStart hook posts
 // what CC hands it. Bind the session to the live run whose claude pid matches
 // (seats.pid is now the claude pid — see seat-server), else the newest still-
@@ -584,6 +766,7 @@ interface LedgerTally {
   output: number;
   cache_write: number;
   cache_read: number;
+  billing_source: BillingSource;
 }
 
 // Shared window read for /costs AND /stats. Table reads ONLY — no filesystem
@@ -621,16 +804,16 @@ function readLedgerWindow(body: { since?: string; until?: string }): {
   const ledger = (
     untilBucket !== null
       ? db.query(
-          `SELECT session_id, attr_session_id, model, input, output, cache_write, cache_read
+          `SELECT session_id, attr_session_id, model, input, output, cache_write, cache_read, billing_source
            FROM cost_ledger WHERE bucket_ts >= ? AND bucket_ts <= ?`
         ).all(sinceBucket, untilBucket)
       : db.query(
-          `SELECT session_id, attr_session_id, model, input, output, cache_write, cache_read
+          `SELECT session_id, attr_session_id, model, input, output, cache_write, cache_read, billing_source
            FROM cost_ledger WHERE bucket_ts >= ?`
         ).all(sinceBucket)
   ) as {
     session_id: string; attr_session_id: string; model: string;
-    input: number; output: number; cache_write: number; cache_read: number;
+    input: number; output: number; cache_write: number; cache_read: number; billing_source: BillingSource | null;
   }[];
 
   // collapse hour buckets into one tally per (session, model).
@@ -639,13 +822,16 @@ function readLedgerWindow(body: { since?: string; until?: string }): {
     const key = `${r.session_id}\0${r.model}`;
     let t = tally.get(key);
     if (!t) {
-      t = { session_id: r.session_id, attr_session_id: r.attr_session_id, model: r.model, input: 0, output: 0, cache_write: 0, cache_read: 0 };
+      t = { session_id: r.session_id, attr_session_id: r.attr_session_id, model: r.model, input: 0, output: 0, cache_write: 0, cache_read: 0, billing_source: "subscription" };
       tally.set(key, t);
     }
     t.input += r.input;
     t.output += r.output;
     t.cache_write += r.cache_write;
     t.cache_read += r.cache_read;
+    // Upgrade-only, defensive: any agent-sdk bucket makes the tally agent-sdk (a NULL
+    // from a pre-0.2.4 row reads as subscription). Mirrors the ledger's ON CONFLICT.
+    if (r.billing_source === "agent-sdk") t.billing_source = "agent-sdk";
   }
   return { sinceIso, untilIso, tallies: [...tally.values()], seatBySession };
 }
@@ -658,10 +844,13 @@ function costOf(t: { model: string; input: number; output: number; cache_write: 
 function handleCosts(body: CostsRequest): CostsResponse {
   const { tallies, seatBySession } = readLedgerWindow(body);
   const rows: CostRow[] = [];
-  let total = 0;
+  // Per-wallet totals — kept separate (never one sum): subscription vs agent-sdk
+  // bill different accounts. Codex "external" spend has NO ledger row (no transcript),
+  // so it never appears here; `patrol status` renders it "$—", not a fabricated 0.
+  const bySource: Partial<Record<BillingSource, number>> = {};
   for (const t of tallies.sort((a, b) => a.session_id.localeCompare(b.session_id))) {
     const cost = costOf(t);
-    total += cost;
+    bySource[t.billing_source] = (bySource[t.billing_source] ?? 0) + cost;
     rows.push({
       seat_id: seatBySession.get(t.attr_session_id) ?? null,
       session_id: t.session_id,
@@ -671,9 +860,17 @@ function handleCosts(body: CostsRequest): CostsResponse {
       cache_write: t.cache_write,
       cache_read: t.cache_read,
       cost_usd: round4(cost),
+      billing_source: t.billing_source,
     });
   }
-  return { rows, total_usd: round4(total) };
+  // total_usd = sum of the ROUNDED buckets, so the status pool columns always add
+  // up to the displayed total (no independent-rounding sub-cent gap).
+  let roundedTotal = 0;
+  for (const k of Object.keys(bySource) as BillingSource[]) {
+    bySource[k] = round4(bySource[k]!);
+    roundedTotal += bySource[k]!;
+  }
+  return { rows, total_usd: round4(roundedTotal), by_source: bySource };
 }
 
 // The v0.2 evidence layer. Same window + same priced tallies as /costs, but
@@ -939,6 +1136,14 @@ function indexFile(file: string, parentSessionId: string | null) {
         db.run("DELETE FROM seen_msgs WHERE session_id = ?", [sid]);
       }
     }
+    // Per-session billing_source for THIS batch: any sdk* record makes the whole
+    // session agent-sdk (a session has one launch lineage; entrypoint can be absent
+    // on some records). Combined with the ledger's upgrade-only ON CONFLICT, a later
+    // sdk line fixes an earlier subscription row across ticks too.
+    const sessionSrc = new Map<string, BillingSource>();
+    for (const r of records) {
+      if (billingSourceFromEntrypoint(r.entrypoint) === "agent-sdk") sessionSrc.set(r.sessionId, "agent-sdk");
+    }
     // aggregate this batch's deltas, deduping resume-rewrites via seen_msgs
     const agg = new Map<string, { sid: string; attr: string; model: string; bucket: number; i: number; o: number; cw: number; cr: number }>();
     for (const r of records) {
@@ -959,7 +1164,7 @@ function indexFile(file: string, parentSessionId: string | null) {
       a.cw += r.cache_write;
       a.cr += r.cache_read;
     }
-    for (const a of agg.values()) upsertLedger.run(a.sid, a.attr, a.model, a.bucket, a.i, a.o, a.cw, a.cr);
+    for (const a of agg.values()) upsertLedger.run(a.sid, a.attr, a.model, a.bucket, a.i, a.o, a.cw, a.cr, sessionSrc.get(a.sid) ?? "subscription");
     idxSet.run(file, parentSessionId, bytesParsed, mtime, anchor, JSON.stringify([...storedIds]));
   })();
 }
@@ -1060,6 +1265,7 @@ function indexTick() {
 // price and bloats SQLite). Returns a terse error string, or null when valid.
 
 const SLUG_RE = /^[a-z0-9]{8}$/;
+const SEAT_STATES = new Set<string>(["idle", "working", "blocked", "done", "unknown"] satisfies SeatState[]);
 const MAX_TEXT_BYTES = 8 * 1024;
 const MAX_SUMMARY = 500;
 const MAX_PATH = 1024;
@@ -1143,6 +1349,33 @@ export function validate(path: string, body: unknown): string | null {
         return "after_id must be a non-negative integer";
       if (b.limit != null && !isPosInt(b.limit)) return "limit must be a positive integer";
       return null;
+    case "/set-state":
+      if (!isSlug(b.id)) return "id must be an 8-char [a-z0-9] slug";
+      if (!SEAT_STATES.has(b.state as string)) return `state must be one of ${[...SEAT_STATES].join("|")}`;
+      return null;
+    case "/claim-port":
+      if (!isSlug(b.id)) return "id must be an 8-char [a-z0-9] slug";
+      if (b.count != null && (!isPosInt(b.count) || (b.count as number) > MAX_PORT_COUNT))
+        return `count must be a positive integer ≤${MAX_PORT_COUNT}`;
+      return null;
+    case "/claim-path": {
+      if (!isSlug(b.id)) return "id must be an 8-char [a-z0-9] slug";
+      if (!Array.isArray(b.paths) || b.paths.length < 1 || b.paths.length > MAX_CLAIM_PATHS)
+        return `paths must be a non-empty array of ≤${MAX_CLAIM_PATHS} strings`;
+      if (!b.paths.every((p) => isStr(p, MAX_PATH, 1))) return `each path must be a non-empty string ≤${MAX_PATH} chars`;
+      return null;
+    }
+    case "/release-claims": {
+      if (!isSlug(b.id)) return "id must be an 8-char [a-z0-9] slug";
+      if (b.paths != null) {
+        if (!Array.isArray(b.paths) || b.paths.length > MAX_CLAIM_PATHS) return `paths must be an array of ≤${MAX_CLAIM_PATHS} strings`;
+        if (!b.paths.every((p) => isStr(p, MAX_PATH, 1))) return `each path must be a non-empty string ≤${MAX_PATH} chars`;
+      }
+      return null;
+    }
+    case "/list-claims":
+      if (!isOptStr(b.git_root, MAX_PATH)) return "git_root too long or not a string";
+      return null;
     default:
       return null; // unknown route 404s below
   }
@@ -1217,6 +1450,16 @@ Bun.serve({
         case "/unregister":
           handleUnregister(body as UnregisterRequest);
           return Response.json({ ok: true });
+        case "/set-state":
+          return Response.json(handleSetState(body as SetStateRequest));
+        case "/claim-port":
+          return Response.json(handleClaimPort(body as ClaimPortRequest));
+        case "/claim-path":
+          return Response.json(handleClaimPath(body as ClaimPathRequest));
+        case "/release-claims":
+          return Response.json(handleReleaseClaims(body as ReleaseClaimsRequest));
+        case "/list-claims":
+          return Response.json(handleListClaims(body as ListClaimsRequest));
         default:
           return Response.json({ error: "not found" }, { status: 404 });
       }

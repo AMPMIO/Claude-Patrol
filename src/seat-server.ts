@@ -151,6 +151,18 @@ const TOOLS = [
     },
   },
   {
+    name: "set_state",
+    description:
+      "Report your current work state so other seats and the dashboard can see it at a glance: idle | working | blocked | done. Self-reported; idempotent.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        state: { type: "string" as const, enum: ["idle", "working", "blocked", "done"], description: "your current state" },
+      },
+      required: ["state"],
+    },
+  },
+  {
     name: "check_messages",
     description:
       "Manually pull queued messages from other seats. Messages normally arrive automatically via channel push; use this only as a fallback.",
@@ -237,6 +249,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const { summary } = args as { summary: string };
         await brokerFetch("/set-summary", { id: myId, summary });
         return { content: [{ type: "text" as const, text: `Summary updated: "${summary}"` }] };
+      }
+      case "set_state": {
+        const { state } = args as { state: string };
+        await brokerFetch("/set-state", { id: myId, state });
+        return { content: [{ type: "text" as const, text: `State set: ${state}` }] };
       }
       case "check_messages": {
         const { messages } = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });

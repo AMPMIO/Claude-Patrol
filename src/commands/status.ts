@@ -56,7 +56,16 @@ export default async function status(_args: string[]): Promise<number> {
     console.log("\nspend unavailable — broker /costs did not respond");
   } else {
     if (unattributed > 0) console.log(`\nunattributed: ${usd(unattributed)}`);
-    console.log(`total spend: ${usd(costs.total_usd)}`);
+    // Three wallets, NEVER summed into one number — they bill different accounts.
+    // subscription + agent-sdk come from the ledger's by_source; codex "external"
+    // has no ledger row (no transcript), so it renders "$—" (unknown, not a made-up 0).
+    const by = costs.by_source ?? {};
+    const sub = by.subscription ?? 0;
+    const sdk = by["agent-sdk"] ?? 0;
+    console.log(
+      `\nby wallet:  subscription ${usd(sub)}   agent-sdk ${usd(sdk)}   external $—`
+    );
+    console.log(`total spend: ${usd(costs.total_usd)}  (subscription + agent-sdk; external billed separately)`);
   }
   return 0;
 }
