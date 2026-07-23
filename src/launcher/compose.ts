@@ -163,11 +163,16 @@ export function composeSeat(plan: SeatPlan, paths: ComposePaths, seatToken: stri
   // it lands in the session jsonl the broker content-matches on) and the env.
   // `silent` seats opt out of both and stay on Layer-3 heuristic attribution.
   const marker = seatToken != null && spec.silent !== true ? seatMarker(seatToken) : null;
-  if (spec.prompt) {
-    argv.push(marker ? `${spec.prompt}\n\n${marker}` : spec.prompt);
-  } else if (marker) {
-    argv.push(`${marker} You are seat ${plan.role}. Await instructions.`);
-  }
+  const promptArg = spec.prompt
+    ? (marker ? `${spec.prompt}\n\n${marker}` : spec.prompt)
+    : (marker ? `${marker} You are seat ${plan.role}. Await instructions.` : null);
+  // The prompt is a trailing POSITIONAL. `--dangerously-load-development-channels`
+  // above is variadic and, unless a flag follows it, slurps the prompt as another
+  // (untagged) channel entry → claude errors out and the seat never boots. This bit
+  // every `mcp:"full"`/no-profile seat (no --settings/--mcp-config to bound it).
+  // `--` ends option parsing so the prompt is always a clean positional; it's a
+  // harmless no-op when no variadic precedes it.
+  if (promptArg !== null) argv.push("--", promptArg);
 
   const env: Record<string, string> = {
     CLAUDE_PATROL_ROLE: plan.role,

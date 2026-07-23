@@ -192,7 +192,7 @@ describe("composeSeat argv+env", () => {
   test("tmux full seat: no mcp flags, no settings, prompt positional", () => {
     const p = plan({ name: "orchestrator", role: "lead", model: "opus", backend: "tmux", profile: "full", prompt: "go" });
     const { argv, env } = composeSeat(p, pathsFor(p));
-    expect(argv).toEqual(["claude", "--model", "opus", "--name", "orchestrator", ...CHAN, "go"]);
+    expect(argv).toEqual(["claude", "--model", "opus", "--name", "orchestrator", ...CHAN, "--", "go"]);
     expect(env).toEqual({ CLAUDE_PATROL_ROLE: "lead", CLAUDE_PATROL_MODEL: "opus", CLAUDE_PATROL_PROFILE: "full" });
   });
 
@@ -247,28 +247,28 @@ describe("composeSeat seat-token marker", () => {
   test("appends marker to an existing prompt and sets SEAT_TOKEN_ENV", () => {
     const p = plan({ name: "orchestrator", role: "lead", model: "opus", profile: "full", prompt: "go" });
     const { argv, env } = composeSeat(p, pathsFor(p), TOKEN);
-    expect(argv).toEqual(["claude", "--model", "opus", "--name", "orchestrator", ...CHAN, `go\n\n${MARKER}`]);
+    expect(argv).toEqual(["claude", "--model", "opus", "--name", "orchestrator", ...CHAN, "--", `go\n\n${MARKER}`]);
     expect(env[SEAT_TOKEN_ENV]).toBe(TOKEN);
   });
 
   test("synthesizes a minimal prompt when the seat has none", () => {
     const p = plan({ name: "worker-1", role: "worker", model: "sonnet" });
     const { argv, env } = composeSeat(p, pathsFor(p), TOKEN);
-    expect(argv).toEqual(["claude", "--model", "sonnet", "--name", "worker-1", ...CHAN, `${MARKER} You are seat worker. Await instructions.`]);
+    expect(argv).toEqual(["claude", "--model", "sonnet", "--name", "worker-1", ...CHAN, "--", `${MARKER} You are seat worker. Await instructions.`]);
     expect(env[SEAT_TOKEN_ENV]).toBe(TOKEN);
   });
 
   test("silent seat skips BOTH marker and env even when a token is passed", () => {
     const p = plan({ name: "quiet", model: "opus", prompt: "hi", silent: true });
     const { argv, env } = composeSeat(p, pathsFor(p), TOKEN);
-    expect(argv).toEqual(["claude", "--model", "opus", "--name", "quiet", ...CHAN, "hi"]);
+    expect(argv).toEqual(["claude", "--model", "opus", "--name", "quiet", ...CHAN, "--", "hi"]);
     expect(env[SEAT_TOKEN_ENV]).toBeUndefined();
   });
 
   test("no token passed -> no marker, no env (back-compat)", () => {
     const p = plan({ name: "bare", model: "opus", prompt: "hi" });
     const { argv, env } = composeSeat(p, pathsFor(p));
-    expect(argv).toEqual(["claude", "--model", "opus", "--name", "bare", ...CHAN, "hi"]);
+    expect(argv).toEqual(["claude", "--model", "opus", "--name", "bare", ...CHAN, "--", "hi"]);
     expect(env[SEAT_TOKEN_ENV]).toBeUndefined();
   });
 });
