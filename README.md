@@ -305,9 +305,12 @@ this for real:
   identity is bound rather than asserted. The tokens must gate `/poll-messages` and
   `/ack`, not just sending: today any caller holding the broker secret can read
   another seat's mail, and with `/ack` can silently destroy it — acking a victim's
-  batch marks it delivered and it is never seen. A bound identity is also what a safe
-  `patrol send --as <seat>` needs, which is why that flag was cut from v0.2.2 instead
-  of shipped.
+  batch marks it delivered and it is never seen. The v0.2.4 mutating routes join this
+  gate: `/release-claims`, `/set-state`, and `/claim-port` trust `body.id`, so one
+  seat can delete another's file-ownership claims, spoof its state, or burn ports
+  charged to it — the same asserted-identity model as `/set-summary`, but higher
+  stakes (destroy vs spoof). A bound identity is also what a safe `patrol send --as
+  <seat>` needs, which is why that flag was cut from v0.2.2 instead of shipped.
 - Consumer-crash redelivery. v0.2.3's lease/ack covers a *live* seat whose push failed
   or whose broker blipped; it does **not** survive the seat process dying, because the
   stale-seat sweep deletes a dead seat's undelivered mail and a restarted seat comes
