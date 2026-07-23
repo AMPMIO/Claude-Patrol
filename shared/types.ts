@@ -20,6 +20,12 @@ export interface Seat {
   role: string | null; // CLAUDE_PATROL_ROLE
   model: string | null; // CLAUDE_PATROL_MODEL
   profile: string | null; // CLAUDE_PATROL_PROFILE (lite|peer|full|custom name)
+  // v0.2.4, optional+additive: a stable, readable, broker-unique identifier
+  // assigned at register — `role` when unique, else project-prefixed, else
+  // hex-suffixed. Shown in status/list/watch/dashboard; `patrol send <handle>`
+  // resolves to `id`. The immutable `id` stays the internal key and a fallback;
+  // absent on pre-0.2.4 rows => clients fall back to `id`.
+  handle?: string;
   state?: SeatState; // v0.2.4, optional+additive: absent on pre-0.2.4 rows => "unknown"
   registered_at: string; // ISO
   last_seen: string; // ISO
@@ -72,6 +78,7 @@ export interface CostRow {
 //   /heartbeat        HeartbeatRequest       → { ok: true }
 //   /set-summary      SetSummaryRequest      → { ok: true }
 //   /set-state        SetStateRequest        → { ok: true }       (v0.2.4 semantic seat state)
+//   /rename           RenameRequest          → RenameResponse     (v0.2.4 readable seat handle)
 //   /wait-for         WaitForRequest         → WaitForResponse    (v0.2.4 block until a seat's state)
 //   /list-seats       ListSeatsRequest       → Seat[]            (raw array, no wrapper)
 //   /send-message     SendMessageRequest     → { ok: boolean; error?: string }
@@ -118,6 +125,17 @@ export function billingSource(backend: SeatSpec["backend"]): BillingSource {
 export interface SetStateRequest {
   id: SeatId;
   state: SeatState;
+}
+
+// v0.2.4 explicit rename. The broker slugifies + dedupes `name` and returns the
+// ACTUAL handle it assigned (which may differ, e.g. a "-2" suffix on collision).
+export interface RenameRequest {
+  id: SeatId;
+  name: string;
+}
+export interface RenameResponse {
+  ok: true;
+  handle: string;
 }
 
 // v0.2.4 /wait-for (herdr's agent.wait): the caller blocks until `target` reaches
@@ -192,6 +210,7 @@ export interface RegisterRequest {
   profile?: string | null;
   session_id?: string | null; // CC session id when discoverable; enables exact cost attribution
   seat_token?: string | null; // v0.2 Layer-1 marker token (SEAT_TOKEN_ENV); broker content-matches it to a session
+  name?: string | null; // v0.2.4: requested handle; broker slugifies + dedupes it. Falls back to role, then hex.
 }
 
 // v0.2 Layer 2 (exact attribution for manual seats): a plugin SessionStart
