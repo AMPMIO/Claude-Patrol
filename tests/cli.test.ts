@@ -47,10 +47,11 @@ const SEATS: Seat[] = [
 ];
 const COSTS: CostsResponse = {
   rows: [
-    { seat_id: "aaaa1111bbbb2222", session_id: "s1", model: "opus", input: 1000, output: 2000, cache_write: 0, cache_read: 0, cost_usd: 2.16 },
-    { seat_id: null, session_id: "s2", model: "sonnet", input: 500, output: 100, cache_write: 0, cache_read: 0, cost_usd: 0.42 },
+    { seat_id: "aaaa1111bbbb2222", session_id: "s1", model: "opus", input: 1000, output: 2000, cache_write: 0, cache_read: 0, cost_usd: 2.16, billing_source: "subscription" },
+    { seat_id: null, session_id: "s2", model: "sonnet", input: 500, output: 100, cache_write: 0, cache_read: 0, cost_usd: 0.42, billing_source: "agent-sdk" },
   ],
   total_usd: 2.58,
+  by_source: { subscription: 2.16, "agent-sdk": 0.42 },
 };
 const STATS: StatsResponse = {
   seats: [
@@ -147,6 +148,16 @@ test("status renders the fleet board with per-seat spend + unattributed + total"
   expect(r.out).toContain("unattributed: $0.42");
   expect(r.out).toContain("total spend: $2.58");
   expect(r.out).toContain("…"); // long summary truncated
+});
+
+test("status shows the three billing pools separately, with codex external as $—", async () => {
+  const r = await capture(() => status([]));
+  expect(r.code).toBe(0);
+  // Three wallets on the by-wallet line, never summed into one.
+  expect(r.out).toContain("subscription $2.16");
+  expect(r.out).toContain("agent-sdk $0.42");
+  expect(r.out).toContain("external $—"); // no ledger row for codex -> unknown, not a fabricated 0
+  expect(r.out).toContain("total spend: $2.58");
 });
 
 test("list prints short ids and roles", async () => {
