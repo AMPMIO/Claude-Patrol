@@ -98,6 +98,29 @@ test("/rename returns the deduped handle; a taken name gets a suffix", async () 
   expect((await post("/rename", { id: other.id, name: "" })).status).toBe(400);
 });
 
+test("MED-1: a handle can NEVER take the id shape — rename to an id-shaped name is rejected, auto-base is suffixed", async () => {
+  // Rename X to a name that IS another live seat's id would shadow that id in
+  // resolveSeatTarget (exact-handle before exact-id). The broker must reject it.
+  const y = await register({ role: "yy" }); // y.id is a real 8-char [a-z0-9] id
+  const x = await register({ role: "xx" });
+  const rej = await post("/rename", { id: x.id, name: y.id });
+  expect(rej.status).toBe(400); // "name must not look like a seat id"
+  // Any id-shaped name is refused by SHAPE, not just a currently-live id.
+  expect((await post("/rename", { id: x.id, name: "abcd1234" })).status).toBe(400);
+
+  // AUTO assignment: an 8-char-alnum role must not yield a bare id-shaped handle —
+  // it gets a project/hex suffix (which contains a dash, so it's out of the id space).
+  const shaped = await register({ role: "wxyz7890" }); // 8 alnum chars
+  expect(shaped.handle).not.toBe("wxyz7890");
+  expect(/^[a-z0-9]{8}$/.test(shaped.handle)).toBe(false);
+  expect(shaped.handle.startsWith("wxyz7890-")).toBe(true);
+});
+
+test("LOW-2: a long name is capped at assignment so it can't blow out the tables", async () => {
+  const long = await register({ name: "a".repeat(200), role: "L" });
+  expect(long.handle.length).toBeLessThanOrEqual(24);
+});
+
 test("a handle is reaped when the seat dies — the name frees up for reuse", async () => {
   const first = await register({ name: "solo", role: "z" });
   expect(first.handle).toBe("solo");

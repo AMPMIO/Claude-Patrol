@@ -450,10 +450,20 @@ function generateId(): string {
 
 // v0.2.4 readable handle. A UX layer ON TOP of the immutable hex id — never a
 // replacement, and never a unique KEY (the id is). slug() lowercases to [a-z0-9-],
-// collapses repeats, trims dashes; empty degrades to "seat".
+// collapses repeats, trims dashes, and CAPS length so a long name can't blow out
+// the status/list tables or the watch SEAT column; empty degrades to "seat".
+const HANDLE_MAX = 24;
 function slug(s: string | null | undefined): string {
   const out = (s ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-  return out || "seat";
+  // Cap AT the source, then re-trim so the cut never leaves a trailing dash.
+  return out.slice(0, HANDLE_MAX).replace(/-+$/g, "") || "seat";
+}
+
+// The hex id shape (SLUG_RE): exactly 8 chars of [a-z0-9]. A handle must NEVER take
+// this shape, or it would live in the id namespace and shadow a real seat's id in
+// resolveSeatTarget (which checks exact-handle before exact-id).
+function looksLikeSeatId(s: string): boolean {
+  return /^[a-z0-9]{8}$/.test(s);
 }
 
 // A handle is "taken" only if a LIVE seat OTHER than excludeId holds it — dead
@@ -463,16 +473,19 @@ function handleTaken(handle: string, excludeId: string): boolean {
   return rows.some((r) => pidAlive(r.pid));
 }
 
-// Assign a stable readable handle, deduped among live seats:
-//   base            when free,
+// Assign a stable readable handle, deduped among live seats AND kept out of the id
+// namespace (MED-1):
+//   base            when free AND not id-shaped,
 //   base-<proj>     else (proj = slug of the git-root/cwd basename),
 //   base-<4hex>     else (last resort; 4 chars of the seat's own id — the id is
 //                   always the unambiguous fallback, so a residual collision here
 //                   never routes to the wrong seat, it just reads less prettily).
+// The suffixed forms all contain a dash, so they can never be 8-pure-alnum — only
+// the bare `base` could collide with the id space, so that's the branch we guard.
 function assignHandle(baseName: string | null | undefined, ownId: string, gitRoot: string | null, cwd: string): string {
   const base = slug(baseName);
-  if (!handleTaken(base, ownId)) return base;
-  const proj = slug(basename(gitRoot || cwd));
+  if (!looksLikeSeatId(base) && !handleTaken(base, ownId)) return base;
+  const proj = slug(basename(gitRoot || cwd)).slice(0, 8).replace(/-+$/g, "") || "seat";
   const withProj = `${base}-${proj}`;
   if (!handleTaken(withProj, ownId)) return withProj;
   return `${base}-${ownId.slice(0, 4)}`;
@@ -1373,7 +1386,11 @@ export function validate(path: string, body: unknown): string | null {
       return isStr(b.summary, MAX_SUMMARY) ? null : `summary must be a string ≤${MAX_SUMMARY} chars`;
     case "/rename":
       if (!isSlug(b.id)) return "id must be an 8-char [a-z0-9] slug";
-      return isStr(b.name, MAX_LABEL, 1) ? null : `name must be a non-empty string ≤${MAX_LABEL} chars`;
+      if (!isStr(b.name, MAX_LABEL, 1)) return `name must be a non-empty string ≤${MAX_LABEL} chars`;
+      // MED-1: an explicit rename to an id-shaped name would shadow a real seat id
+      // in resolveSeatTarget. Reject it here (auto-assignment suffixes instead).
+      if (looksLikeSeatId(slug(b.name))) return "name must not look like a seat id (8 chars of a-z0-9)";
+      return null;
     case "/send-message": {
       if (b.from_id !== "cli" && !isSlug(b.from_id)) return 'from_id must be a seat slug or "cli"';
       if (!isSlug(b.to_id)) return "to_id must be an 8-char [a-z0-9] slug";
