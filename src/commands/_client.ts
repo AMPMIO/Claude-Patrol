@@ -27,6 +27,39 @@ export async function readToken(): Promise<string | null> {
 
 export class BrokerError extends Error {}
 
+// A displayed seat identifier: its handle when it has one, else the short hex id.
+export function seatLabel(seat: { handle?: string; id: string }): string {
+  return seat.handle && seat.handle.length > 0 ? seat.handle : seat.id.slice(0, 8);
+}
+
+// Resolve a user-typed seat target (handle OR raw/prefix hex id) to a full seat id,
+// CLIENT-SIDE, via /list-seats. Precedence — the handle is the primary UX identifier:
+//   1. exact handle match           (readable name wins)
+//   2. exact full id match           (raw hex id, unchanged — the fallback)
+//   3. unique id-prefix match
+// An ambiguous handle or prefix ERRORS with the candidates rather than routing to the
+// wrong seat. Nothing matched throws too, so a typo never silently hits a live seat.
+export async function resolveSeatTarget(target: string): Promise<string> {
+  const seats = await brokerPost<Array<{ id: string; handle?: string; role: string | null }>>(
+    "/list-seats",
+    { scope: "machine", cwd: process.cwd(), git_root: gitRoot() }
+  );
+  const cand = (s: { id: string; role: string | null }) => `${s.id.slice(0, 8)}${s.role ? ` (${s.role})` : ""}`;
+
+  const byHandle = seats.filter((s) => s.handle === target);
+  if (byHandle.length === 1) return byHandle[0]!.id;
+  if (byHandle.length > 1) throw new BrokerError(`ambiguous handle "${target}" — matches ${byHandle.map(cand).join(", ")}; use the id`);
+
+  const exactId = seats.find((s) => s.id === target);
+  if (exactId) return exactId.id;
+
+  const byPrefix = seats.filter((s) => s.id.startsWith(target));
+  if (byPrefix.length === 1) return byPrefix[0]!.id;
+  if (byPrefix.length > 1) throw new BrokerError(`ambiguous id prefix "${target}" — matches ${byPrefix.map(cand).join(", ")}`);
+
+  throw new BrokerError(`no live seat matches "${target}" — see \`patrol list\``);
+}
+
 export async function brokerPost<T>(path: string, body: unknown): Promise<T> {
   const token = await readToken();
   if (!token) {

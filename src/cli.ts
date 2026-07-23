@@ -2,7 +2,7 @@
 // patrol CLI — thin dispatcher. Each subcommand lives in src/commands/<name>.ts
 // and default-exports (args: string[]) => Promise<number>.
 
-const COMMANDS = ["up", "down", "status", "send", "list", "doctor", "stats", "watch", "claim-port", "claim", "claims", "release"] as const;
+const COMMANDS = ["up", "down", "status", "send", "list", "doctor", "stats", "watch", "claim-port", "claim", "claims", "release", "rename"] as const;
 
 async function main(): Promise<number> {
   const [cmd, ...args] = process.argv.slice(2);
@@ -13,7 +13,8 @@ Usage:
   patrol up [config]     launch the fleet from patrol.yaml
   patrol down            tear the fleet down
   patrol status          fleet board: seats, roles, models, spend
-  patrol send <id> <msg> message a seat
+  patrol send <handle> <msg>  message a seat (handle or id)
+  patrol rename <h> <name>    rename a seat's handle
   patrol list            list seats (compact)
   patrol doctor          check broker/daemon health
   patrol stats           telemetry: wake-ups, coalescing, attribution layers

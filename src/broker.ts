@@ -58,6 +58,8 @@ import type {
   ReleaseClaimsRequest,
   ListClaimsRequest,
   PathClaim,
+  RenameRequest,
+  RenameResponse,
 } from "../shared/types.ts";
 
 const PORT = parseInt(process.env.CLAUDE_PATROL_PORT ?? "7900", 10);
@@ -126,8 +128,10 @@ db.run(`
 
 // Additive migrations for DBs created before a column existed. Each ALTER is
 // idempotent-by-try: it throws (and is ignored) once the column is present.
-// v0.2.4 adds `state` (self-reported seat state; NULL reads as "unknown" downstream).
-for (const col of ["role TEXT", "model TEXT", "profile TEXT", "session_id TEXT", "state TEXT"]) {
+// v0.2.4 adds `state` (self-reported seat state; NULL reads as "unknown" downstream)
+// and `handle` (readable broker-assigned name; NULL on pre-0.2.4 rows => clients fall
+// back to the hex id).
+for (const col of ["role TEXT", "model TEXT", "profile TEXT", "session_id TEXT", "state TEXT", "handle TEXT"]) {
   try {
     db.run(`ALTER TABLE seats ADD COLUMN ${col}`);
   } catch {
@@ -351,12 +355,13 @@ setInterval(cleanStaleSeats, 30_000);
 // --- Prepared statements ---
 
 const insertSeat = db.prepare(`
-  INSERT INTO seats (id, pid, cwd, git_root, tty, summary, role, model, profile, session_id, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO seats (id, pid, cwd, git_root, tty, summary, role, model, profile, session_id, registered_at, last_seen, handle)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 const updateLastSeen = db.prepare(`UPDATE seats SET last_seen = ? WHERE id = ?`);
 const updateSummary = db.prepare(`UPDATE seats SET summary = ? WHERE id = ?`);
 const updateState = db.prepare(`UPDATE seats SET state = ? WHERE id = ?`);
+const updateHandle = db.prepare(`UPDATE seats SET handle = ? WHERE id = ?`);
 const insertSeatRun = db.prepare(`
   INSERT INTO seat_runs (seat_id, session_id, seat_token, cwd, role, model, profile, registered_at, ended_at, bound_via)
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
@@ -443,6 +448,36 @@ function generateId(): string {
   return id;
 }
 
+// v0.2.4 readable handle. A UX layer ON TOP of the immutable hex id — never a
+// replacement, and never a unique KEY (the id is). slug() lowercases to [a-z0-9-],
+// collapses repeats, trims dashes; empty degrades to "seat".
+function slug(s: string | null | undefined): string {
+  const out = (s ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  return out || "seat";
+}
+
+// A handle is "taken" only if a LIVE seat OTHER than excludeId holds it — dead
+// seats free their handle (and it's reaped from the row on endSeat anyway).
+function handleTaken(handle: string, excludeId: string): boolean {
+  const rows = db.query("SELECT pid FROM seats WHERE handle = ? AND id != ?").all(handle, excludeId) as { pid: number }[];
+  return rows.some((r) => pidAlive(r.pid));
+}
+
+// Assign a stable readable handle, deduped among live seats:
+//   base            when free,
+//   base-<proj>     else (proj = slug of the git-root/cwd basename),
+//   base-<4hex>     else (last resort; 4 chars of the seat's own id — the id is
+//                   always the unambiguous fallback, so a residual collision here
+//                   never routes to the wrong seat, it just reads less prettily).
+function assignHandle(baseName: string | null | undefined, ownId: string, gitRoot: string | null, cwd: string): string {
+  const base = slug(baseName);
+  if (!handleTaken(base, ownId)) return base;
+  const proj = slug(basename(gitRoot || cwd));
+  const withProj = `${base}-${proj}`;
+  if (!handleTaken(withProj, ownId)) return withProj;
+  return `${base}-${ownId.slice(0, 4)}`;
+}
+
 // --- Handlers ---
 
 function handleRegister(body: RegisterRequest): RegisterResponse {
@@ -470,10 +505,15 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     }
   }
 
+  // Readable handle, deduped among live seats. Base is the requested name, else the
+  // role, else "seat". Computed AFTER the same-pid endSeat above, so a re-register
+  // doesn't collide with the row it just retired.
+  const handle = assignHandle(body.name ?? body.role, id, body.git_root, body.cwd);
+
   insertSeat.run(
     id, body.pid, body.cwd, body.git_root, body.tty, body.summary,
     body.role ?? null, body.model ?? null, body.profile ?? null, sessionId,
-    now, now
+    now, now, handle
   );
 
   // Durable run row (survives dereg). session_id is the env-override/guarded
@@ -602,6 +642,18 @@ function handleSetState(body: SetStateRequest): { ok: boolean; error?: string } 
   if (!liveSeat(body.id)) return { ok: false, error: `${body.id} is not a live seat` };
   updateState.run(body.state, body.id);
   return { ok: true };
+}
+
+// Explicit rename: re-slug + re-dedupe the requested name and store it. Returns the
+// ACTUAL assigned handle (a "-proj"/"-hex" suffix on collision), never the raw input.
+// Owner-scoped by body.id — same trust model as /set-state (the v0.3 capability-token
+// gate covers spoofing later; the existing pattern is not re-invented here).
+function handleRename(body: RenameRequest): RenameResponse | { ok: false; error: string } {
+  const seat = db.query("SELECT pid, cwd, git_root FROM seats WHERE id = ?").get(body.id) as { pid: number; cwd: string; git_root: string | null } | null;
+  if (!seat || !pidAlive(seat.pid)) return { ok: false, error: `${body.id} is not a live seat` };
+  const handle = assignHandle(body.name, body.id, seat.git_root, seat.cwd);
+  updateHandle.run(handle, body.id);
+  return { ok: true, handle };
 }
 
 // Allocate `count` free ports from [LO, HI], PERSISTED in port_claims (checklist
@@ -1319,6 +1371,9 @@ export function validate(path: string, body: unknown): string | null {
     case "/set-summary":
       if (!isSlug(b.id)) return "id must be an 8-char [a-z0-9] slug";
       return isStr(b.summary, MAX_SUMMARY) ? null : `summary must be a string ≤${MAX_SUMMARY} chars`;
+    case "/rename":
+      if (!isSlug(b.id)) return "id must be an 8-char [a-z0-9] slug";
+      return isStr(b.name, MAX_LABEL, 1) ? null : `name must be a non-empty string ≤${MAX_LABEL} chars`;
     case "/send-message": {
       if (b.from_id !== "cli" && !isSlug(b.from_id)) return 'from_id must be a seat slug or "cli"';
       if (!isSlug(b.to_id)) return "to_id must be an 8-char [a-z0-9] slug";
@@ -1452,6 +1507,8 @@ Bun.serve({
           return Response.json({ ok: true });
         case "/set-state":
           return Response.json(handleSetState(body as SetStateRequest));
+        case "/rename":
+          return Response.json(handleRename(body as RenameRequest));
         case "/claim-port":
           return Response.json(handleClaimPort(body as ClaimPortRequest));
         case "/claim-path":
