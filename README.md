@@ -313,10 +313,22 @@ CPU. 189 tests.
   register, so `patrol status` and `patrol send builder` stop dealing in random hex
   ids. The immutable id stays the internal key and a fallback.
 
-**v0.2.5 — next.** The command-center dashboard: a single broker-served page — a
-question inbox (agent questions surface in one place instead of scattered terminals),
-a work kanban from git worktrees + open PRs, the fleet board with live seat state, and
-a comms audit log. Plus seat-side port delivery (allocation shipped in 0.2.4).
+**v0.2.5 — next.**
+- **Command-center dashboard**: a single broker-served page — a question inbox (agent
+  questions surface in one place instead of scattered terminals), a work kanban from
+  git worktrees + open PRs, the fleet board with live seat state, and a comms audit log.
+- **`patrol cockpit`** — a tmux "big panel + previews" layout: the selected (or
+  orchestrator) seat fills a large top pane, the rest tile as live previews below, a
+  hotkey promotes any preview to the top slot, and the status bar shows the key hints
+  inline so you never have to remember `Ctrl-b <n>`. This is herdr's "real pane views,
+  not a wrapped interpretation" — the actual terminals, not a summary.
+- **`patrol init`** — a setup wizard that writes `patrol.yaml` (and gitignores it)
+  instead of hand-authoring it. Optionally AI-assisted: it runs a one-shot `claude -p`
+  (or codex) over the repo + the user's stated objective and *recommends* the fleet —
+  seat count, roles, models per role, topology (swarm / orchestrated / tiered) — with a
+  rationale, which the user confirms or edits. Draws the Agent-SDK pool, so the wizard
+  itself is cheap and off the interactive budget.
+- **Seat-side port delivery** (allocation shipped in 0.2.4).
 
 **v0.3 — hardening.** The work that has to land before I'd suggest anyone depend on
 this for real:
@@ -339,6 +351,13 @@ this for real:
   its launch checkout, so it cannot implement in the per-package worktrees the fleet
   runs on — it's confined to read-only review and spec work until this lands.
 - Plugin packaging, so a cloned install resolves its own paths.
+- **Project-level telemetry → a self-improving loop.** The broker already sees every
+  message, per-seat spend, and (0.2.4) state transitions; this rolls them into durable
+  per-project session records — messages/session, cost/task, blocked-time, rework rate,
+  who-waits-on-whom — so after N sessions the data can drive the next round of
+  optimizations. It is also the honest way to *measure* whether standing seats beat
+  subagents on real ongoing work, not just the one benchmark. Needs a defined schema up
+  front so the data is still minable months later.
 
 **v0.4 — after it has proven itself.** A Rust CLI; SSE or long-poll replacing the 1s
 poll; codex cost parsing, so non-Claude seats get their own per-seat spend (v0.2.4
