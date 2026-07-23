@@ -60,7 +60,10 @@ export async function resolveSeatTarget(target: string): Promise<string> {
   throw new BrokerError(`no live seat matches "${target}" — see \`patrol list\``);
 }
 
-export async function brokerPost<T>(path: string, body: unknown): Promise<T> {
+// timeoutMs defaults to 3s (a wedged broker must not hang the CLI). A long-poll
+// route like /wait-for passes a larger value — it legitimately holds the response
+// open until the target reaches its state or the server-side timeout fires.
+export async function brokerPost<T>(path: string, body: unknown, timeoutMs = 3000): Promise<T> {
   const token = await readToken();
   if (!token) {
     throw new BrokerError(`no patrol secret at ${secretPath()} — is the broker running? try: patrol up`);
@@ -71,7 +74,7 @@ export async function brokerPost<T>(path: string, body: unknown): Promise<T> {
       method: "POST",
       headers: { "content-type": "application/json", "x-patrol-token": token },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(3000), // wedged broker (port open, no response) must not hang the CLI
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch {
     // network error OR AbortError (timeout) — both are "can't reach a working broker"
