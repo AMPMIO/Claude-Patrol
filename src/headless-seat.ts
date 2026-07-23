@@ -144,6 +144,11 @@ export function shouldRetireSession(inputTokens: number, retireInputTokens: numb
   return inputTokens > retireInputTokens;
 }
 
+// A session that fails this many times IN A ROW is abandoned; the next turn creates
+// a fresh one. 2, not 1: a single transient blip must not discard a resumable
+// session. Mirrors codex-seat's MAX_CONSECUTIVE_THREAD_FAILURES.
+export const MAX_SESSION_FAILURES = 2;
+
 // The per-message prompt: same unforgeable untrusted-data fence the codex adapter
 // and the Claude seats use, so a message body cannot rewrite the seat's role or
 // rules. `boundary` is injectable for deterministic tests.
@@ -169,6 +174,7 @@ ${fenceBody(message.text, boundary)}`;
 export class ClaudeSession {
   private sessionId: string | null = null;
   private inputTokens = 0;
+  private consecutiveFailures = 0;
 
   constructor(
     private readonly config: HeadlessSeatConfig,
@@ -219,20 +225,52 @@ export class ClaudeSession {
     const out = outRes.text;
     const err = errRes.text;
 
-    const fail = (detail: string): HeadlessTurnResult => ({ ok: false, error: detail, reply: "", sessionId: this.sessionId, inputTokens: 0 });
+    // Parse BEFORE the failure checks: even an is_error / nonzero-exit turn that
+    // still emitted the JSON tells us the session id claude created and the input
+    // it billed. Throwing that away (a) orphans the session — the retry mints a new
+    // uuid and the first session's agent-sdk spend goes unresumed + uncounted — and
+    // (b) undercounts the retire budget. Mirrors codex-seat.run's parse-then-bill.
+    const parsed = parseHeadlessJson(out);
+
+    // L3: bill whenever a usage was parsed, even on failure — a failed resume still
+    // loaded and was charged for the transcript context (same class as WP-L's
+    // overflow-billing floor). Undercounting lets a frequently-failing session
+    // rotate later than intended.
+    this.inputTokens += parsed?.inputTokens ?? 0;
+
+    // H1(a): ADOPT the id on any parseable result, so a failed turn resumes the
+    // session claude already created rather than orphaning it. Resetting the failure
+    // count on a genuinely NEW id keeps a freshly-adopted session from being
+    // abandoned by failures that belonged to the previous one (codex-seat parity).
+    if (parsed?.sessionId && parsed.sessionId !== this.sessionId) {
+      this.sessionId = parsed.sessionId;
+      this.consecutiveFailures = 0;
+    }
+
+    const fail = (detail: string): HeadlessTurnResult => {
+      // M2/H1(b): escape hatch. A session that keeps failing (un-resumable, expired)
+      // would otherwise make the seat a black hole — every message resumes the dead
+      // id, fails, and drains with a "gave up" notice, none ever succeeding. After K
+      // consecutive failures, drop the id so the NEXT turn CREATES a fresh session.
+      this.consecutiveFailures++;
+      if (this.sessionId && this.consecutiveFailures >= MAX_SESSION_FAILURES) {
+        log(`Abandoning headless session ${this.sessionId} after ${this.consecutiveFailures} consecutive failures; next turn starts fresh`);
+        this.sessionId = null;
+        this.inputTokens = 0;
+        this.consecutiveFailures = 0;
+      }
+      return { ok: false, error: detail, reply: "", sessionId: this.sessionId, inputTokens: parsed?.inputTokens ?? 0 };
+    };
 
     if (overflowed) return fail(`headless output exceeded the ${this.maxOutputBytes}-byte cap; turn aborted`);
     if (timedOut) return fail("headless turn exceeded 10-minute limit");
-    if (exitCode !== 0) return fail(err.trim() || out.trim() || `claude exited ${exitCode}`);
-
-    const parsed = parseHeadlessJson(out);
+    if (exitCode !== 0 && !parsed) return fail(err.trim() || out.trim() || `claude exited ${exitCode}`);
     if (!parsed) return fail("claude -p produced no parseable JSON result");
     if (parsed.isError) return fail(parsed.reply.trim() || "claude -p reported is_error");
     if (!parsed.reply) return fail("claude -p returned an empty result");
 
-    // Success: adopt the session id (echoed back by claude) and bill its input.
-    this.sessionId = parsed.sessionId ?? sessionId;
-    this.inputTokens += parsed.inputTokens;
+    // Success: keep the adopted id and reset the failure streak.
+    this.consecutiveFailures = 0;
     return { ok: true, error: null, reply: parsed.reply, sessionId: this.sessionId, inputTokens: parsed.inputTokens };
   }
 }

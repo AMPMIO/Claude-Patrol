@@ -190,6 +190,13 @@ export function computeCosts(opts: ComputeCostsOptions = {}): CostsResponse {
         t = { session_id: ownSessionId, attr_session_id: attrSessionId, model: rec.model, input: 0, output: 0, cache_write: 0, cache_read: 0, billing_source: billingSourceFromEntrypoint(rec.entrypoint) };
         tally.set(key, t);
       }
+      // L5: a session has ONE launch lineage, but `entrypoint` may be absent on
+      // some records. Do NOT freeze billing_source from the first-seen line —
+      // scan ALL of the session's records: if ANY carries an sdk* entrypoint the
+      // session is agent-sdk. First-seen freezing would mis-bill agent-sdk spend
+      // to the cheaper subscription wallet whenever an entrypoint-less line sorts
+      // first (the "worse" direction).
+      if (billingSourceFromEntrypoint(rec.entrypoint) === "agent-sdk") t.billing_source = "agent-sdk";
       t.input += rec.input;
       t.output += rec.output;
       t.cache_write += rec.cache_write;
@@ -198,14 +205,12 @@ export function computeCosts(opts: ComputeCostsOptions = {}): CostsResponse {
   }
 
   const rows: CostRow[] = [];
-  let total = 0;
   // Per-wallet running totals. These MUST stay separate — they bill different
   // accounts — so `patrol status` renders three columns, never one sum.
   const bySource: Partial<Record<BillingSource, number>> = {};
   for (const t of [...tally.values()].sort((a, b) => a.session_id.localeCompare(b.session_id))) {
     const [pi, po, pcw, pcr] = priceFor(t.model);
     const cost = (t.input * pi + t.output * po + t.cache_write * pcw + t.cache_read * pcr) / 1e6;
-    total += cost;
     bySource[t.billing_source] = (bySource[t.billing_source] ?? 0) + cost;
     rows.push({
       seat_id: seatSessions.get(t.attr_session_id) ?? null,
@@ -219,8 +224,16 @@ export function computeCosts(opts: ComputeCostsOptions = {}): CostsResponse {
       billing_source: t.billing_source,
     });
   }
-  for (const k of Object.keys(bySource) as BillingSource[]) bySource[k] = Math.round(bySource[k]! * 1e4) / 1e4;
-  return { rows, total_usd: Math.round(total * 1e4) / 1e4, by_source: bySource };
+  // L4: round each wallet bucket, then derive total_usd as the SUM OF THE ROUNDED
+  // buckets — so the displayed per-wallet columns always add up to the displayed
+  // total. Rounding the grand total independently could leave a sub-cent gap, and
+  // the whole point of the split is trustworthy per-wallet numbers.
+  let roundedTotal = 0;
+  for (const k of Object.keys(bySource) as BillingSource[]) {
+    bySource[k] = Math.round(bySource[k]! * 1e4) / 1e4;
+    roundedTotal += bySource[k]!;
+  }
+  return { rows, total_usd: Math.round(roundedTotal * 1e4) / 1e4, by_source: bySource };
 }
 
 // Incremental single-file parser for the broker's background indexer. Reads the

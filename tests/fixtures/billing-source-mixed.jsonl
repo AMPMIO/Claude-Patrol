@@ -1,0 +1,2 @@
+{"type": "assistant", "sessionId": "mixed-sess", "timestamp": "2026-07-23T12:00:00Z", "message": {"id": "mix-1", "model": "claude-haiku-4-5-20251001", "usage": {"input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}}
+{"type": "assistant", "sessionId": "mixed-sess", "timestamp": "2026-07-23T12:01:00Z", "entrypoint": "sdk-cli", "message": {"id": "mix-2", "model": "claude-haiku-4-5-20251001", "usage": {"input_tokens": 20, "output_tokens": 8, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}}

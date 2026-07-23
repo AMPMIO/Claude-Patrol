@@ -142,6 +142,60 @@ test("a claude is_error turn fails without wedging the session", async () => {
   expect(recovered).toMatchObject({ ok: true, reply: "reply:works" });
 });
 
+test("H1(a): a failed FIRST turn ADOPTS the session it created — the retry resumes it, no orphan", async () => {
+  writeFileSync(invocationLog, "");
+  const session = fakeSession();
+  const first = await session.run("fail"); // first turn: mints SID1, is_error echoes session_id=SID1
+  expect(first.ok).toBe(false);
+  const second = await session.run("works"); // must RESUME SID1, not mint SID2
+  expect(second).toMatchObject({ ok: true, reply: "reply:works", sessionId: "SID1" });
+  const calls = readFileSync(invocationLog, "utf8").trim().split("\n");
+  expect(calls[0]).toContain("--session-id SID1");
+  expect(calls[1]).toContain("--resume SID1"); // adopted — not a fresh SID2
+  expect(calls[1]).not.toContain("SID2");
+});
+
+test("H1(b) + M2: after K consecutive failures the wedged session is abandoned, next turn creates fresh", async () => {
+  writeFileSync(invocationLog, "");
+  const session = fakeSession(); // MAX_SESSION_FAILURES = 2
+  await session.run("one"); // success -> SID1
+  await session.run("fail"); // resume SID1 fails (1st) -> still SID1
+  await session.run("fail"); // resume SID1 fails (2nd) -> K reached, abandon SID1
+  const revived = await session.run("two"); // must CREATE a fresh session, not keep resuming a dead SID1
+  expect(revived).toMatchObject({ ok: true, sessionId: "SID2" });
+  const calls = readFileSync(invocationLog, "utf8").trim().split("\n");
+  expect(calls[1]).toContain("--resume SID1");
+  expect(calls[2]).toContain("--resume SID1"); // still flogging SID1 up to K
+  expect(calls[3]).toContain("--session-id SID2"); // gave up on SID1 -> fresh
+  expect(calls[3]).not.toContain("--resume");
+});
+
+test("H1(b): a SINGLE failure does not discard an otherwise resumable session", async () => {
+  writeFileSync(invocationLog, "");
+  const session = fakeSession();
+  await session.run("one"); // success -> SID1
+  await session.run("fail"); // one failure only (1 < K)
+  await session.run("two"); // must still RESUME SID1
+  const calls = readFileSync(invocationLog, "utf8").trim().split("\n");
+  expect(calls[2]).toContain("--resume SID1");
+});
+
+test("L3: a failed turn still bills its input tokens, so the session rotates on schedule", async () => {
+  writeFileSync(invocationLog, "");
+  // Budget 20. success bills 16 (10 input + 4 cache_read + 2 cache_creation); an is_error
+  // resume bills 5. 16 + 5 = 21 > 20, so the turn AFTER the failure must retire+rotate —
+  // which only happens if the failed turn's usage was counted (the L3 fix).
+  const session = fakeSession(20);
+  await session.run("one"); // SID1, inputTokens=16
+  const failed = await session.run("fail"); // resume SID1, is_error, bills 5 -> 21 (1 < K, SID1 kept)
+  expect(failed.ok).toBe(false);
+  const rotated = await session.run("two"); // 21 > 20 -> retire -> fresh SID2
+  expect(rotated).toMatchObject({ ok: true, sessionId: "SID2" });
+  const calls = readFileSync(invocationLog, "utf8").trim().split("\n");
+  expect(calls[2]).toContain("--session-id SID2"); // rotated BECAUSE the failure billed
+  expect(calls[2]).not.toContain("--resume");
+});
+
 test("F3: output over the byte cap fails the turn without unbounded allocation", async () => {
   writeFileSync(invocationLog, "");
   // A 4-byte cap is exceeded by any real JSON line → overflow → turn fails, session survives.
