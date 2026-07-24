@@ -67,6 +67,10 @@ import type {
   AskResponse,
   QuestionsRequest,
   AnswerRequest,
+  Worktree,
+  WorktreeAddRequest,
+  WorktreeListRequest,
+  WorktreeRemoveRequest,
 } from "../shared/types.ts";
 
 const PORT = parseInt(process.env.CLAUDE_PATROL_PORT ?? "7900", 10);
@@ -328,6 +332,24 @@ db.run(`
 `);
 db.run(`CREATE INDEX IF NOT EXISTS idx_questions_open ON questions(answered, id)`);
 
+// v0.2.6 worktree association. Additive (same CREATE-IF-NOT-EXISTS idiom as the
+// tables above). git is the source of truth for the tree; this table records ONLY
+// the seat→worktree association so status/dashboard can show "seat → branch".
+// PRIMARY KEY (seat_id, path) makes /worktree-add an idempotent upsert. Reaped by
+// seat_id in endSeat — the ROW only; endSeat NEVER runs a git command, because a
+// dead seat may hold unmerged work that only `patrol checkpoint` may integrate.
+db.run(`
+  CREATE TABLE IF NOT EXISTS worktrees (
+    seat_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    base_commit TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (seat_id, path)
+  )
+`);
+db.run(`CREATE INDEX IF NOT EXISTS idx_worktrees_seat ON worktrees(seat_id)`);
+
 // Liveness probe: signal 0 doesn't kill, just checks existence. EPERM means the
 // process EXISTS but is owned by another user, so it counts as alive (matches
 // the CLI's pidAlive; moot for same-user seats but correct either way).
@@ -365,6 +387,11 @@ function endSeat(seatId: string) {
   // ANSWERED history stays (answered=1 rows are untouched), so the inbox's answered
   // log survives the seat that asked.
   db.run("DELETE FROM questions WHERE from_id = ? AND answered = 0", [seatId]);
+  // v0.2.6: drop this seat's worktree ASSOCIATIONS (rows only). git owns the tree —
+  // a dead seat may hold unmerged work, so endSeat must NOT run `git worktree remove`
+  // here (only `patrol checkpoint` removes a tree, and only after a clean merge). This
+  // is exactly the frozen contract: endSeat forgets the association, never the tree.
+  db.run("DELETE FROM worktrees WHERE seat_id = ?", [seatId]);
   db.run("DELETE FROM seats WHERE id = ?", [seatId]);
 }
 
@@ -489,6 +516,20 @@ const selectAllQuestions = db.prepare(
 );
 const selectQuestionById = db.prepare(`SELECT id, from_id, answered FROM questions WHERE id = ?`);
 const markAnswered = db.prepare(`UPDATE questions SET answered = 1, answer = ?, answered_at = ? WHERE id = ?`);
+
+// v0.2.6 worktree association statements. Upsert keeps /worktree-add idempotent on
+// (seat_id, path): a re-record of the same worktree refreshes branch/base, never dups.
+const upsertWorktree = db.prepare(
+  `INSERT INTO worktrees (seat_id, path, branch, base_commit, created_at) VALUES (?, ?, ?, ?, ?)
+   ON CONFLICT(seat_id, path) DO UPDATE SET branch = excluded.branch, base_commit = excluded.base_commit, created_at = excluded.created_at`
+);
+const selectWorktreesBySeat = db.prepare(
+  `SELECT seat_id, path, branch, base_commit, created_at FROM worktrees WHERE seat_id = ? ORDER BY created_at`
+);
+const selectAllWorktrees = db.prepare(
+  `SELECT seat_id, path, branch, base_commit, created_at FROM worktrees ORDER BY created_at`
+);
+const deleteWorktree = db.prepare(`DELETE FROM worktrees WHERE seat_id = ? AND path = ?`);
 
 // --- Seat ID ---
 
@@ -1172,6 +1213,34 @@ function handleAnswer(body: AnswerRequest): { ok: true } | { ok: false; error: s
   return answerTxn(body.question_id, body.text, new Date().toISOString());
 }
 
+// --- v0.2.6 worktree association ---
+// git owns the tree; the broker only records the seat→worktree association so
+// status/dashboard can show "seat → branch". Owner-scoped by body.id — the same
+// trust model as claims/questions (the v0.3 capability-token gate covers spoofing
+// later; the existing pattern is not re-invented here). The recorder must be a LIVE
+// seat (mirrors handleAsk/handleClaimPath): a row owned by a ghost is exactly what
+// endSeat's reap prevents, so refuse to create one.
+function handleWorktreeAdd(body: WorktreeAddRequest): { ok: true } | { ok: false; error: string } {
+  if (!liveSeat(body.id)) return { ok: false, error: `${body.id} is not a live seat` };
+  upsertWorktree.run(body.id, body.path, body.branch, body.base_commit, new Date().toISOString());
+  return { ok: true };
+}
+
+// id given => that seat's worktrees; omitted => all seats' (raw array, like
+// /list-claims — the caller coordinates).
+function handleWorktreeList(body: WorktreeListRequest): Worktree[] {
+  return (body.id ? selectWorktreesBySeat.all(body.id) : selectAllWorktrees.all()) as Worktree[];
+}
+
+// Drop ONE association, owner-scoped by seat_id+path (a seat can only de-register its
+// OWN worktree). Idempotent: removing one that isn't there matches nothing. NEVER
+// touches the git tree — the CLI removes the tree after a clean merge; this only
+// forgets the association.
+function handleWorktreeRemove(body: WorktreeRemoveRequest): { ok: true } {
+  deleteWorktree.run(body.id, body.path);
+  return { ok: true };
+}
+
 // --- v0.2.6 budget alerts (OBSERVE-ONLY) ---
 // Crossing a per-seat cap pings the alert recipient ONCE — it never gates or stops
 // the model (the frozen contract's semantics: Patrol observes spend, it does not
@@ -1674,6 +1743,19 @@ export function validate(path: string, body: unknown): string | null {
       if (typeof b.text !== "string" || b.text.length < 1 || Buffer.byteLength(b.text, "utf8") > MAX_TEXT_BYTES)
         return `text must be a non-empty string ≤${MAX_TEXT_BYTES} bytes`;
       return null;
+    case "/worktree-add":
+      if (!isSlug(b.id)) return "id must be an 8-char [a-z0-9] slug";
+      if (!isStr(b.path, MAX_PATH, 1)) return `path must be a non-empty string ≤${MAX_PATH} chars`;
+      if (!isStr(b.branch, MAX_LABEL, 1)) return `branch must be a non-empty string ≤${MAX_LABEL} chars`;
+      if (!isStr(b.base_commit, MAX_LABEL, 1)) return `base_commit must be a non-empty string ≤${MAX_LABEL} chars`;
+      return null;
+    case "/worktree-list":
+      if (b.id != null && !isSlug(b.id)) return "id must be an 8-char [a-z0-9] slug";
+      return null;
+    case "/worktree-remove":
+      if (!isSlug(b.id)) return "id must be an 8-char [a-z0-9] slug";
+      if (!isStr(b.path, MAX_PATH, 1)) return `path must be a non-empty string ≤${MAX_PATH} chars`;
+      return null;
     default:
       return null; // unknown route 404s below
   }
@@ -1787,6 +1869,12 @@ Bun.serve({
           return Response.json(handleQuestions(body as QuestionsRequest));
         case "/answer":
           return Response.json(handleAnswer(body as AnswerRequest));
+        case "/worktree-add":
+          return Response.json(handleWorktreeAdd(body as WorktreeAddRequest));
+        case "/worktree-list":
+          return Response.json(handleWorktreeList(body as WorktreeListRequest));
+        case "/worktree-remove":
+          return Response.json(handleWorktreeRemove(body as WorktreeRemoveRequest));
         default:
           return Response.json({ error: "not found" }, { status: 404 });
       }

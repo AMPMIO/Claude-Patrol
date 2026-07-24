@@ -1,6 +1,6 @@
 // patrol status — the fleet board. Flagship view: per-seat spend is the
 // differentiator no competitor peer tool has (see research/r2).
-import type { Seat, CostsResponse } from "../../shared/types.ts";
+import type { Seat, CostsResponse, Worktree } from "../../shared/types.ts";
 import { brokerPost, gitRoot, relTime, truncate, usd, renderTable, seatLabel, BrokerError } from "./_client.ts";
 
 // v0.2.6: /list-seats now carries the seat's spend cap (a REAL column added to the
@@ -31,6 +31,18 @@ export default async function status(_args: string[]): Promise<number> {
     costs = null;
   }
 
+  // v0.2.6 active task branch per seat. Best-effort like /costs: a failed call just
+  // renders "-" in the BRANCH column, it must never block the board.
+  const branchBySeat = new Map<string, string>();
+  try {
+    for (const w of await brokerPost<Worktree[]>("/worktree-list", {})) {
+      const prev = branchBySeat.get(w.seat_id);
+      branchBySeat.set(w.seat_id, prev ? `${prev},${w.branch}` : w.branch);
+    }
+  } catch {
+    /* worktree tracking unavailable — leave the column blank */
+  }
+
   const spendBySeat = new Map<string, number>();
   let unattributed = 0;
   if (costs) {
@@ -44,10 +56,11 @@ export default async function status(_args: string[]): Promise<number> {
     console.log("no seats registered.");
   } else {
     // Handle is the primary identifier; the hex id stays as a secondary column
-    // (disambiguator + fallback). SPEND is column 7, BUDGET column 8 — both right-aligned.
-    // An OVER marker rides in the SPEND cell (v0.2.6 observe-only cap; the broker has
-    // already pinged the recipient, this just surfaces it on the board).
-    const headers = ["SEAT", "ID", "ROLE", "MODEL", "PROFILE", "TTY", "SEEN", "SPEND", "BUDGET", "SUMMARY"];
+    // (disambiguator + fallback). BRANCH (v0.2.6) is the seat's active task worktree.
+    // SPEND is column 8, BUDGET column 9 — both right-aligned. An OVER marker rides in
+    // the SPEND cell (v0.2.6 observe-only cap; the broker has already pinged the
+    // recipient, this just surfaces it on the board).
+    const headers = ["SEAT", "ID", "ROLE", "MODEL", "PROFILE", "TTY", "BRANCH", "SEEN", "SPEND", "BUDGET", "SUMMARY"];
     const rows = seats.map((s) => {
       const budget = (s as SeatWithBudget).budget_usd ?? null;
       const spend = spendBySeat.get(s.id) ?? 0;
@@ -59,13 +72,14 @@ export default async function status(_args: string[]): Promise<number> {
         s.model ?? "-",
         s.profile ?? "-",
         s.tty ?? "-",
+        truncate(branchBySeat.get(s.id) ?? "-", 24),
         relTime(s.last_seen),
         costs ? `${usd(spend)}${over ? " OVER" : ""}` : "—",
         budget != null ? usd(budget) : "—",
         truncate(s.summary, 40),
       ];
     });
-    console.log(renderTable(headers, rows, new Set([7, 8])));
+    console.log(renderTable(headers, rows, new Set([8, 9])));
   }
 
   if (!costs) {
