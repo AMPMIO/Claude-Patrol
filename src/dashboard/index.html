@@ -76,6 +76,8 @@
   .stat { display: flex; flex-direction: column; gap: 1px; }
   .stat .k { font-size: 15px; font-weight: 800; font-family: system-ui, sans-serif; font-variant-numeric: tabular-nums; }
   .stat .rust { color: var(--rust); }
+  /* three billing wallets — contents so each .stat joins the topbar flex row directly */
+  .wallets { display: contents; }
   .pill {
     display: inline-flex; align-items: center; gap: 6px;
     border: 1.5px solid var(--line); padding: 2px 8px; border-radius: 999px;
@@ -185,6 +187,35 @@
   .msg .txt { font-size: 11px; color: var(--ink-2); margin-top: 2px; line-height: 1.4; overflow-wrap: anywhere; }
   .log-empty { padding: 14px; color: var(--ink-2); font-size: 12px; }
 
+  /* --- clickable fleet rows (open the diff pane) --- */
+  .seat-row { cursor: pointer; }
+  .seat-row:hover td { background: color-mix(in srgb, var(--rust) 12%, transparent); }
+  .seat-row:focus-visible { outline: 3px solid var(--rust); outline-offset: -3px; }
+
+  /* --- per-seat diff pane (modal) --- */
+  .modal {
+    position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center;
+    padding: 24px; background: color-mix(in srgb, var(--shadow) 55%, transparent);
+  }
+  .modal[hidden] { display: none; } /* [hidden]'s default display:none loses to display:flex above */
+  .modal-card {
+    width: min(980px, 100%); max-height: 86vh; display: flex; flex-direction: column;
+    border: 2px solid var(--line); background: var(--card);
+    box-shadow: 6px 6px 0 var(--shadow); border-radius: var(--radius);
+  }
+  .modal-head { display: flex; align-items: center; gap: 10px; padding: 11px 14px; border-bottom: 2px solid var(--line); }
+  .modal-seat { font-family: system-ui, sans-serif; font-weight: 800; font-size: 13px; }
+  .modal-trunc {
+    font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--rust); border: 1px solid var(--rust); border-radius: 2px; padding: 1px 5px;
+  }
+  .modal-head .themebtn { margin-left: auto; }
+  .diff-body {
+    margin: 0; padding: 12px 14px; overflow: auto; white-space: pre; tab-size: 2;
+    font: 12px/1.55 ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace; color: var(--ink);
+  }
+  .diff-body.muted { color: var(--ink-2); white-space: normal; }
+
   .foot { margin-top: 24px; font-size: 10px; color: var(--ink-2); text-align: center; line-height: 1.6; }
   .foot code { background: var(--paper-2); padding: 1px 5px; border: 1px solid var(--line); border-radius: 2px; }
 
@@ -206,10 +237,8 @@
       <span class="v">v0.2.5 · command center</span>
     </div>
     <span class="pill"><span class="dot" id="conn-dot"></span> <span id="conn-label">connecting…</span></span>
-    <div class="stat">
-      <span class="eyebrow">fleet spend</span>
-      <span class="k" id="t-spend">$—</span>
-    </div>
+    <!-- three billing wallets from /costs.by_source — NEVER summed (different accounts) -->
+    <div class="wallets" id="wallets"></div>
     <div class="stat">
       <span class="eyebrow">unattributed</span>
       <span class="k" id="t-unattr">$—</span>
@@ -269,8 +298,21 @@
   </div>
 
   <div class="foot">
-    served by the broker at <code>GET /dashboard</code>, polling <code>/list-seats</code> · <code>/log</code> · <code>/stats</code> · <code>/questions</code><br>
-    answers route back to the asking seat as a message from <code>human</code>
+    served by the broker at <code>GET /dashboard</code>, polling <code>/list-seats</code> · <code>/log</code> · <code>/stats</code> · <code>/costs</code> · <code>/questions</code><br>
+    click a seat to view its working <code>/diff</code> · answers route back to the asking seat as a message from <code>human</code>
+  </div>
+</div>
+
+<!-- per-seat diff pane: opened by clicking a fleet row; polls /diff ONLY while open -->
+<div class="modal" id="diff-modal" hidden>
+  <div class="modal-card">
+    <div class="modal-head">
+      <span class="eyebrow">working diff</span>
+      <span class="modal-seat" id="diff-title"></span>
+      <span class="modal-trunc" id="diff-trunc" hidden>truncated · 256 KiB cap</span>
+      <button class="themebtn" id="diff-close" aria-label="close diff (Esc)">✕ close</button>
+    </div>
+    <pre class="diff-body" id="diff-body"></pre>
   </div>
 </div>
 
@@ -289,7 +331,7 @@
   }
 
   // --- shared client state ---
-  const state = { seats: [], questions: [], stats: null, statsBySeat: {}, log: [], logCursor: null };
+  const state = { seats: [], questions: [], stats: null, statsBySeat: {}, costs: null, log: [], logCursor: null };
   const LOG_KEEP = 40;   // newest N messages retained/shown
   const LOG_SEED = 120;  // on first load, seed the cursor this far back from the tail
 
@@ -349,9 +391,26 @@
   }
 
   // --- top strip ---
+  // The three billing wallets (subscription | agent-sdk | external) are shown SEPARATELY,
+  // never summed — they bill different accounts. An absent source renders "$—". A broker
+  // with no by_source (pre-0.2.4) falls back to a single fleet-spend total.
+  const WALLETS = [["subscription", "subscription"], ["agent-sdk", "agent-sdk"], ["external", "external"]];
+  function walletCells(costs, stats) {
+    if (!costs || !costs.by_source) {
+      const total = costs ? costs.total_usd : (stats && stats.totals ? stats.totals.cost_usd : null);
+      return [{ label: "fleet spend", value: usd(total) }];
+    }
+    return WALLETS.map(([key, label]) => ({ label, value: usd(costs.by_source[key]) }));
+  }
+  function renderWallets() {
+    $("wallets").innerHTML = walletCells(state.costs, state.stats).map((c) =>
+      '<div class="stat"><span class="eyebrow">' + esc(c.label) + '</span>' +
+      '<span class="k">' + esc(c.value) + '</span></div>'
+    ).join("");
+  }
+
   function renderTop() {
     const t = state.stats && state.stats.totals;
-    $("t-spend").textContent = t ? usd(t.cost_usd) : "$—";
     const unattr = $("t-unattr");
     unattr.textContent = t ? usd(t.unattributed_usd) : "$—";
     unattr.classList.toggle("rust", !!t && t.unattributed_usd > 0);
@@ -452,7 +511,8 @@
           const st = state.statsBySeat[s.id];
           const spend = st ? usd(st.cost_usd) : "$—";
           const seatState = s.state || "unknown";
-          return '<tr>' +
+          return '<tr class="seat-row" data-seat-id="' + esc(String(s.id)) +
+              '" tabindex="0" role="button" aria-label="view working diff for ' + esc(seatLabel(s)) + '">' +
             '<td class="seat-id">' + esc(seatLabel(s)) + '</td>' +
             '<td class="role">' + esc(s.role || "—") + '</td>' +
             '<td>' + esc(s.model || "—") + '</td>' +
@@ -529,10 +589,83 @@
     state.statsBySeat = bySeat;
     renderTop();
     renderFleet();
+    renderWallets(); // stats feeds the single-total fallback when /costs has no by_source
   }, 4000);
+
+  // Wallet split: same default window as /stats. total_usd stays the grand total but is
+  // never shown as one figure — the three pools bill different accounts.
+  poll(async () => {
+    state.costs = await api("/costs", {});
+    renderWallets();
+  }, 4000);
+
+  // --- per-seat diff pane ---
+  // Polls /diff ONLY while the pane is open (CPU discipline — the same reason the fleet
+  // pollers guard in-flight), and drops the loop the moment it closes. inFlight guards
+  // against a slow /diff piling up; the seatId re-check discards a response that landed
+  // after the pane closed or switched seats.
+  const diffView = { seatId: null, timer: null, inFlight: false };
+
+  function renderDiff(res) {
+    const body = $("diff-body");
+    const has = res.diff && res.diff.length;
+    body.className = "diff-body" + (has ? "" : " muted");
+    body.textContent = has ? res.diff : "no uncommitted changes in this seat's working tree.";
+    $("diff-trunc").hidden = !res.truncated;
+  }
+
+  function openDiff(seat) {
+    diffView.seatId = seat.id;
+    $("diff-title").textContent = seatLabel(seat);
+    $("diff-trunc").hidden = true;
+    const body = $("diff-body");
+    body.className = "diff-body muted";
+    body.textContent = "loading…";
+    $("diff-modal").hidden = false;
+    $("diff-close").focus();
+
+    const tick = async () => {
+      if (diffView.seatId === null || diffView.inFlight) return;
+      diffView.inFlight = true;
+      try {
+        const res = await api("/diff", { id: diffView.seatId });
+        if (diffView.seatId === seat.id) renderDiff(res); // still the same open pane?
+      } catch (e) { /* soft: retry next tick */ }
+      finally { diffView.inFlight = false; }
+    };
+    tick();
+    diffView.timer = setInterval(tick, 2500);
+  }
+
+  function closeDiff() {
+    diffView.seatId = null;
+    if (diffView.timer) { clearInterval(diffView.timer); diffView.timer = null; }
+    $("diff-modal").hidden = true;
+  }
+
+  function seatRowTarget(e) {
+    const tr = e.target.closest("tr[data-seat-id]");
+    if (!tr) return null;
+    return state.seats.find((s) => String(s.id) === tr.dataset.seatId) || null;
+  }
+  $("fleet").addEventListener("click", (e) => {
+    const seat = seatRowTarget(e);
+    if (seat) openDiff(seat);
+  });
+  $("fleet").addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    const seat = seatRowTarget(e);
+    if (!seat) return;
+    e.preventDefault(); // Space would otherwise scroll
+    openDiff(seat);
+  });
+  $("diff-close").addEventListener("click", closeDiff);
+  $("diff-modal").addEventListener("click", (e) => { if (e.target === $("diff-modal")) closeDiff(); });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("diff-modal").hidden) closeDiff(); });
 
   // static section — render once
   renderKanban();
   renderLog();
   renderInbox();
+  renderWallets();
 </script>
