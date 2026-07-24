@@ -93,6 +93,10 @@ export interface CostRow {
 //   /claim-path       ClaimPathRequest       → ClaimPathResponse (v0.2.4 file ownership; denies on conflict)
 //   /release-claims   ReleaseClaimsRequest   → { ok: true }      (v0.2.4)
 //   /list-claims      ListClaimsRequest      → PathClaim[]       (v0.2.4 raw array)
+//   /ask              AskRequest             → AskResponse       (v0.2.5 seat raises a question for the human)
+//   /questions        QuestionsRequest       → Question[]        (v0.2.5 open questions for the inbox)
+//   /answer           AnswerRequest          → { ok: true }      (v0.2.5 human answers → routed back to the seat)
+//   GET /dashboard    (no auth)              → text/html         (v0.2.5 serves the command-center page)
 //   GET /health       (no auth)              → { status: "ok"; seats: number }
 
 // --- v0.2.4: billing source ---
@@ -151,6 +155,38 @@ export interface WaitForRequest {
 export interface WaitForResponse {
   reached: boolean;
   state: SeatState;
+}
+
+// v0.2.5 question inbox: a seat raises a question the HUMAN must answer; it surfaces
+// in the dashboard/CLI inbox instead of being buried in one of N terminals. The human
+// answers and the broker routes the answer back to the asking seat as a normal message.
+// Pairs with SeatState "blocked": a seat that asks typically sets itself blocked.
+export interface Question {
+  id: number;
+  from_id: SeatId;
+  from_handle: string | null; // resolved at ask time for display
+  text: string;
+  asked_at: string; // ISO
+  answered: boolean;
+  answer: string | null;
+  answered_at: string | null; // ISO
+}
+export interface AskRequest {
+  id: SeatId; // the asking seat
+  text: string;
+}
+export interface AskResponse {
+  ok: true;
+  question_id: number;
+}
+export interface QuestionsRequest {
+  open_only?: boolean; // default true — only unanswered
+}
+// The broker sends `text` to the asking seat as a message from "human", marks the
+// question answered, and records answered_at.
+export interface AnswerRequest {
+  question_id: number;
+  text: string;
 }
 
 export interface ClaimPortRequest {
