@@ -62,6 +62,11 @@ import type {
   RenameResponse,
   WaitForRequest,
   WaitForResponse,
+  Question,
+  AskRequest,
+  AskResponse,
+  QuestionsRequest,
+  AnswerRequest,
 } from "../shared/types.ts";
 
 const PORT = parseInt(process.env.CLAUDE_PATROL_PORT ?? "7900", 10);
@@ -302,6 +307,25 @@ db.run(`
 `);
 db.run(`CREATE INDEX IF NOT EXISTS idx_delivery_log ON delivery_log(to_id, delivered_at)`);
 
+// v0.2.5 question inbox. Additive (a fresh table never breaks an existing db, same
+// as the seat_runs/cost_ledger CREATE-IF-NOT-EXISTS above). A seat raises a question
+// the human must answer; /answer marks it and routes the answer back to the asking
+// seat as a normal message. from_handle is snapshotted at ask time so a dead seat's
+// answered history still renders a readable name. answered is 0/1 (SQLite has no bool).
+db.run(`
+  CREATE TABLE IF NOT EXISTS questions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_id TEXT NOT NULL,
+    from_handle TEXT,
+    text TEXT NOT NULL,
+    asked_at TEXT NOT NULL,
+    answered INTEGER NOT NULL DEFAULT 0,
+    answer TEXT,
+    answered_at TEXT
+  )
+`);
+db.run(`CREATE INDEX IF NOT EXISTS idx_questions_open ON questions(answered, id)`);
+
 // Liveness probe: signal 0 doesn't kill, just checks existence. EPERM means the
 // process EXISTS but is owned by another user, so it counts as alive (matches
 // the CLI's pidAlive; moot for same-user seats but correct either way).
@@ -334,6 +358,11 @@ function endSeat(seatId: string) {
   // forever, a path owned by a ghost). By owner_id, not FK cascade (#3: no FKs).
   db.run("DELETE FROM port_claims WHERE owner_id = ?", [seatId]);
   db.run("DELETE FROM path_claims WHERE owner_id = ?", [seatId]);
+  // v0.2.5: drop this seat's OPEN questions — a dead seat can never receive the
+  // answer, so the same reasoning as the undelivered-mail purge above applies. Its
+  // ANSWERED history stays (answered=1 rows are untouched), so the inbox's answered
+  // log survives the seat that asked.
+  db.run("DELETE FROM questions WHERE from_id = ? AND answered = 0", [seatId]);
   db.run("DELETE FROM seats WHERE id = ?", [seatId]);
 }
 
@@ -445,6 +474,19 @@ const selectLog = db.prepare(`
   LIMIT ?
 `);
 const selectMaxMsgId = db.prepare(`SELECT MAX(id) AS mx FROM messages`);
+
+// v0.2.5 question inbox statements.
+const insertQuestion = db.prepare(
+  `INSERT INTO questions (from_id, from_handle, text, asked_at, answered) VALUES (?, ?, ?, ?, 0)`
+);
+const selectOpenQuestions = db.prepare(
+  `SELECT id, from_id, from_handle, text, asked_at, answered, answer, answered_at FROM questions WHERE answered = 0 ORDER BY id DESC`
+);
+const selectAllQuestions = db.prepare(
+  `SELECT id, from_id, from_handle, text, asked_at, answered, answer, answered_at FROM questions ORDER BY id DESC`
+);
+const selectQuestionById = db.prepare(`SELECT id, from_id, answered FROM questions WHERE id = ?`);
+const markAnswered = db.prepare(`UPDATE questions SET answered = 1, answer = ?, answered_at = ? WHERE id = ?`);
 
 // --- Seat ID ---
 
@@ -1087,6 +1129,47 @@ function handleLog(body: LogRequest): LogResponse {
   return { messages, latest_id: latestId };
 }
 
+// --- v0.2.5 question inbox ---
+
+// A seat raises a question for the human. The asker must be a LIVE seat (mirrors
+// send-message's from_id guard and set-state's liveSeat check) — an answer to a
+// nonexistent seat has nowhere to go. from_handle is snapshotted from the seat row
+// so the inbox shows a readable name even after the seat dies.
+function handleAsk(body: AskRequest): AskResponse | { ok: false; error: string } {
+  const seat = db.query("SELECT pid, handle FROM seats WHERE id = ?").get(body.id) as { pid: number; handle: string | null } | null;
+  if (!seat || !pidAlive(seat.pid)) return { ok: false, error: `${body.id} is not a live seat` };
+  const res = insertQuestion.run(body.id, seat.handle ?? null, body.text, new Date().toISOString());
+  return { ok: true, question_id: Number(res.lastInsertRowid) };
+}
+
+function handleQuestions(body: QuestionsRequest): Question[] {
+  const openOnly = body.open_only ?? true; // default true — only unanswered
+  const rows = (openOnly ? selectOpenQuestions.all() : selectAllQuestions.all()) as (Omit<Question, "answered"> & {
+    answered: number;
+  })[];
+  return rows.map((r) => ({ ...r, answered: !!r.answered }));
+}
+
+// The human answers. Check-then-write (read the question, mark it, enqueue the reply),
+// so it runs inside ONE db.transaction — same idiom as claimBatch/claimPathsTxn. The
+// answer is delivered by inserting it through the SAME message-insert path a normal
+// /send-message uses, from the reserved sender id "human" (not a seat slug, like "cli"):
+// so /poll-messages leases and delivers it exactly like any inter-seat message.
+const answerTxn = db.transaction((questionId: number, text: string, now: string): { ok: true } | { ok: false; error: string } => {
+  const q = selectQuestionById.get(questionId) as { id: number; from_id: string; answered: number } | null;
+  if (!q) return { ok: false, error: `question ${questionId} not found` };
+  // Idempotent: first answer wins. A double-answer (retry, double-click) is a no-op —
+  // it must NOT enqueue a second reply to the seat.
+  if (q.answered) return { ok: true };
+  markAnswered.run(text, now, questionId);
+  insertMessage.run("human", q.from_id, text, now);
+  return { ok: true };
+});
+
+function handleAnswer(body: AnswerRequest): { ok: true } | { ok: false; error: string } {
+  return answerTxn(body.question_id, body.text, new Date().toISOString());
+}
+
 // --- Background cost indexer (keeps /costs off the fs) ---
 
 function hourBucket(tsMs: number | null): number {
@@ -1488,6 +1571,19 @@ export function validate(path: string, body: unknown): string | null {
     case "/list-claims":
       if (!isOptStr(b.git_root, MAX_PATH)) return "git_root too long or not a string";
       return null;
+    case "/ask":
+      if (!isSlug(b.id)) return "id must be an 8-char [a-z0-9] slug";
+      if (typeof b.text !== "string" || b.text.length < 1 || Buffer.byteLength(b.text, "utf8") > MAX_TEXT_BYTES)
+        return `text must be a non-empty string ≤${MAX_TEXT_BYTES} bytes`;
+      return null;
+    case "/questions":
+      if (b.open_only != null && typeof b.open_only !== "boolean") return "open_only must be a boolean";
+      return null;
+    case "/answer":
+      if (!isPosInt(b.question_id)) return "question_id must be a positive integer";
+      if (typeof b.text !== "string" || b.text.length < 1 || Buffer.byteLength(b.text, "utf8") > MAX_TEXT_BYTES)
+        return `text must be a non-empty string ≤${MAX_TEXT_BYTES} bytes`;
+      return null;
     default:
       return null; // unknown route 404s below
   }
@@ -1508,6 +1604,23 @@ Bun.serve({
     if (req.method !== "POST") {
       if (path === "/health") {
         return Response.json({ status: "ok", seats: (selectAllSeats.all() as Seat[]).length });
+      }
+      if (path === "/dashboard") {
+        // Open like /health (no token) but reachable only over the loopback bind
+        // (hostname 127.0.0.1 below) — a same-user localhost page. The page's POSTs
+        // to the broker DO need the token, so inject the secret as a JS const the
+        // page's fetch() sends in the x-patrol-token header. This is acceptable
+        // exactly because the surface is localhost + a 0600 secret + the same user;
+        // the token never crosses the machine boundary. JSON.stringify keeps an
+        // arbitrary secret string safe to embed. Served from a file so it stays
+        // editable (not a megastring in this source).
+        try {
+          const raw = await Bun.file(new URL("./dashboard/index.html", import.meta.url)).text();
+          const html = raw.replaceAll('"__PATROL_TOKEN__"', JSON.stringify(SECRET));
+          return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
+        } catch (e) {
+          return new Response(`dashboard unavailable: ${e instanceof Error ? e.message : String(e)}`, { status: 500 });
+        }
       }
       return new Response("claude-patrol broker", { status: 200 });
     }
@@ -1578,6 +1691,12 @@ Bun.serve({
           return Response.json(handleReleaseClaims(body as ReleaseClaimsRequest));
         case "/list-claims":
           return Response.json(handleListClaims(body as ListClaimsRequest));
+        case "/ask":
+          return Response.json(handleAsk(body as AskRequest));
+        case "/questions":
+          return Response.json(handleQuestions(body as QuestionsRequest));
+        case "/answer":
+          return Response.json(handleAnswer(body as AnswerRequest));
         default:
           return Response.json({ error: "not found" }, { status: 404 });
       }

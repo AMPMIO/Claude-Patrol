@@ -1,0 +1,538 @@
+<title>Patrol Command Center</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --paper: #E8E2D0;
+    --paper-2: #DED7C2;
+    --card: #F1ECDD;
+    --ink: #171310;
+    --ink-2: #4A4237;
+    --line: #171310;
+    --rust: #B4441E;
+    --good: #2F6B3A;
+    --warn: #B07B12;
+    --crit: #A32318;
+    --shadow: #171310;
+    --radius: 3px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #17150F;
+      --paper-2: #1F1C14;
+      --card: #221E16;
+      --ink: #ECE4D0;
+      --ink-2: #A79C82;
+      --line: #4A4030;
+      --rust: #E4703B;
+      --good: #6FB77E;
+      --warn: #D9AA3C;
+      --crit: #E06B5E;
+      --shadow: #000000;
+    }
+  }
+  :root[data-theme="light"] {
+    --paper: #E8E2D0; --paper-2: #DED7C2; --card: #F1ECDD; --ink: #171310;
+    --ink-2: #4A4237; --line: #171310; --rust: #B4441E; --good: #2F6B3A;
+    --warn: #B07B12; --crit: #A32318; --shadow: #171310;
+  }
+  :root[data-theme="dark"] {
+    --paper: #17150F; --paper-2: #1F1C14; --card: #221E16; --ink: #ECE4D0;
+    --ink-2: #A79C82; --line: #4A4030; --rust: #E4703B; --good: #6FB77E;
+    --warn: #D9AA3C; --crit: #E06B5E; --shadow: #000000;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font: 13px/1.5 ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 18px 20px 60px; }
+
+  .eyebrow {
+    font-family: system-ui, sans-serif;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: .14em;
+    font-size: 10px;
+    color: var(--ink-2);
+  }
+  h1, h2, h3 { font-family: system-ui, sans-serif; margin: 0; text-wrap: balance; }
+
+  /* --- top strip --- */
+  .topbar {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 14px 22px;
+    border: 2px solid var(--line);
+    background: var(--card);
+    box-shadow: 5px 5px 0 var(--shadow);
+    padding: 12px 16px;
+    margin-bottom: 20px;
+  }
+  .brand { display: flex; align-items: baseline; gap: 10px; margin-right: auto; }
+  .brand h1 { font-size: 19px; font-weight: 900; letter-spacing: -.01em; }
+  .brand .v { font-size: 11px; color: var(--rust); font-weight: 800; }
+  .stat { display: flex; flex-direction: column; gap: 1px; }
+  .stat .k { font-size: 15px; font-weight: 800; font-family: system-ui, sans-serif; font-variant-numeric: tabular-nums; }
+  .stat .rust { color: var(--rust); }
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    border: 1.5px solid var(--line); padding: 2px 8px; border-radius: 999px;
+    font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em;
+    background: var(--paper);
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; border: 1px solid rgba(0,0,0,.35); background: var(--ink-2); }
+  /* broker connection + working seats pulse */
+  .dot.live, .dot.working { background: var(--good); animation: pulse 1.8s infinite; }
+  .dot.idle { background: var(--warn); }
+  .dot.blocked, .dot.dead { background: var(--crit); }
+  .dot.done { background: var(--good); }
+  .dot.unknown { background: var(--ink-2); opacity: .5; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
+  @media (prefers-reduced-motion: reduce) { .dot.live, .dot.working { animation: none; } }
+
+  .themebtn {
+    font: inherit; font-size: 11px; cursor: pointer; background: var(--paper);
+    border: 1.5px solid var(--line); border-radius: var(--radius); padding: 4px 9px; color: var(--ink);
+  }
+  .themebtn:hover { background: var(--rust); color: #fff; }
+
+  /* --- section frame --- */
+  section { margin-bottom: 20px; }
+  .sec-head { display: flex; align-items: center; gap: 10px; margin-bottom: 9px; }
+  .sec-head h2 { font-size: 13px; font-weight: 800; text-transform: uppercase; letter-spacing: .1em; }
+  .sec-head .count { font-size: 10px; color: var(--ink-2); }
+  .rule { flex: 1; height: 2px; background: var(--line); opacity: .25; }
+
+  .card {
+    border: 2px solid var(--line); background: var(--card);
+    box-shadow: 4px 4px 0 var(--shadow); border-radius: var(--radius);
+  }
+
+  /* --- question inbox (hero of the tool) --- */
+  .inbox { border-color: var(--rust); box-shadow: 4px 4px 0 var(--rust); }
+  .q {
+    display: grid; grid-template-columns: auto 1fr auto; gap: 4px 12px;
+    align-items: start; padding: 12px 14px; border-bottom: 1.5px dashed var(--line);
+  }
+  .q:last-child { border-bottom: 0; }
+  .q .who { font-weight: 800; color: var(--rust); font-size: 12px; }
+  .q .age { grid-column: 3; font-size: 10px; color: var(--ink-2); white-space: nowrap; }
+  .q .body { grid-column: 2; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .q .ans { grid-column: 2; display: flex; gap: 8px; margin-top: 8px; }
+  .q .ans input {
+    flex: 1; font: inherit; font-size: 12px; padding: 6px 9px;
+    border: 1.5px solid var(--line); border-radius: var(--radius); background: var(--paper); color: var(--ink);
+  }
+  .q .ans input:focus-visible { outline: 3px solid var(--rust); outline-offset: 1px; }
+  .q .ans button {
+    font: inherit; font-size: 11px; font-weight: 800; cursor: pointer; padding: 6px 12px;
+    border: 1.5px solid var(--line); border-radius: var(--radius); background: var(--ink); color: var(--paper);
+  }
+  .q .ans button:hover { background: var(--rust); }
+  .inbox-empty { padding: 14px; color: var(--ink-2); font-size: 12px; }
+
+  /* --- kanban --- */
+  .kanban { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+  .col-head {
+    display: flex; align-items: center; justify-content: space-between;
+    font-family: system-ui, sans-serif; font-weight: 800; font-size: 11px;
+    text-transform: uppercase; letter-spacing: .08em; padding: 6px 4px; margin-bottom: 6px;
+    border-bottom: 3px solid var(--line);
+  }
+  .col-head .n { color: var(--ink-2); }
+  .col-empty { font-size: 10px; color: var(--ink-2); padding: 4px; opacity: .7; }
+  .ticket {
+    border: 1.5px solid var(--line); background: var(--card); border-radius: var(--radius);
+    box-shadow: 3px 3px 0 var(--shadow); padding: 9px 10px; margin-bottom: 9px;
+  }
+  .ticket .id { font-weight: 800; font-size: 11px; }
+  .ticket .t { font-size: 11px; color: var(--ink-2); margin: 3px 0 7px; line-height: 1.35; }
+  .ticket .meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .tag {
+    font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
+    border: 1px solid var(--line); border-radius: 2px; padding: 1px 5px; background: var(--paper);
+  }
+  .tag.wt { color: var(--ink-2); }
+
+  /* --- two-up: fleet + log --- */
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; align-items: start; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .tbl-wrap { overflow-x: auto; }
+  th {
+    text-align: left; font-family: system-ui, sans-serif; font-size: 9px; font-weight: 800;
+    text-transform: uppercase; letter-spacing: .08em; color: var(--ink-2);
+    padding: 8px 10px; border-bottom: 2px solid var(--line); white-space: nowrap;
+  }
+  td { padding: 8px 10px; border-bottom: 1px solid color-mix(in srgb, var(--line) 30%, transparent); white-space: nowrap; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tr:last-child td { border-bottom: 0; }
+  .seat-id { font-weight: 800; }
+  .role { color: var(--ink-2); }
+  .empty-row td { color: var(--ink-2); }
+
+  /* --- message log --- */
+  .log { max-height: 340px; overflow-y: auto; }
+  .msg { padding: 8px 12px; border-bottom: 1px dashed color-mix(in srgb, var(--line) 40%, transparent); }
+  .msg:last-child { border-bottom: 0; }
+  .msg .line1 { display: flex; align-items: baseline; gap: 6px; font-size: 11px; }
+  .msg .from { font-weight: 800; }
+  .msg .arrow { color: var(--ink-2); }
+  .msg .to { font-weight: 800; color: var(--rust); }
+  .msg .ts { margin-left: auto; font-size: 10px; color: var(--ink-2); }
+  .msg .txt { font-size: 11px; color: var(--ink-2); margin-top: 2px; line-height: 1.4; overflow-wrap: anywhere; }
+  .log-empty { padding: 14px; color: var(--ink-2); font-size: 12px; }
+
+  .foot { margin-top: 24px; font-size: 10px; color: var(--ink-2); text-align: center; line-height: 1.6; }
+  .foot code { background: var(--paper-2); padding: 1px 5px; border: 1px solid var(--line); border-radius: 2px; }
+
+  @media (max-width: 880px) {
+    .kanban { grid-template-columns: 1fr 1fr; }
+    .two { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 560px) {
+    .kanban { grid-template-columns: 1fr; }
+  }
+</style>
+
+<div class="wrap">
+
+  <!-- TOP STRIP -->
+  <div class="topbar">
+    <div class="brand">
+      <h1>PATROL</h1>
+      <span class="v">v0.2.5 · command center</span>
+    </div>
+    <span class="pill"><span class="dot" id="conn-dot"></span> <span id="conn-label">connecting…</span></span>
+    <div class="stat">
+      <span class="eyebrow">fleet spend</span>
+      <span class="k" id="t-spend">$—</span>
+    </div>
+    <div class="stat">
+      <span class="eyebrow">unattributed</span>
+      <span class="k" id="t-unattr">$—</span>
+    </div>
+    <div class="stat">
+      <span class="eyebrow">wake-ups</span>
+      <span class="k" id="t-wakes">—</span>
+    </div>
+    <div class="stat">
+      <span class="eyebrow">seats live</span>
+      <span class="k" id="t-seats">—</span>
+    </div>
+    <button class="themebtn" onclick="toggleTheme()" id="tbtn">◐ theme</button>
+  </div>
+
+  <!-- QUESTION INBOX -->
+  <section>
+    <div class="sec-head">
+      <h2>Questions for you</h2>
+      <span class="count" id="q-count">—</span>
+      <div class="rule"></div>
+    </div>
+    <div class="card inbox" id="inbox"></div>
+  </section>
+
+  <!-- WORK KANBAN -->
+  <section>
+    <div class="sec-head">
+      <h2>Work</h2>
+      <span class="count">git worktrees + gh pr — not wired in v0.2.5</span>
+      <div class="rule"></div>
+    </div>
+    <div class="kanban" id="kanban"></div>
+  </section>
+
+  <!-- FLEET + LOG -->
+  <div class="two">
+    <section>
+      <div class="sec-head">
+        <h2>Fleet</h2>
+        <span class="count" id="fleet-count"></span>
+        <div class="rule"></div>
+      </div>
+      <div class="card tbl-wrap">
+        <table id="fleet"></table>
+      </div>
+    </section>
+
+    <section>
+      <div class="sec-head">
+        <h2>Comms audit</h2>
+        <span class="count">live message log</span>
+        <div class="rule"></div>
+      </div>
+      <div class="card log" id="log"></div>
+    </section>
+  </div>
+
+  <div class="foot">
+    served by the broker at <code>GET /dashboard</code>, polling <code>/list-seats</code> · <code>/log</code> · <code>/stats</code> · <code>/questions</code><br>
+    answers route back to the asking seat as a message from <code>human</code>
+  </div>
+</div>
+
+<script>
+  // The broker injects the shared secret here (replaces the placeholder at serve
+  // time); the page sends it in x-patrol-token on every POST. Localhost only.
+  const TOKEN = "__PATROL_TOKEN__";
+  const HEADERS = { "content-type": "application/json", "x-patrol-token": TOKEN };
+
+  // --- theme toggle: stamp data-theme, override the media query both ways ---
+  function toggleTheme() {
+    const r = document.documentElement;
+    const cur = r.getAttribute('data-theme')
+      || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+    r.setAttribute('data-theme', cur === 'dark' ? 'light' : 'dark');
+  }
+
+  // --- shared client state ---
+  const state = { seats: [], questions: [], stats: null, statsBySeat: {}, log: [], logCursor: null };
+  const LOG_KEEP = 40;   // newest N messages retained/shown
+  const LOG_SEED = 120;  // on first load, seed the cursor this far back from the tail
+
+  // --- helpers ---
+  const $ = (id) => document.getElementById(id);
+  function esc(s) {
+    return String(s == null ? "" : s)
+      .replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;").replaceAll("'", "&#39;");
+  }
+  function usd(n) { return typeof n === "number" ? "$" + n.toFixed(2) : "$—"; }
+  function relTime(iso) {
+    const then = Date.parse(iso);
+    if (Number.isNaN(then)) return "?";
+    const s = Math.max(0, Math.round((Date.now() - then) / 1000));
+    if (s < 60) return s + "s";
+    const m = Math.floor(s / 60);
+    if (m < 60) return m + "m";
+    const h = Math.floor(m / 60);
+    if (h < 24) return h + "h";
+    return Math.floor(h / 24) + "d";
+  }
+  function hhmm(iso) {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return "";
+    return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+  }
+  function seatLabel(s) { return s.handle && s.handle.length ? s.handle : String(s.id).slice(0, 8); }
+  const SEAT_STATES = new Set(["idle", "working", "blocked", "done"]);
+  function stateClass(st) { return SEAT_STATES.has(st) ? st : "unknown"; }
+
+  async function api(path, body) {
+    const res = await fetch(path, { method: "POST", headers: HEADERS, body: JSON.stringify(body || {}) });
+    if (!res.ok) throw new Error(path + " " + res.status);
+    return res.json();
+  }
+
+  // In-flight-guarded poller — mirrors usePoll in src/tui/watch-app.tsx: a tick is
+  // SKIPPED while the previous fetch is outstanding, so a slow/wedged broker can
+  // never let ticks pile up. Runaway polling once burned 46 CPU-hours; don't
+  // reintroduce it.
+  function poll(fn, intervalMs) {
+    let inFlight = false;
+    const tick = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try { await fn(); } catch (e) { /* soft: keep polling on the next tick */ }
+      finally { inFlight = false; }
+    };
+    tick();
+    setInterval(tick, intervalMs);
+  }
+
+  function setConn(ok) {
+    $("conn-dot").className = "dot " + (ok ? "live" : "dead");
+    $("conn-label").textContent = ok ? "broker live" : "broker unreachable";
+  }
+
+  // --- top strip ---
+  function renderTop() {
+    const t = state.stats && state.stats.totals;
+    $("t-spend").textContent = t ? usd(t.cost_usd) : "$—";
+    const unattr = $("t-unattr");
+    unattr.textContent = t ? usd(t.unattributed_usd) : "$—";
+    unattr.classList.toggle("rust", !!t && t.unattributed_usd > 0);
+    $("t-wakes").textContent = t ? String(t.notifications) : "—";
+    // /list-seats already drops dead seats server-side, so every returned seat is live.
+    $("t-seats").textContent = String(state.seats.length);
+  }
+
+  // --- question inbox (hero) ---
+  function makeQuestionNode(q) {
+    const node = document.createElement("div");
+    node.className = "q";
+    node.dataset.qid = String(q.id);
+    node.innerHTML =
+      '<span class="who"></span>' +
+      '<span class="age"></span>' +
+      '<div class="body"><div class="ans">' +
+        '<input placeholder="answer — routes back to the seat…">' +
+        '<button>Send</button>' +
+      '</div></div>';
+    const who = q.from_handle && q.from_handle.length ? q.from_handle : String(q.from_id).slice(0, 8);
+    node.querySelector(".who").textContent = who;
+    // body text set as a text node before the .ans block (keeps the answer UI intact)
+    const body = node.querySelector(".body");
+    body.insertBefore(document.createTextNode(q.text), body.firstChild);
+    const input = node.querySelector("input");
+    input.setAttribute("aria-label", "answer to " + who);
+    const submit = () => answerQuestion(q.id, node, input);
+    node.querySelector("button").addEventListener("click", submit);
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+    return node;
+  }
+
+  function renderInbox() {
+    const inbox = $("inbox");
+    const qs = state.questions;
+    $("q-count").textContent = qs.length ? qs.length + " waiting" : "clear";
+    if (qs.length === 0) {
+      inbox.innerHTML = '<div class="inbox-empty">nothing waiting — every seat is unblocked.</div>';
+      return;
+    }
+    // Reconcile by question id: reuse the existing node (so a poll can't wipe an
+    // answer the human is mid-typing), create new ones, drop resolved ones, and
+    // re-order newest-first. appendChild MOVES an existing node, preserving its input.
+    const empty = inbox.querySelector(".inbox-empty");
+    if (empty) empty.remove();
+    const existing = new Map();
+    inbox.querySelectorAll(".q").forEach((n) => existing.set(n.dataset.qid, n));
+    const wanted = new Set(qs.map((q) => String(q.id)));
+    existing.forEach((n, qid) => { if (!wanted.has(qid)) n.remove(); });
+    let prev = null;
+    for (const q of qs) {
+      let node = existing.get(String(q.id));
+      if (!node) node = makeQuestionNode(q);
+      node.querySelector(".age").textContent = relTime(q.asked_at) + " ago";
+      if (prev) prev.after(node); else inbox.prepend(node);
+      prev = node;
+    }
+  }
+
+  async function answerQuestion(qid, node, input) {
+    const text = input.value.trim();
+    if (!text) { input.focus(); return; }
+    // Optimistic: grey out + clear immediately; the next /questions poll drops it
+    // for real. Drop it from local state too so it can't flash back in between.
+    node.style.opacity = "0.4";
+    input.value = "";
+    input.disabled = true;
+    state.questions = state.questions.filter((q) => q.id !== qid);
+    try {
+      await api("/answer", { question_id: qid, text });
+    } catch (e) {
+      // restore on failure so the answer isn't silently lost
+      node.style.opacity = "1";
+      input.disabled = false;
+      input.value = text;
+    }
+  }
+
+  // --- work kanban ---
+  // v0.2.5 adds no work-item feed (git worktrees + gh pr is a later WP), so the
+  // columns render empty rather than ship the mockup's illustrative fake tickets.
+  function renderKanban() {
+    const cols = ["In progress", "Needs review", "Merging", "Queued"];
+    $("kanban").innerHTML = cols.map((name) =>
+      '<div class="col"><div class="col-head"><span>' + esc(name) +
+      '</span><span class="n">0</span></div><div class="col-empty">no tracked work</div></div>'
+    ).join("");
+  }
+
+  // --- fleet board ---
+  function renderFleet() {
+    const seats = state.seats;
+    const head = '<tr><th>Seat</th><th>Role</th><th>Model</th><th>State</th><th style="text-align:right">Spend</th></tr>';
+    const body = seats.length === 0
+      ? '<tr class="empty-row"><td colspan="5">no seats registered</td></tr>'
+      : seats.map((s) => {
+          const st = state.statsBySeat[s.id];
+          const spend = st ? usd(st.cost_usd) : "$—";
+          const seatState = s.state || "unknown";
+          return '<tr>' +
+            '<td class="seat-id">' + esc(seatLabel(s)) + '</td>' +
+            '<td class="role">' + esc(s.role || "—") + '</td>' +
+            '<td>' + esc(s.model || "—") + '</td>' +
+            '<td><span class="pill"><span class="dot ' + stateClass(seatState) + '"></span>' + esc(seatState) + '</span></td>' +
+            '<td class="num">' + spend + '</td>' +
+          '</tr>';
+        }).join("");
+    $("fleet").innerHTML = head + body;
+    $("fleet-count").textContent = seats.length + (seats.length === 1 ? " seat" : " seats");
+  }
+
+  // --- comms log ---
+  function renderLog() {
+    const el = $("log");
+    const msgs = state.log;
+    if (msgs.length === 0) {
+      el.innerHTML = '<div class="log-empty">no messages yet</div>';
+      return;
+    }
+    // newest first
+    el.innerHTML = msgs.slice().reverse().map((m) =>
+      '<div class="msg">' +
+        '<div class="line1">' +
+          '<span class="from">' + esc(String(m.from_id).slice(0, 12)) + '</span>' +
+          '<span class="arrow">→</span>' +
+          '<span class="to">' + esc(String(m.to_id).slice(0, 12)) + '</span>' +
+          '<span class="ts">' + esc(hhmm(m.sent_at)) + '</span>' +
+        '</div>' +
+        '<div class="txt">' + esc(m.text) + '</div>' +
+      '</div>'
+    ).join("");
+  }
+
+  // --- pollers (intervals: log 1.5s, seats 2s, questions 3s, stats 4s) ---
+  poll(async () => {
+    try {
+      const seats = await api("/list-seats", { scope: "machine", cwd: "/", git_root: null });
+      state.seats = seats;
+      setConn(true);
+      renderFleet();
+      renderTop();
+    } catch (e) {
+      setConn(false);
+    }
+  }, 2000);
+
+  poll(async () => {
+    // Seed the cursor near the tail on first load so the FIRST render shows the
+    // newest messages, not the oldest (/log has an after_id cursor, not a before).
+    if (state.logCursor === null) {
+      const probe = await api("/log", { after_id: 0, limit: 1 });
+      state.logCursor = Math.max(0, (probe.latest_id || 0) - LOG_SEED);
+      return; // next tick pulls the tail from the seeded cursor
+    }
+    const res = await api("/log", { after_id: state.logCursor, limit: 200 });
+    if (res.messages && res.messages.length) {
+      state.log = state.log.concat(res.messages).slice(-LOG_KEEP);
+      renderLog();
+    }
+    state.logCursor = res.latest_id || state.logCursor;
+  }, 1500);
+
+  poll(async () => {
+    const qs = await api("/questions", { open_only: true });
+    state.questions = qs;
+    renderInbox();
+  }, 3000);
+
+  poll(async () => {
+    const stats = await api("/stats", {});
+    state.stats = stats;
+    const bySeat = {};
+    for (const s of stats.seats) bySeat[s.seat_id] = s;
+    state.statsBySeat = bySeat;
+    renderTop();
+    renderFleet();
+  }, 4000);
+
+  // static section — render once
+  renderKanban();
+  renderLog();
+  renderInbox();
+</script>
