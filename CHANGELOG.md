@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.2.6 — 2026-07-24
+
+Competitor steals, chosen against a small-verb-set discipline (the field's
+cautionary tale is a tool whose own docs disagree on its 87/171/210 count). Two
+features, plus the anti-bloat commitment to publish and hold the verb count (19).
+283 tests.
+
+### Added
+- **Budget alerts.** A seat crossing its `budget_usd` cap pings the alert
+  recipient (default: the `orchestrator`-role seat) exactly once — observe-only,
+  never gates the model. Additive `budget_usd`/`budget_alerted` columns; the
+  check runs in an isolated try inside the cost tick so a budget bug can't break
+  indexing; the alert is a normal message from sender `patrol`. `patrol status`
+  shows a `BUDGET` column + an `OVER` marker. Per-seat `SeatSpec.budget_usd` and
+  fleet-level `PatrolConfig.budget_usd`/`budget_alert_to`.
+- **`patrol worktree` + `patrol checkpoint`** — the task-worktree loop as two
+  verbs (worktree-per-task; the standing seat is never pinned). `worktree <seat>
+  <branch>` cuts a tracked worktree under `.claude/worktrees/` and tells the seat
+  its path; `checkpoint <seat> [--gate]` runs the gate in the worktree, then
+  merges the branch back and removes the worktree. The merge-back is safe against
+  a concurrent build: it integrates inside a throwaway worktree, so git's
+  one-branch-one-worktree rule refuses if trunk is live, a conflict STOPs (trunk
+  ref untouched), and the seat tree is removed without `--force` (uncommitted work
+  is preserved, never destroyed). The broker tracks the seat→worktree association
+  (`/worktree-add`/`-list`/`-remove`); `endSeat` drops the association but never
+  the git tree.
+
+### Deferred (to hold the verb count)
+- Seat-side port delivery (allocation shipped in 0.2.4; no consumer yet),
+  status-change hooks, gate-first validation, heuristic state fallback.
+
+## 0.2.5 — 2026-07-24
+
+Fleet legibility: a browser command center, a cockpit layout, and a setup wizard.
+
+### Added
+- **Command-center dashboard** (`patrol dash`): a broker-served page with a
+  question inbox (`/ask` surfaces a seat's question in one place; the human
+  answers via `/answer` and the broker routes it back to the asking seat as a
+  message), the fleet board with live seat state, and a comms audit log. Served
+  from `GET /dashboard` with the loopback secret injected so the page can call the
+  token-gated routes.
+- **`patrol cockpit`**: folds the fleet into one tmux window — a big focus pane
+  over tiled live previews, `Ctrl-b z` to zoom a seat fullscreen, key hints in the
+  status bar. join-pane preserves each seat's live process.
+- **`patrol init [--ai]`**: a wizard that writes + gitignores a validated
+  `patrol.yaml`; `--ai` runs a one-shot `claude -p` over the repo + your stated
+  goal to recommend the fleet, off the interactive budget.
+
 ## 0.2.4 — 2026-07-23
 
 Fleet legibility + a second billing pool. Headless seats that draw the Agent-SDK
