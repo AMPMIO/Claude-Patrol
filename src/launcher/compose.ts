@@ -190,6 +190,11 @@ export function composeSeat(plan: SeatPlan, paths: ComposePaths, seatToken: stri
   if (spec.profile !== undefined) {
     env.CLAUDE_PATROL_PROFILE = typeof spec.profile === "string" ? spec.profile : "custom";
   }
+  // v0.2.6: carry the per-seat spend cap to the seat-server, which forwards it in
+  // /register. An env var (not a new argv flag) keeps composeSeat pure and this change
+  // localized to the existing CLAUDE_PATROL_* block — codex/headless adapter seats
+  // (which bill externally / return early above) are intentionally out of scope.
+  if (spec.budget_usd != null) env.CLAUDE_PATROL_BUDGET_USD = String(spec.budget_usd);
   if (marker) env[SEAT_TOKEN_ENV] = seatToken!;
   return { argv, env };
 }

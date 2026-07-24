@@ -143,7 +143,9 @@ db.run(`
 // v0.2.4 adds `state` (self-reported seat state; NULL reads as "unknown" downstream)
 // and `handle` (readable broker-assigned name; NULL on pre-0.2.4 rows => clients fall
 // back to the hex id).
-for (const col of ["role TEXT", "model TEXT", "profile TEXT", "session_id TEXT", "state TEXT", "handle TEXT"]) {
+// v0.2.6 adds `budget_usd` (per-seat spend cap, NULL = no cap) and `budget_alerted`
+// (0/1 latch so a crossing pings the recipient ONCE, not every index tick).
+for (const col of ["role TEXT", "model TEXT", "profile TEXT", "session_id TEXT", "state TEXT", "handle TEXT", "budget_usd REAL", "budget_alerted INTEGER NOT NULL DEFAULT 0"]) {
   try {
     db.run(`ALTER TABLE seats ADD COLUMN ${col}`);
   } catch {
@@ -391,8 +393,8 @@ setInterval(cleanStaleSeats, 30_000);
 // --- Prepared statements ---
 
 const insertSeat = db.prepare(`
-  INSERT INTO seats (id, pid, cwd, git_root, tty, summary, role, model, profile, session_id, registered_at, last_seen, handle)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO seats (id, pid, cwd, git_root, tty, summary, role, model, profile, session_id, registered_at, last_seen, handle, budget_usd)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 const updateLastSeen = db.prepare(`UPDATE seats SET last_seen = ? WHERE id = ?`);
 const updateSummary = db.prepare(`UPDATE seats SET summary = ? WHERE id = ?`);
@@ -575,7 +577,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   insertSeat.run(
     id, body.pid, body.cwd, body.git_root, body.tty, body.summary,
     body.role ?? null, body.model ?? null, body.profile ?? null, sessionId,
-    now, now, handle
+    now, now, handle, body.budget_usd ?? null
   );
 
   // Durable run row (survives dereg). session_id is the env-override/guarded
@@ -1170,6 +1172,84 @@ function handleAnswer(body: AnswerRequest): { ok: true } | { ok: false; error: s
   return answerTxn(body.question_id, body.text, new Date().toISOString());
 }
 
+// --- v0.2.6 budget alerts (OBSERVE-ONLY) ---
+// Crossing a per-seat cap pings the alert recipient ONCE — it never gates or stops
+// the model (the frozen contract's semantics: Patrol observes spend, it does not
+// enforce it). Fired at the tail of each index tick, AFTER the ledger is refreshed,
+// so an alert can never precede the spend that triggered it. The budget_alerted latch
+// (a seats column, reaped with the row in endSeat) is what makes it fire once, not
+// every tick.
+
+// Flag + enqueue as ONE check-then-write (same idiom as answerTxn): a crash between
+// them must not drop the alert or leave it re-firing. The alert goes through the SAME
+// insertMessage path a /send-message uses, from the reserved sender "patrol" (not a
+// seat slug — like "human"/"cli"), so /poll-messages leases and delivers it like any
+// inter-seat message.
+const alertTxn = db.transaction((seatId: string, recipientId: string, text: string, now: string) => {
+  db.run("UPDATE seats SET budget_alerted = 1 WHERE id = ?", [seatId]);
+  insertMessage.run("patrol", recipientId, text, now);
+});
+
+// Resolve who hears a budget crossing. The frozen contract carries NO per-seat field
+// for PatrolConfig.budget_alert_to (shared/types.ts is the orchestrator's to change),
+// so the broker uses the contract's DEFAULT recipient: the live seat whose role is
+// "orchestrator". `target` (matched by handle, then role) is honored for the day a
+// contract field delivers budget_alert_to to the broker; today it is always null.
+// Returns a live seat id, or null when nothing resolves (caller no-ops + logs).
+function resolveAlertRecipient(target: string | null): string | null {
+  const live = (
+    db.query("SELECT id, pid, handle, role FROM seats").all() as {
+      id: string; pid: number; handle: string | null; role: string | null;
+    }[]
+  ).filter((s) => pidAlive(s.pid));
+  if (target) {
+    const byHandle = live.find((s) => s.handle === target);
+    if (byHandle) return byHandle.id;
+    const byRole = live.find((s) => s.role === target);
+    if (byRole) return byRole.id;
+  }
+  const orch = live.find((s) => s.role === "orchestrator");
+  return orch ? orch.id : null;
+}
+
+// Per-seat cumulative-spend check. Only seats WITH a cap and NOT yet alerted are
+// considered. Spend is summed by the SAME aggregation /costs and /stats use
+// (readLedgerWindow + costOf), over the SAME default window (since broker start), so
+// the alert can never fire on a number `patrol status` doesn't show. A missing
+// recipient no-ops with ONE log line (and still latches the flag, so a fleet with no
+// live orchestrator doesn't re-log the same crossing every tick) — a budget cap must
+// NEVER throw inside the index tick and starve indexing.
+function checkBudgets() {
+  const capped = db.query(
+    "SELECT id, handle, role, budget_usd FROM seats WHERE budget_usd IS NOT NULL AND budget_alerted = 0"
+  ).all() as { id: string; handle: string | null; role: string | null; budget_usd: number }[];
+  if (capped.length === 0) return;
+
+  const { tallies, seatBySession } = readLedgerWindow({});
+  const spendBySeat = new Map<string, number>();
+  for (const t of tallies) {
+    const seatId = seatBySession.get(t.attr_session_id);
+    if (!seatId) continue;
+    spendBySeat.set(seatId, (spendBySeat.get(seatId) ?? 0) + costOf(t));
+  }
+
+  const now = new Date().toISOString();
+  for (const seat of capped) {
+    const spend = spendBySeat.get(seat.id) ?? 0;
+    if (spend < seat.budget_usd) continue;
+    const handle = seat.handle ?? seat.id;
+    const text = `⚠ ${handle} crossed its $${seat.budget_usd} budget — now $${spend.toFixed(2)}`;
+    const recipient = resolveAlertRecipient(null); // fleet budget_alert_to can't reach the broker (frozen contract) => orchestrator default
+    if (!recipient) {
+      db.run("UPDATE seats SET budget_alerted = 1 WHERE id = ?", [seat.id]);
+      log(`budget: ${handle} crossed $${seat.budget_usd} (now $${spend.toFixed(2)}) but no live alert recipient — dropped`);
+      continue;
+    }
+    alertTxn(seat.id, recipient, text, now);
+    log(`budget: ${handle} crossed $${seat.budget_usd} (now $${spend.toFixed(2)}) — alerted ${recipient}`);
+  }
+}
+
 // --- Background cost indexer (keeps /costs off the fs) ---
 
 function hourBucket(tsMs: number | null): number {
@@ -1428,6 +1508,14 @@ function indexTick() {
       }
     }
     resolvePendingRuns();
+    // Budget alerts run on the freshly-updated ledger. Isolated try: a budget bug
+    // (or a wedged recipient lookup) must never abort a tick whose indexing already
+    // completed above — nor throw out of the cost tick.
+    try {
+      checkBudgets();
+    } catch (e) {
+      log(`budget check error: ${e instanceof Error ? e.message : String(e)}`);
+    }
   } catch (e) {
     log(`index tick error: ${e instanceof Error ? e.message : String(e)}`);
   }
@@ -1479,6 +1567,8 @@ export function validate(path: string, body: unknown): string | null {
       if (!isOptStr(b.session_id, 256)) return "session_id too long or not a string";
       if (b.seat_token != null && !(typeof b.seat_token === "string" && SEAT_TOKEN_RE.test(b.seat_token)))
         return "seat_token must match cp-<8hex>";
+      if (b.budget_usd != null && !(typeof b.budget_usd === "number" && Number.isFinite(b.budget_usd) && b.budget_usd > 0))
+        return "budget_usd must be a positive number";
       return null;
     case "/heartbeat":
     case "/poll-messages":

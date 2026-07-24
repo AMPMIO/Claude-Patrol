@@ -3,6 +3,11 @@
 import type { Seat, CostsResponse } from "../../shared/types.ts";
 import { brokerPost, gitRoot, relTime, truncate, usd, renderTable, seatLabel, BrokerError } from "./_client.ts";
 
+// v0.2.6: /list-seats now carries the seat's spend cap (a REAL column added to the
+// seats table). The frozen Seat contract predates it, so read it off a widened view
+// rather than editing shared/types.ts.
+type SeatWithBudget = Seat & { budget_usd?: number | null };
+
 export default async function status(_args: string[]): Promise<number> {
   const cwd = process.cwd();
 
@@ -39,20 +44,28 @@ export default async function status(_args: string[]): Promise<number> {
     console.log("no seats registered.");
   } else {
     // Handle is the primary identifier; the hex id stays as a secondary column
-    // (disambiguator + fallback). SPEND is column 7 now (after the added ID column).
-    const headers = ["SEAT", "ID", "ROLE", "MODEL", "PROFILE", "TTY", "SEEN", "SPEND", "SUMMARY"];
-    const rows = seats.map((s) => [
-      seatLabel(s),
-      s.id.slice(0, 8),
-      s.role ?? "-",
-      s.model ?? "-",
-      s.profile ?? "-",
-      s.tty ?? "-",
-      relTime(s.last_seen),
-      costs ? usd(spendBySeat.get(s.id) ?? 0) : "—",
-      truncate(s.summary, 40),
-    ]);
-    console.log(renderTable(headers, rows, new Set([7])));
+    // (disambiguator + fallback). SPEND is column 7, BUDGET column 8 — both right-aligned.
+    // An OVER marker rides in the SPEND cell (v0.2.6 observe-only cap; the broker has
+    // already pinged the recipient, this just surfaces it on the board).
+    const headers = ["SEAT", "ID", "ROLE", "MODEL", "PROFILE", "TTY", "SEEN", "SPEND", "BUDGET", "SUMMARY"];
+    const rows = seats.map((s) => {
+      const budget = (s as SeatWithBudget).budget_usd ?? null;
+      const spend = spendBySeat.get(s.id) ?? 0;
+      const over = costs != null && budget != null && spend >= budget;
+      return [
+        seatLabel(s),
+        s.id.slice(0, 8),
+        s.role ?? "-",
+        s.model ?? "-",
+        s.profile ?? "-",
+        s.tty ?? "-",
+        relTime(s.last_seen),
+        costs ? `${usd(spend)}${over ? " OVER" : ""}` : "—",
+        budget != null ? usd(budget) : "—",
+        truncate(s.summary, 40),
+      ];
+    });
+    console.log(renderTable(headers, rows, new Set([7, 8])));
   }
 
   if (!costs) {
