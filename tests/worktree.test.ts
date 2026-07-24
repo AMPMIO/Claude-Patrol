@@ -207,6 +207,95 @@ test("/worktree-add for a non-live seat is refused cleanly; malformed input is 4
   expect((await post("/worktree-remove", { id: "bad", path: "/p" })).status).toBe(400);
 });
 
+// --- /diff route (real git, byte-bounded) ------------------------------------
+
+type DiffResp = { diff: string; truncated: boolean };
+async function diffOf(id: string): Promise<DiffResp> {
+  return (await (await post("/diff", { id })).json()) as DiffResp;
+}
+
+describe("/diff (per-seat working diff)", () => {
+  test("diffs the seat's cwd when no worktree is tracked; includes staged + unstaged vs HEAD", async () => {
+    const repo = makeRepo(false); // primary on main, f.txt committed as "base"
+    try {
+      sh(["sh", "-c", `printf 'UNSTAGED_MARKER\\n' > "${repo}/f.txt"`]); // modify tracked (unstaged)
+      sh(["sh", "-c", `printf 'STAGED_MARKER\\n' > "${repo}/g.txt"`]);
+      git(repo, "add", "g.txt"); // new file, staged → only in `diff HEAD`, not plain `diff`
+      const seat = await registerSeat({ cwd: repo, git_root: repo });
+
+      const res = await diffOf(seat);
+      expect(res.truncated).toBe(false);
+      expect(res.diff).toContain("UNSTAGED_MARKER"); // working-tree change
+      expect(res.diff).toContain("STAGED_MARKER");   // staged change (proves `diff HEAD`)
+      expect(res.diff).toContain("f.txt");
+      expect(res.diff).toContain("g.txt");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test("diffs the tracked worktree path, not the seat's cwd, when a worktree is recorded", async () => {
+    const repo = makeRepo(false);
+    const wtPath = join(repo, ".claude/worktrees/wt");
+    try {
+      const base = git(repo, "rev-parse", "main").out.trim();
+      git(repo, "worktree", "add", "-q", "-b", "wtbranch", wtPath, "main");
+      // Divergent uncommitted edits in each tree, so the returned diff names its source.
+      sh(["sh", "-c", `printf 'CWD_MARKER\\n' > "${repo}/f.txt"`]);
+      sh(["sh", "-c", `printf 'WORKTREE_MARKER\\n' > "${wtPath}/f.txt"`]);
+
+      const seat = await registerSeat({ cwd: repo, git_root: repo });
+      await post("/worktree-add", { id: seat, path: wtPath, branch: "wtbranch", base_commit: base });
+
+      const res = await diffOf(seat);
+      expect(res.diff).toContain("WORKTREE_MARKER"); // worktree path wins
+      expect(res.diff).not.toContain("CWD_MARKER");  // cwd is NOT what was diffed
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test("a huge diff is truncated at the byte cap with the flag set", async () => {
+    const CAP = 256 * 1024;
+    const repo = makeRepo(false);
+    try {
+      // A staged new file whose diff exceeds the cap: ~400 KiB of '+' lines.
+      const big = Array.from({ length: 8000 }, (_, i) => `line ${i} ${"x".repeat(48)}`).join("\n");
+      await Bun.write(join(repo, "big.txt"), big);
+      git(repo, "add", "big.txt");
+      const seat = await registerSeat({ cwd: repo, git_root: repo });
+
+      const res = await diffOf(seat);
+      expect(res.truncated).toBe(true);
+      expect(res.diff.length).toBeGreaterThan(0);
+      expect(Buffer.byteLength(res.diff, "utf8")).toBeLessThanOrEqual(CAP);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test("a non-repo cwd returns an empty diff, not an error", async () => {
+    const notRepo = mkdtempSync(join(tmpdir(), "patrol-nonrepo-"));
+    try {
+      const seat = await registerSeat({ cwd: notRepo, git_root: null });
+      const res = await post("/diff", { id: seat });
+      expect(res.status).toBe(200); // graceful, never a 500
+      const body = (await res.json()) as DiffResp;
+      expect(body.diff).toBe("");
+      expect(body.truncated).toBe(false);
+    } finally {
+      rmSync(notRepo, { recursive: true, force: true });
+    }
+  });
+
+  test("an unknown seat returns an empty diff; a malformed id is 400", async () => {
+    const unknown = await diffOf("zzzzzzzz"); // slug-shaped but no such seat
+    expect(unknown.diff).toBe("");
+    expect(unknown.truncated).toBe(false);
+    expect((await post("/diff", { id: "bad" })).status).toBe(400); // not an 8-char slug
+  });
+});
+
 // --- pure command-sequence unit tests ----------------------------------------
 
 describe("worktree git sequence (pure)", () => {

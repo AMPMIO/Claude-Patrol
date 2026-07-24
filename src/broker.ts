@@ -1241,6 +1241,75 @@ function handleWorktreeRemove(body: WorktreeRemoveRequest): { ok: true } {
   return { ok: true };
 }
 
+// --- v0.2.6 per-seat working diff (read-only, byte-bounded) -----------------
+// Local shape — the orchestrator owns shared/types.ts and froze no contract for
+// this, so it stays broker-local. Documented here so a later frozen type can adopt
+// it verbatim:  POST /diff  { id: SeatId }  ->  { diff: string; truncated: boolean }
+interface DiffRequest { id: string }
+interface DiffResponse { diff: string; truncated: boolean }
+
+// Hard cap on captured diff bytes: a runaway diff (a vendored dir, a generated lock
+// file) must never let the broker buffer unbounded memory, so reading STOPS at the cap
+// and flags it — never read-all-then-slice.
+const DIFF_BYTE_CAP = 256 * 1024;
+
+// `git -C <dir> diff HEAD` (staged + unstaged vs HEAD) captured under DIFF_BYTE_CAP.
+// Not a git repo / no HEAD / missing dir => empty string, never an error (a non-zero
+// exit with nothing captured). Once the cap is hit git is killed here, so a non-zero
+// exit AFTER a truncation is expected and the captured bytes are kept.
+async function gitDiff(dir: string): Promise<DiffResponse> {
+  try {
+    // `const` here (not a pre-declared wide binding) so `stdout: "pipe"` narrows
+    // proc.stdout to a ReadableStream — same idiom as seat-server's getGitRoot.
+    const proc = Bun.spawn(["git", "-C", dir, "diff", "HEAD"], { stdout: "pipe", stderr: "ignore" });
+    const reader = proc.stdout.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    let truncated = false;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value || value.byteLength === 0) continue;
+        // '>' (not '>=') so a diff exactly filling the cap isn't flagged truncated until
+        // a later read proves more bytes exist.
+        if (total + value.byteLength > DIFF_BYTE_CAP) {
+          chunks.push(value.subarray(0, DIFF_BYTE_CAP - total));
+          total = DIFF_BYTE_CAP;
+          truncated = true;
+          break;
+        }
+        chunks.push(value);
+        total += value.byteLength;
+      }
+    } finally {
+      // Stop draining the pipe past the cap and let git die; otherwise a huge diff keeps
+      // git alive filling a pipe nobody reads.
+      try { await reader.cancel(); } catch {}
+      proc.kill();
+    }
+    const code = await proc.exited;
+    if (!truncated && code !== 0) return { diff: "", truncated: false };
+    const buf = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) { buf.set(c, off); off += c.byteLength; }
+    return { diff: new TextDecoder().decode(buf), truncated };
+  } catch {
+    return { diff: "", truncated: false };
+  }
+}
+
+// Owner-agnostic read (the token gate already applies): resolve the seat's dir — its
+// most-recent tracked task worktree if any, else its registered cwd — and diff it. An
+// unknown/reaped seat has no dir => empty diff, not an error (matches "no diff").
+async function handleDiff(body: DiffRequest): Promise<DiffResponse> {
+  const seat = db.query("SELECT cwd FROM seats WHERE id = ?").get(body.id) as { cwd: string } | null;
+  if (!seat) return { diff: "", truncated: false };
+  const worktrees = selectWorktreesBySeat.all(body.id) as Worktree[]; // ORDER BY created_at asc
+  const dir = worktrees.length ? worktrees[worktrees.length - 1]!.path : seat.cwd;
+  return gitDiff(dir);
+}
+
 // --- v0.2.6 budget alerts (OBSERVE-ONLY) ---
 // Crossing a per-seat cap pings the alert recipient ONCE — it never gates or stops
 // the model (the frozen contract's semantics: Patrol observes spend, it does not
@@ -1756,6 +1825,8 @@ export function validate(path: string, body: unknown): string | null {
       if (!isSlug(b.id)) return "id must be an 8-char [a-z0-9] slug";
       if (!isStr(b.path, MAX_PATH, 1)) return `path must be a non-empty string ≤${MAX_PATH} chars`;
       return null;
+    case "/diff":
+      return isSlug(b.id) ? null : "id must be an 8-char [a-z0-9] slug";
     default:
       return null; // unknown route 404s below
   }
@@ -1875,6 +1946,8 @@ Bun.serve({
           return Response.json(handleWorktreeList(body as WorktreeListRequest));
         case "/worktree-remove":
           return Response.json(handleWorktreeRemove(body as WorktreeRemoveRequest));
+        case "/diff":
+          return Response.json(await handleDiff(body as DiffRequest));
         default:
           return Response.json({ error: "not found" }, { status: 404 });
       }
