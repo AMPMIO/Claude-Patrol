@@ -161,8 +161,10 @@ test("/ask by an unknown seat is handled cleanly; malformed input is rejected 40
 });
 
 test("a dead seat's OPEN questions are reaped; ANSWERED history survives", async () => {
-  const DEAD_PID = 2_000_000_001; // valid pid int; no such live process
-  const reg = await post("/register", { pid: DEAD_PID, cwd: "/tmp/q-dead", git_root: null, tty: null, summary: "dead", role: "ghost", model: null });
+  // Register LIVE (own pid) so /ask succeeds — a seat cannot ask once dead. Death
+  // is then simulated by /unregister, which runs endSeat (the same reap path a
+  // real dead-pid sweep hits).
+  const reg = await post("/register", { pid: process.pid, cwd: "/tmp/q-dead", git_root: null, tty: null, summary: "dying", role: "ghost", model: null });
   const dead = ((await reg.json()) as { id: string }).id;
 
   // one open, one answered — both belong to the soon-to-be-reaped seat
@@ -170,8 +172,8 @@ test("a dead seat's OPEN questions are reaped; ANSWERED history survives", async
   const ansQ = (await (await post("/ask", { id: dead, text: "answered before I die" })).json()) as { question_id: number };
   await post("/answer", { question_id: ansQ.question_id, text: "here you go" });
 
-  // /list-seats runs the endSeat sweep for a dead pid (no 30s tick needed in-test)
-  await post("/list-seats", { scope: "machine", cwd: "/", git_root: null });
+  // seat leaves → endSeat reaps its OPEN questions, keeps answered history
+  await post("/unregister", { id: dead });
 
   const all = await questions(false);
   expect(all.some((q) => q.id === openQ.question_id)).toBe(false); // open one reaped
