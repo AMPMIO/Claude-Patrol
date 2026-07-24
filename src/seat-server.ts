@@ -354,6 +354,11 @@ async function main() {
   const claudePid = process.ppid || process.pid;
   const envToken = process.env[SEAT_TOKEN_ENV];
   const seatToken = envToken && SEAT_TOKEN_RE.test(envToken) ? envToken : null;
+  // v0.2.6: per-seat spend cap set by the launcher (compose.ts). A malformed/empty
+  // value degrades to null (no cap) rather than shipping NaN — the broker also
+  // re-validates budget_usd at /register.
+  const budgetEnv = process.env.CLAUDE_PATROL_BUDGET_USD;
+  const budgetUsd = budgetEnv && Number.isFinite(Number(budgetEnv)) ? Number(budgetEnv) : null;
 
   const reg = await brokerFetch<RegisterResponse>("/register", {
     pid: claudePid,
@@ -366,6 +371,7 @@ async function main() {
     profile: process.env.CLAUDE_PATROL_PROFILE ?? null,
     session_id: discoverSessionId(),
     seat_token: seatToken,
+    budget_usd: budgetUsd,
   });
   myId = reg.id;
   log(`Registered as seat ${myId} (cwd: ${cwd})`);
