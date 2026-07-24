@@ -5,7 +5,8 @@
 Competitor steals, chosen against a small-verb-set discipline (the field's
 cautionary tale is a tool whose own docs disagree on its 87/171/210 count). Two
 features, plus the anti-bloat commitment to publish and hold the verb count (19).
-283 tests.
+The command-center dashboard (from 0.2.5) is completed here with a per-seat diff
+pane and a 3-wallet billing strip. 288 tests.
 
 ### Added
 - **Budget alerts.** A seat crossing its `budget_usd` cap pings the alert
