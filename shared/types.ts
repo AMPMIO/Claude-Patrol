@@ -96,6 +96,9 @@ export interface CostRow {
 //   /ask              AskRequest             → AskResponse       (v0.2.5 seat raises a question for the human)
 //   /questions        QuestionsRequest       → Question[]        (v0.2.5 open questions for the inbox)
 //   /answer           AnswerRequest          → { ok: true }      (v0.2.5 human answers → routed back to the seat)
+//   /worktree-add     WorktreeAddRequest     → { ok: true }      (v0.2.6 record a seat→worktree association)
+//   /worktree-list    WorktreeListRequest    → Worktree[]        (v0.2.6 raw array)
+//   /worktree-remove  WorktreeRemoveRequest  → { ok: true }      (v0.2.6 drop the association; git tree untouched)
 //   GET /dashboard    (no auth)              → text/html         (v0.2.5 serves the command-center page)
 //   GET /health       (no auth)              → { status: "ok"; seats: number }
 
@@ -189,6 +192,30 @@ export interface AnswerRequest {
   text: string;
 }
 
+// v0.2.6 worktree tracking: git is the source of truth for the tree; the broker only
+// records the seat→worktree association so status/dashboard can show "seat → branch".
+// endSeat drops the association but NEVER deletes the git worktree (unmerged work).
+export interface Worktree {
+  seat_id: SeatId;
+  path: string; // absolute worktree path
+  branch: string;
+  base_commit: string; // the commit it branched from (for a clean checkpoint rebase)
+  created_at: string; // ISO
+}
+export interface WorktreeAddRequest {
+  id: SeatId;
+  path: string;
+  branch: string;
+  base_commit: string;
+}
+export interface WorktreeListRequest {
+  id?: SeatId; // omit = all seats
+}
+export interface WorktreeRemoveRequest {
+  id: SeatId;
+  path: string;
+}
+
 export interface ClaimPortRequest {
   id: SeatId;
   count?: number; // default 1
@@ -247,6 +274,7 @@ export interface RegisterRequest {
   session_id?: string | null; // CC session id when discoverable; enables exact cost attribution
   seat_token?: string | null; // v0.2 Layer-1 marker token (SEAT_TOKEN_ENV); broker content-matches it to a session
   name?: string | null; // v0.2.4: requested handle; broker slugifies + dedupes it. Falls back to role, then hex.
+  budget_usd?: number | null; // v0.2.6: per-seat spend cap; launcher passes SeatSpec.budget_usd through.
 }
 
 // v0.2 Layer 2 (exact attribution for manual seats): a plugin SessionStart
@@ -418,6 +446,10 @@ export interface SeatSpec {
   // blocks destructive commands (rm -rf, git push --force, curl|sh, out-of-cwd
   // writes) — spike-verified 2026-07-14 to block even under workspace-write.
   sandbox?: "read-only" | "workspace-write" | "danger-full-access";
+  // v0.2.6: per-seat spend cap in USD. When the seat's cumulative cost crosses it,
+  // the broker pings the alert recipient ONCE (not a hard stop — Patrol observes
+  // spend, it does not gate the model). Absent = no cap.
+  budget_usd?: number;
 }
 
 export interface ProfileSpec {
@@ -428,6 +460,11 @@ export interface ProfileSpec {
 
 export interface PatrolConfig {
   seats: SeatSpec[];
+  // v0.2.6: fleet-wide spend cap + who hears a crossing. budget_alert_to is a handle
+  // or role (default: the seat whose role is "orchestrator"). A per-seat
+  // SeatSpec.budget_usd overrides this for that seat.
+  budget_usd?: number;
+  budget_alert_to?: string;
 }
 
 // $/MTok list prices: (input, output, cache_write, cache_read).
