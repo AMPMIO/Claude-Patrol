@@ -4,8 +4,9 @@
 // / up.ts. Keeping it pure is what makes tests/launcher.test.ts able to assert
 // exact argv without a real tmux or claude.
 
-import { resolve } from "node:path";
-import { seatMarker, SEAT_TOKEN_ENV, type PatrolConfig, type SeatSpec } from "../../shared/types.ts";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
+import { seatMarker, SEAT_TOKEN_ENV, LEASE_FILE_ENV, type PatrolConfig, type SeatSpec } from "../../shared/types.ts";
 import { resolveProfile, buildSettingsOverlay, PRESET_NAMES, NAMED_PROFILES, type ResolvedProfile } from "../profiles.ts";
 
 export const TMUX_SESSION = "patrol";
@@ -13,7 +14,17 @@ export const TMUX_SESSION = "patrol";
 // assert the executable adapter path without touching the filesystem.
 export const CODEX_SEAT = resolve(import.meta.dir, "../codex-seat.ts");
 export const HEADLESS_SEAT = resolve(import.meta.dir, "../headless-seat.ts");
+// v0.2.9 checkpoint guard. Absolute, resolved from the package root, because the
+// settings overlay that references it is read from an arbitrary seat cwd.
+export const CHECKPOINT_GUARD = resolve(import.meta.dir, "../../plugin/hooks/checkpoint-guard.ts");
 const EMPTY_MCP = '{"mcpServers":{}}';
+
+// Where a seat's checkpoint lease lives. Exported so anything that writes a lease
+// derives the path the same way the seat's hook reads it — a drift here means a
+// checkpoint that quiesces nothing.
+export function leaseFile(seatName: string): string {
+  return join(homedir(), ".claude-patrol", "leases", `${seatName}.lock`);
+}
 
 // A seat name becomes a filesystem path segment (per-seat overlay files) and a
 // tmux `-t patrol:<name>` target, so a name from a possibly-cloned untrusted
@@ -87,7 +98,16 @@ export function applyFleetBudget(config: PatrolConfig): SeatSpec[] {
 
 export function planSeat(seat: SeatSpec, installedPlugins: Record<string, boolean>, configDir: string): SeatPlan {
   const resolved = resolveProfile(seat.profile);
-  const settingsOverlay = resolved ? buildSettingsOverlay(resolved, installedPlugins) : null;
+  const backend = seat.backend ?? "tmux";
+  // Every Claude seat now gets an overlay — even a `full`/no-profile one, which used
+  // to get none — because the overlay carries the checkpoint-guard hook. A no-profile
+  // seat overrides nothing else, so it plans against `full` (its effective profile);
+  // `resolved` stays null so the additive-MCP path below is unchanged.
+  // Adapter seats (codex/headless) are not Claude sessions: no overlay, no hook.
+  const isAdapter = backend === "codex" || backend === "headless";
+  const settingsOverlay = isAdapter
+    ? null
+    : buildSettingsOverlay(resolved ?? NAMED_PROFILES.full!, installedPlugins, CHECKPOINT_GUARD);
   return {
     spec: seat,
     role: seat.role ?? seat.name,
@@ -95,7 +115,7 @@ export function planSeat(seat: SeatSpec, installedPlugins: Record<string, boolea
     // process cwd — `patrol up ../other/patrol.yaml` must launch seats relative
     // to that config, not wherever the user happened to run the command.
     cwd: seat.cwd ? resolve(configDir, seat.cwd) : configDir,
-    backend: seat.backend ?? "tmux",
+    backend,
     resolved,
     settingsOverlay,
   };
@@ -209,6 +229,12 @@ export function composeSeat(
   const env: Record<string, string> = {
     CLAUDE_PATROL_ROLE: plan.role,
     CLAUDE_PATROL_MODEL: spec.model,
+    // v0.2.9: the lease file the guard hook stats before every mutating tool call.
+    // Per seat (SEAT_NAME_RE already guarantees the name is a safe path segment) so
+    // one seat's checkpoint never quiesces another. Setting it is also the seat's
+    // `guarded` bit at /register — the launcher only sets it where it installed the
+    // hook, which is exactly the settings overlay planSeat just built.
+    [LEASE_FILE_ENV]: leaseFile(spec.name),
   };
   if (spec.profile !== undefined) {
     env.CLAUDE_PATROL_PROFILE = typeof spec.profile === "string" ? spec.profile : "custom";

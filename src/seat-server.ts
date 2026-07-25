@@ -20,7 +20,7 @@ import {
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { getSecret, TOKEN_HEADER } from "../shared/auth.ts";
-import { SEAT_TOKEN_ENV, SEAT_TOKEN_RE } from "../shared/types.ts";
+import { SEAT_TOKEN_ENV, SEAT_TOKEN_RE, LEASE_FILE_ENV } from "../shared/types.ts";
 import type {
   SeatId,
   RegisterResponse,
@@ -363,6 +363,11 @@ async function main() {
   // recipient resolver can honor a configured handle/role, not just the orchestrator
   // default. Empty/absent degrades to null (broker falls back to its default).
   const budgetAlertTo = process.env.CLAUDE_PATROL_BUDGET_ALERT_TO || null;
+  // v0.2.9: the launcher sets LEASE_FILE_ENV only on seats it installed the
+  // checkpoint-guard hook into, so its presence IS this seat's guard bit. A seat
+  // that reports false cannot be quiesced, and `patrol checkpoint` refuses it
+  // rather than pretend a fence is a lease.
+  const guarded = !!process.env[LEASE_FILE_ENV];
 
   const reg = await brokerFetch<RegisterResponse>("/register", {
     pid: claudePid,
@@ -377,6 +382,7 @@ async function main() {
     seat_token: seatToken,
     budget_usd: budgetUsd,
     budget_alert_to: budgetAlertTo,
+    guarded,
   });
   myId = reg.id;
   log(`Registered as seat ${myId} (cwd: ${cwd})`);

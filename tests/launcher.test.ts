@@ -1,15 +1,22 @@
 import { test, expect, describe } from "bun:test";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { parseYaml, parsePatrolConfig } from "../src/launcher/yaml.ts";
 import {
-  resolveProfile, buildEnabledPlugins, buildSettingsOverlay, matchPlugin, NAMED_PROFILES,
+  resolveProfile, buildEnabledPlugins, buildSettingsOverlay, matchPlugin, NAMED_PROFILES, GUARD_MATCHER,
 } from "../src/profiles.ts";
 import {
   validateConfig, applyFleetBudget, planSeat, composeSeat, shQuote, seatShellLine, tmuxCommands, CODEX_SEAT, HEADLESS_SEAT,
-  selectBgPidsToKill, patrolMcpConfig, type SeatPlan, type ComposePaths,
+  CHECKPOINT_GUARD, leaseFile, selectBgPidsToKill, patrolMcpConfig, type SeatPlan, type ComposePaths,
 } from "../src/launcher/compose.ts";
-import { seatMarker, SEAT_TOKEN_ENV, type PatrolConfig, type SeatSpec } from "../shared/types.ts";
+import { seatMarker, SEAT_TOKEN_ENV, LEASE_FILE_ENV, type PatrolConfig, type SeatSpec } from "../shared/types.ts";
+
+// v0.2.9: the guard hook block every Claude seat's --settings overlay now carries.
+const GUARD_HOOKS = {
+  PreToolUse: [
+    { matcher: GUARD_MATCHER, hooks: [{ type: "command", command: `bun "${CHECKPOINT_GUARD}"` }] },
+  ],
+};
 
 const INSTALLED = {
   "caveman@caveman": true,
@@ -191,11 +198,29 @@ describe("profiles", () => {
       "caveman@caveman": true, "ponytail@ponytail": false, "context7@claude-plugins-official": false,
     });
   });
-  test("buildSettingsOverlay: full->null, subset->enabledPlugins, raw merged last", () => {
-    expect(buildSettingsOverlay(NAMED_PROFILES.full!, INSTALLED)).toBeNull();
-    expect(buildSettingsOverlay({ plugins: ["caveman"], mcp: "full", settings: { theme: "dark" } }, INSTALLED)).toEqual({
+  // v0.2.9: the overlay is never null any more — it carries the checkpoint guard,
+  // and a seat without it could not be quiesced (checkpoint would refuse it).
+  test("buildSettingsOverlay: full->guard hook only, subset->enabledPlugins, raw merged last", () => {
+    expect(buildSettingsOverlay(NAMED_PROFILES.full!, INSTALLED, "/pkg/hook.ts")).toEqual({
+      hooks: { PreToolUse: [{ matcher: GUARD_MATCHER, hooks: [{ type: "command", command: 'bun "/pkg/hook.ts"' }] }] },
+    });
+    expect(buildSettingsOverlay({ plugins: ["caveman"], mcp: "full", settings: { theme: "dark" } }, INSTALLED, CHECKPOINT_GUARD)).toEqual({
       enabledPlugins: { "caveman@caveman": true, "ponytail@ponytail": false, "context7@claude-plugins-official": false },
       theme: "dark",
+      hooks: GUARD_HOOKS,
+    });
+  });
+
+  test("buildSettingsOverlay: a profile's own hooks survive; the guard is APPENDED", () => {
+    const mine = { matcher: "Bash", hooks: [{ type: "command", command: "echo hi" }] };
+    const overlay = buildSettingsOverlay(
+      { plugins: "all", mcp: "full", settings: { hooks: { PreToolUse: [mine], SessionEnd: ["keep-me"] } } },
+      INSTALLED,
+      CHECKPOINT_GUARD,
+    );
+    expect(overlay.hooks).toEqual({
+      SessionEnd: ["keep-me"],
+      PreToolUse: [mine, ...GUARD_HOOKS.PreToolUse],
     });
   });
 });
@@ -239,11 +264,17 @@ describe("composeSeat argv+env", () => {
     expect(env).toEqual({ CLAUDE_PATROL_ROLE: "answerer", CLAUDE_PATROL_MODEL: "sonnet" });
   });
 
-  test("tmux full seat: no mcp flags, no settings, prompt positional", () => {
+  // v0.2.9: a `full` seat overrides no plugins and no settings, but it STILL gets a
+  // --settings overlay now — that file is what installs the checkpoint guard hook.
+  test("tmux full seat: additive mcp + guard-only settings overlay, prompt positional", () => {
     const p = plan({ name: "orchestrator", role: "lead", model: "opus", backend: "tmux", profile: "full", prompt: "go" });
+    expect(p.settingsOverlay).toEqual({ hooks: GUARD_HOOKS });
     const { argv, env } = composeSeat(p, pathsFor(p));
-    expect(argv).toEqual(["claude", "--model", "opus", "--name", "orchestrator", ...ADD_MCP, ...CHAN, "--", "go"]);
-    expect(env).toEqual({ CLAUDE_PATROL_ROLE: "lead", CLAUDE_PATROL_MODEL: "opus", CLAUDE_PATROL_PROFILE: "full" });
+    expect(argv).toEqual(["claude", "--model", "opus", "--name", "orchestrator", ...ADD_MCP, ...CHAN, "--settings", SET, "--", "go"]);
+    expect(env).toEqual({
+      CLAUDE_PATROL_ROLE: "lead", CLAUDE_PATROL_MODEL: "opus", CLAUDE_PATROL_PROFILE: "full",
+      [LEASE_FILE_ENV]: leaseFile("orchestrator"),
+    });
   });
 
   test("custom subset tmux seat: mcp=patrol + settings overlay, role defaults to name", () => {
@@ -255,7 +286,10 @@ describe("composeSeat argv+env", () => {
       ...CHAN,
       "--settings", SET,
     ]);
-    expect(env).toEqual({ CLAUDE_PATROL_ROLE: "executor", CLAUDE_PATROL_MODEL: "opus", CLAUDE_PATROL_PROFILE: "custom" });
+    expect(env).toEqual({
+      CLAUDE_PATROL_ROLE: "executor", CLAUDE_PATROL_MODEL: "opus", CLAUDE_PATROL_PROFILE: "custom",
+      [LEASE_FILE_ENV]: leaseFile("executor"),
+    });
   });
 
   test("bg peer seat: --bg + empty-plugin settings + patrol mcp", () => {
@@ -280,12 +314,55 @@ describe("composeSeat argv+env", () => {
     ]);
   });
 
-  test("no-profile seat: plain claude + channel flag, no PROFILE env", () => {
+  // A no-profile seat inherits everything, so its overlay is the guard hook and
+  // nothing else — but it must exist, or the seat is unguarded.
+  test("no-profile seat: plain claude + channel flag + guard settings, no PROFILE env", () => {
     const p = plan({ name: "bare", model: "opus" });
+    expect(p.resolved).toBeNull(); // still inherits (additive MCP), overlay notwithstanding
+    expect(p.settingsOverlay).toEqual({ hooks: GUARD_HOOKS });
     const { argv, env } = composeSeat(p, pathsFor(p));
-    expect(argv).toEqual(["claude", "--model", "opus", "--name", "bare", ...ADD_MCP, ...CHAN]);
-    expect(env).toEqual({ CLAUDE_PATROL_ROLE: "bare", CLAUDE_PATROL_MODEL: "opus" });
+    expect(argv).toEqual(["claude", "--model", "opus", "--name", "bare", ...ADD_MCP, ...CHAN, "--settings", SET]);
+    expect(env).toEqual({
+      CLAUDE_PATROL_ROLE: "bare", CLAUDE_PATROL_MODEL: "opus",
+      [LEASE_FILE_ENV]: leaseFile("bare"),
+    });
   });
+});
+
+// --- v0.2.9 checkpoint guard wiring -----------------------------------------
+
+describe("checkpoint guard wiring", () => {
+  test("the hook path in the overlay is absolute and points at checkpoint-guard.ts", () => {
+    expect(CHECKPOINT_GUARD.startsWith("/")).toBe(true);
+    expect(CHECKPOINT_GUARD.endsWith("/plugin/hooks/checkpoint-guard.ts")).toBe(true);
+    expect(existsSync(CHECKPOINT_GUARD)).toBe(true); // a settings file naming a missing hook guards nothing
+  });
+
+  for (const backend of ["tmux", "bg", "current"] as const) {
+    test(`${backend} seat gets BOTH the lease env and the guard hook`, () => {
+      const p = plan({ name: `s-${backend}`, model: "opus", backend });
+      expect(p.settingsOverlay!.hooks).toEqual(GUARD_HOOKS);
+      const { env } = composeSeat(p, pathsFor(p));
+      expect(env[LEASE_FILE_ENV]).toBe(leaseFile(`s-${backend}`));
+    });
+  }
+
+  test("each seat gets its OWN lease file (one seat's checkpoint never quiesces another)", () => {
+    const a = plan({ name: "a", model: "opus" });
+    const b = plan({ name: "b", model: "opus" });
+    expect(composeSeat(a, pathsFor(a)).env[LEASE_FILE_ENV])
+      .not.toBe(composeSeat(b, pathsFor(b)).env[LEASE_FILE_ENV]);
+  });
+
+  // Adapter seats are not Claude sessions: nothing to hook, nothing to quiesce.
+  // They register unguarded and `patrol checkpoint` refuses them by design.
+  for (const backend of ["codex", "headless"] as const) {
+    test(`${backend} adapter seat gets NEITHER the lease env NOR a settings overlay`, () => {
+      const p = plan({ name: "a", role: "adapter", model: "opus", backend });
+      expect(p.settingsOverlay).toBeNull();
+      expect(composeSeat(p, pathsFor(p)).env[LEASE_FILE_ENV]).toBeUndefined();
+    });
+  }
 });
 
 // --- Layer-1 seat-token marker injection -----------------------------------
@@ -297,28 +374,28 @@ describe("composeSeat seat-token marker", () => {
   test("appends marker to an existing prompt and sets SEAT_TOKEN_ENV", () => {
     const p = plan({ name: "orchestrator", role: "lead", model: "opus", profile: "full", prompt: "go" });
     const { argv, env } = composeSeat(p, pathsFor(p), TOKEN);
-    expect(argv).toEqual(["claude", "--model", "opus", "--name", "orchestrator", ...ADD_MCP, ...CHAN, "--", `go\n\n${MARKER}`]);
+    expect(argv).toEqual(["claude", "--model", "opus", "--name", "orchestrator", ...ADD_MCP, ...CHAN, "--settings", SET, "--", `go\n\n${MARKER}`]);
     expect(env[SEAT_TOKEN_ENV]).toBe(TOKEN);
   });
 
   test("synthesizes a minimal prompt when the seat has none", () => {
     const p = plan({ name: "worker-1", role: "worker", model: "sonnet" });
     const { argv, env } = composeSeat(p, pathsFor(p), TOKEN);
-    expect(argv).toEqual(["claude", "--model", "sonnet", "--name", "worker-1", ...ADD_MCP, ...CHAN, "--", `${MARKER} You are seat worker. Await instructions.`]);
+    expect(argv).toEqual(["claude", "--model", "sonnet", "--name", "worker-1", ...ADD_MCP, ...CHAN, "--settings", SET, "--", `${MARKER} You are seat worker. Await instructions.`]);
     expect(env[SEAT_TOKEN_ENV]).toBe(TOKEN);
   });
 
   test("silent seat skips BOTH marker and env even when a token is passed", () => {
     const p = plan({ name: "quiet", model: "opus", prompt: "hi", silent: true });
     const { argv, env } = composeSeat(p, pathsFor(p), TOKEN);
-    expect(argv).toEqual(["claude", "--model", "opus", "--name", "quiet", ...ADD_MCP, ...CHAN, "--", "hi"]);
+    expect(argv).toEqual(["claude", "--model", "opus", "--name", "quiet", ...ADD_MCP, ...CHAN, "--settings", SET, "--", "hi"]);
     expect(env[SEAT_TOKEN_ENV]).toBeUndefined();
   });
 
   test("no token passed -> no marker, no env (back-compat)", () => {
     const p = plan({ name: "bare", model: "opus", prompt: "hi" });
     const { argv, env } = composeSeat(p, pathsFor(p));
-    expect(argv).toEqual(["claude", "--model", "opus", "--name", "bare", ...ADD_MCP, ...CHAN, "--", "hi"]);
+    expect(argv).toEqual(["claude", "--model", "opus", "--name", "bare", ...ADD_MCP, ...CHAN, "--settings", SET, "--", "hi"]);
     expect(env[SEAT_TOKEN_ENV]).toBeUndefined();
   });
 });
