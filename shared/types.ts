@@ -27,6 +27,12 @@ export interface Seat {
   // absent on pre-0.2.4 rows => clients fall back to `id`.
   handle?: string;
   state?: SeatState; // v0.2.4, optional+additive: absent on pre-0.2.4 rows => "unknown"
+  // v0.2.9: reported by the seat at register and echoed here so `patrol checkpoint`
+  // (a different process, with no access to the seat's env) can tell a quiescible seat
+  // from an unguarded one AND write the exact file that seat's hook stats. A guarded
+  // seat with no lease_file reads as unguarded — never guess the path.
+  guarded?: boolean;
+  lease_file?: string | null;
   registered_at: string; // ISO
   last_seen: string; // ISO
 }
