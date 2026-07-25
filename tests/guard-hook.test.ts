@@ -6,7 +6,7 @@
  * where it shouldn't stops the whole fleet from working.
  */
 import { test, expect, afterAll, describe } from "bun:test";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LEASE_FILE_ENV } from "../shared/types.ts";
@@ -60,6 +60,14 @@ function iso(offsetMs: number): string {
 }
 
 describe("checkpoint guard hook", () => {
+  // The hook is self-contained (no cross-dir import, like reg-session.ts) so it
+  // survives packaging — which means its env name is a hardcoded COPY of
+  // LEASE_FILE_ENV. On a drift the hook would watch a variable nobody sets: it
+  // allows every call while the seat still reports itself guarded.
+  test("the hook's hardcoded env name still matches the frozen LEASE_FILE_ENV", () => {
+    expect(readFileSync(HOOK, "utf8")).toContain(`process.env.${LEASE_FILE_ENV}`);
+  });
+
   test("no lease env -> allows (a seat with no lease path is unguarded, not blocked)", async () => {
     const { exit, stdout } = await runHook(null);
     expect(exit).toBe(0);

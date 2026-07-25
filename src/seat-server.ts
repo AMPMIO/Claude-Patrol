@@ -366,8 +366,12 @@ async function main() {
   // v0.2.9: the launcher sets LEASE_FILE_ENV only on seats it installed the
   // checkpoint-guard hook into, so its presence IS this seat's guard bit. A seat
   // that reports false cannot be quiesced, and `patrol checkpoint` refuses it
-  // rather than pretend a fence is a lease.
-  const guarded = !!process.env[LEASE_FILE_ENV];
+  // rather than pretend a fence is a lease. The PATH goes with it because only the
+  // seat can read its own env: checkpoint runs in another process and must write
+  // the exact file this seat's hook stats, not a re-derived convention (a drift
+  // there would fail silently — hook watching one path, checkpoint writing another).
+  const leaseFile = process.env[LEASE_FILE_ENV] || null;
+  const guarded = leaseFile !== null;
 
   const reg = await brokerFetch<RegisterResponse>("/register", {
     pid: claudePid,
@@ -383,6 +387,7 @@ async function main() {
     budget_usd: budgetUsd,
     budget_alert_to: budgetAlertTo,
     guarded,
+    lease_file: leaseFile,
   });
   myId = reg.id;
   log(`Registered as seat ${myId} (cwd: ${cwd})`);
