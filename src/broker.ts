@@ -149,7 +149,9 @@ db.run(`
 // back to the hex id).
 // v0.2.6 adds `budget_usd` (per-seat spend cap, NULL = no cap) and `budget_alerted`
 // (0/1 latch so a crossing pings the recipient ONCE, not every index tick).
-for (const col of ["role TEXT", "model TEXT", "profile TEXT", "session_id TEXT", "state TEXT", "handle TEXT", "budget_usd REAL", "budget_alerted INTEGER NOT NULL DEFAULT 0"]) {
+// v0.2.7 adds `budget_alert_to` (fleet PatrolConfig.budget_alert_to handle/role, NULL
+// => the orchestrator default) so a crossing can page a configured recipient.
+for (const col of ["role TEXT", "model TEXT", "profile TEXT", "session_id TEXT", "state TEXT", "handle TEXT", "budget_usd REAL", "budget_alerted INTEGER NOT NULL DEFAULT 0", "budget_alert_to TEXT"]) {
   try {
     db.run(`ALTER TABLE seats ADD COLUMN ${col}`);
   } catch {
@@ -420,8 +422,8 @@ setInterval(cleanStaleSeats, 30_000);
 // --- Prepared statements ---
 
 const insertSeat = db.prepare(`
-  INSERT INTO seats (id, pid, cwd, git_root, tty, summary, role, model, profile, session_id, registered_at, last_seen, handle, budget_usd)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO seats (id, pid, cwd, git_root, tty, summary, role, model, profile, session_id, registered_at, last_seen, handle, budget_usd, budget_alert_to)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 const updateLastSeen = db.prepare(`UPDATE seats SET last_seen = ? WHERE id = ?`);
 const updateSummary = db.prepare(`UPDATE seats SET summary = ? WHERE id = ?`);
@@ -618,7 +620,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   insertSeat.run(
     id, body.pid, body.cwd, body.git_root, body.tty, body.summary,
     body.role ?? null, body.model ?? null, body.profile ?? null, sessionId,
-    now, now, handle, body.budget_usd ?? null
+    now, now, handle, body.budget_usd ?? null, body.budget_alert_to ?? null
   );
 
   // Durable run row (survives dereg). session_id is the env-override/guarded
@@ -1204,6 +1206,13 @@ const answerTxn = db.transaction((questionId: number, text: string, now: string)
   // Idempotent: first answer wins. A double-answer (retry, double-click) is a no-op —
   // it must NOT enqueue a second reply to the seat.
   if (q.answered) return { ok: true };
+  // The asking seat must still be LIVE. If it died after asking (its row/question
+  // linger until the stale sweep reaps them), marking answered + queuing a reply is a
+  // lie: endSeat's undelivered-mail purge deletes that reply on the next sweep, so the
+  // dashboard shows "answered" while the seat never receives it. Leave the question
+  // OPEN so a live re-ask can still resolve it. Mirrors handleAsk's from_id liveness guard.
+  const seat = db.query("SELECT pid FROM seats WHERE id = ?").get(q.from_id) as { pid: number } | null;
+  if (!seat || !pidAlive(seat.pid)) return { ok: false, error: "asking seat is no longer live" };
   markAnswered.run(text, now, questionId);
   insertMessage.run("human", q.from_id, text, now);
   return { ok: true };
@@ -1253,47 +1262,93 @@ interface DiffResponse { diff: string; truncated: boolean }
 // and flags it — never read-all-then-slice.
 const DIFF_BYTE_CAP = 256 * 1024;
 
-// `git -C <dir> diff HEAD` (staged + unstaged vs HEAD) captured under DIFF_BYTE_CAP.
-// Not a git repo / no HEAD / missing dir => empty string, never an error (a non-zero
-// exit with nothing captured). Once the cap is hit git is killed here, so a non-zero
-// exit AFTER a truncation is expected and the captured bytes are kept.
+function concatChunks(chunks: Uint8Array[], total: number): Uint8Array {
+  const buf = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { buf.set(c, off); off += c.byteLength; }
+  return buf;
+}
+
+// Stream one `git -C <dir> <args>` process's stdout into `chunks`, appending at most
+// `DIFF_BYTE_CAP - startTotal` more bytes (so callers can share one running byte budget
+// across several git invocations). Once the cap is hit git is killed so a runaway file
+// can't keep it filling a pipe nobody drains — a non-zero exit AFTER that is expected.
+// `const proc` (not a pre-declared wide binding) so `stdout: "pipe"` narrows proc.stdout
+// to a ReadableStream — same idiom as seat-server's getGitRoot. A spawn failure (no git
+// on PATH) throws to gitDiff's outer try, which returns empty.
+async function readGit(
+  dir: string, args: string[], chunks: Uint8Array[], startTotal: number
+): Promise<{ added: number; capped: boolean; code: number }> {
+  const proc = Bun.spawn(["git", "-C", dir, ...args], { stdout: "pipe", stderr: "ignore" });
+  const reader = proc.stdout.getReader();
+  let added = 0;
+  let capped = false;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || value.byteLength === 0) continue;
+      // '>' (not '>=') so a diff exactly filling the cap isn't flagged capped until a
+      // later read proves more bytes exist.
+      const room = DIFF_BYTE_CAP - (startTotal + added);
+      if (value.byteLength > room) {
+        if (room > 0) { chunks.push(value.subarray(0, room)); added += room; }
+        capped = true;
+        break;
+      }
+      chunks.push(value);
+      added += value.byteLength;
+    }
+  } finally {
+    try { await reader.cancel(); } catch {}
+    proc.kill();
+  }
+  const code = await proc.exited;
+  return { added, capped, code };
+}
+
+// The seat's working diff: tracked changes vs HEAD PLUS untracked (new) files, captured
+// under a single shared DIFF_BYTE_CAP. Without the untracked pass a seat that only created
+// new files shows "no changes". Not a git repo / no HEAD / missing dir => empty string,
+// never an error (a non-zero exit with nothing captured).
 async function gitDiff(dir: string): Promise<DiffResponse> {
   try {
-    // `const` here (not a pre-declared wide binding) so `stdout: "pipe"` narrows
-    // proc.stdout to a ReadableStream — same idiom as seat-server's getGitRoot.
-    const proc = Bun.spawn(["git", "-C", dir, "diff", "HEAD"], { stdout: "pipe", stderr: "ignore" });
-    const reader = proc.stdout.getReader();
     const chunks: Uint8Array[] = [];
     let total = 0;
     let truncated = false;
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (!value || value.byteLength === 0) continue;
-        // '>' (not '>=') so a diff exactly filling the cap isn't flagged truncated until
-        // a later read proves more bytes exist.
-        if (total + value.byteLength > DIFF_BYTE_CAP) {
-          chunks.push(value.subarray(0, DIFF_BYTE_CAP - total));
-          total = DIFF_BYTE_CAP;
-          truncated = true;
-          break;
+
+    // 1) Tracked changes (staged + unstaged vs HEAD).
+    const tracked = await readGit(dir, ["diff", "HEAD"], chunks, total);
+    total += tracked.added;
+    if (tracked.capped) truncated = true;
+    // Non-repo / no HEAD exits non-zero having captured nothing => empty, never an error
+    // (the pre-0.2.7 contract). A truncated diff also exits non-zero — but AFTER we killed
+    // git with bytes captured — so guard on "captured nothing AND not truncated".
+    if (!truncated && tracked.code !== 0 && total === 0) return { diff: "", truncated: false };
+
+    // 2) Untracked files (respecting .gitignore). Only when the repo is healthy (tracked
+    // diff exited 0) and the budget isn't already spent. Each file's content is appended
+    // as a `--no-index` diff against /dev/null, sharing the SAME running byte total so
+    // tracked+untracked together never exceed the cap.
+    if (!truncated && tracked.code === 0) {
+      const listChunks: Uint8Array[] = [];
+      const list = await readGit(dir, ["ls-files", "--others", "--exclude-standard", "-z"], listChunks, 0);
+      if (list.capped) truncated = true; // more untracked paths than the cap can even list
+      if (list.code === 0 && list.added > 0) {
+        const files = new TextDecoder().decode(concatChunks(listChunks, list.added)).split("\0").filter((f) => f.length > 0);
+        for (const f of files) {
+          if (truncated) break;
+          // `git diff --no-index -- /dev/null <file>` exits 1 whenever the two differ —
+          // ALWAYS here (/dev/null vs a real file) — which is the normal "there is a diff"
+          // signal, not an error, so its exit code is deliberately ignored.
+          const u = await readGit(dir, ["diff", "--no-index", "--", "/dev/null", f], chunks, total);
+          total += u.added;
+          if (u.capped) truncated = true;
         }
-        chunks.push(value);
-        total += value.byteLength;
       }
-    } finally {
-      // Stop draining the pipe past the cap and let git die; otherwise a huge diff keeps
-      // git alive filling a pipe nobody reads.
-      try { await reader.cancel(); } catch {}
-      proc.kill();
     }
-    const code = await proc.exited;
-    if (!truncated && code !== 0) return { diff: "", truncated: false };
-    const buf = new Uint8Array(total);
-    let off = 0;
-    for (const c of chunks) { buf.set(c, off); off += c.byteLength; }
-    return { diff: new TextDecoder().decode(buf), truncated };
+
+    return { diff: new TextDecoder().decode(concatChunks(chunks, total)), truncated };
   } catch {
     return { diff: "", truncated: false };
   }
@@ -1328,12 +1383,12 @@ const alertTxn = db.transaction((seatId: string, recipientId: string, text: stri
   insertMessage.run("patrol", recipientId, text, now);
 });
 
-// Resolve who hears a budget crossing. The frozen contract carries NO per-seat field
-// for PatrolConfig.budget_alert_to (shared/types.ts is the orchestrator's to change),
-// so the broker uses the contract's DEFAULT recipient: the live seat whose role is
-// "orchestrator". `target` (matched by handle, then role) is honored for the day a
-// contract field delivers budget_alert_to to the broker; today it is always null.
-// Returns a live seat id, or null when nothing resolves (caller no-ops + logs).
+// Resolve who hears a budget crossing. `target` is the seat's stored budget_alert_to
+// (v0.2.7 RegisterRequest.budget_alert_to, from fleet PatrolConfig): a configured
+// handle (matched first) or role wins over the default. When it's null or resolves to
+// no live seat, fall back to the contract DEFAULT recipient — the live seat whose role
+// is "orchestrator". Returns a live seat id, or null when nothing resolves (caller
+// no-ops + logs, and MUST NOT latch — a later tick retries once a recipient is live).
 function resolveAlertRecipient(target: string | null): string | null {
   const live = (
     db.query("SELECT id, pid, handle, role FROM seats").all() as {
@@ -1354,13 +1409,14 @@ function resolveAlertRecipient(target: string | null): string | null {
 // considered. Spend is summed by the SAME aggregation /costs and /stats use
 // (readLedgerWindow + costOf), over the SAME default window (since broker start), so
 // the alert can never fire on a number `patrol status` doesn't show. A missing
-// recipient no-ops with ONE log line (and still latches the flag, so a fleet with no
-// live orchestrator doesn't re-log the same crossing every tick) — a budget cap must
-// NEVER throw inside the index tick and starve indexing.
+// recipient no-ops with ONE log line but does NOT latch — the alert is retried on a
+// later tick once a recipient is live (latching there would drop it forever). Only
+// alertTxn, which actually queues the message, latches budget_alerted. A budget cap
+// must NEVER throw inside the index tick and starve indexing.
 function checkBudgets() {
   const capped = db.query(
-    "SELECT id, handle, role, budget_usd FROM seats WHERE budget_usd IS NOT NULL AND budget_alerted = 0"
-  ).all() as { id: string; handle: string | null; role: string | null; budget_usd: number }[];
+    "SELECT id, handle, role, budget_usd, budget_alert_to FROM seats WHERE budget_usd IS NOT NULL AND budget_alerted = 0"
+  ).all() as { id: string; handle: string | null; role: string | null; budget_usd: number; budget_alert_to: string | null }[];
   if (capped.length === 0) return;
 
   const { tallies, seatBySession } = readLedgerWindow({});
@@ -1377,10 +1433,11 @@ function checkBudgets() {
     if (spend < seat.budget_usd) continue;
     const handle = seat.handle ?? seat.id;
     const text = `⚠ ${handle} crossed its $${seat.budget_usd} budget — now $${spend.toFixed(2)}`;
-    const recipient = resolveAlertRecipient(null); // fleet budget_alert_to can't reach the broker (frozen contract) => orchestrator default
+    const recipient = resolveAlertRecipient(seat.budget_alert_to); // configured handle/role wins; else orchestrator default
     if (!recipient) {
-      db.run("UPDATE seats SET budget_alerted = 1 WHERE id = ?", [seat.id]);
-      log(`budget: ${handle} crossed $${seat.budget_usd} (now $${spend.toFixed(2)}) but no live alert recipient — dropped`);
+      // Do NOT latch: a crossing with no live recipient is retried next tick (once an
+      // orchestrator/configured seat is live it alerts) instead of being dropped forever.
+      log(`budget: ${handle} crossed $${seat.budget_usd} (now $${spend.toFixed(2)}) but no live alert recipient — will retry`);
       continue;
     }
     alertTxn(seat.id, recipient, text, now);
@@ -1707,6 +1764,7 @@ export function validate(path: string, body: unknown): string | null {
         return "seat_token must match cp-<8hex>";
       if (b.budget_usd != null && !(typeof b.budget_usd === "number" && Number.isFinite(b.budget_usd) && b.budget_usd > 0))
         return "budget_usd must be a positive number";
+      if (!isOptStr(b.budget_alert_to, MAX_LABEL)) return "budget_alert_to too long or not a string";
       return null;
     case "/heartbeat":
     case "/poll-messages":
@@ -1827,6 +1885,8 @@ export function validate(path: string, body: unknown): string | null {
       return null;
     case "/diff":
       return isSlug(b.id) ? null : "id must be an 8-char [a-z0-9] slug";
+    case "/dash-token":
+      return null; // no body fields; the full-secret gate is the only guard it needs
     default:
       return null; // unknown route 404s below
   }
@@ -1836,30 +1896,80 @@ export function validate(path: string, body: unknown): string | null {
 
 const SECRET = getSecret();
 
+// v0.2.7 scoped dashboard tokens. GET /dashboard no longer hands out the full SECRET
+// (an unauthenticated GET leaking the key that authorizes /send-message et al). Instead
+// `patrol dash` mints a short-lived nonce via POST /dash-token (full-secret authed); the
+// page authenticates with THAT. A leaked nonce is READ-only + /answer and loopback-only,
+// so it can't drive the fleet. In-memory only: nonces die with the broker (a restart just
+// re-mints), and never touch disk. Pruned lazily on mint.
+const DASH_TOKEN_TTL_MS = 8 * HOUR_MS; // ~8h — one working session
+const dashTokens = new Map<string, number>(); // nonce -> expiry epoch ms
+// Routes a dash-nonce may reach: the dashboard's read set + /answer (the human replying
+// to a question inbox). ANY other route (send-message, unregister, register, claims,
+// worktree, set-state, rename, ack, ...) rejects a nonce, so a leaked one can't act.
+const DASH_ALLOWED = new Set(["/list-seats", "/log", "/stats", "/costs", "/questions", "/diff", "/answer"]);
+
+function mintDashToken(): string {
+  const now = Date.now();
+  for (const [tok, exp] of dashTokens) if (exp <= now) dashTokens.delete(tok); // lazy prune
+  const nonce = crypto.randomUUID() + crypto.randomUUID(); // unguessable, no disk
+  dashTokens.set(nonce, now + DASH_TOKEN_TTL_MS);
+  return nonce;
+}
+
+function dashTokenValid(tok: string | null | undefined): boolean {
+  if (!tok) return false;
+  const exp = dashTokens.get(tok);
+  if (exp === undefined) return false;
+  if (exp <= Date.now()) { dashTokens.delete(tok); return false; }
+  return true;
+}
+
+// CSRF guard for browser-driven (dash-nonce) requests only: a malicious page the user
+// visits must not be able to drive the broker through their browser. The dashboard's own
+// fetch() carries a loopback Origin; a cross-site page carries its own. Modern browsers
+// send Origin on every POST, so its ABSENCE means a non-browser/same-origin caller (the
+// CLI, tests) — accepted via the always-present Host. The full-secret path never runs this.
+function loopbackHostname(h: string | null): boolean {
+  if (!h) return false;
+  const host = h.replace(/:\d+$/, ""); // strip :port (not present on bracketed [::1]:port either way)
+  return host === "127.0.0.1" || host === "localhost" || host === "[::1]" || host === "::1";
+}
+function csrfOk(req: Request): boolean {
+  const origin = req.headers.get("origin");
+  if (origin) {
+    try { return loopbackHostname(new URL(origin).hostname); } catch { return false; }
+  }
+  return loopbackHostname(req.headers.get("host"));
+}
+
 Bun.serve({
   port: PORT,
   hostname: "127.0.0.1",
   // Reject oversized POSTs before req.json() ever buffers them.
   maxRequestBodySize: 64 * 1024,
   async fetch(req) {
-    const path = new URL(req.url).pathname;
+    const url = new URL(req.url);
+    const path = url.pathname;
 
     if (req.method !== "POST") {
       if (path === "/health") {
         return Response.json({ status: "ok", seats: (selectAllSeats.all() as Seat[]).length });
       }
       if (path === "/dashboard") {
-        // Open like /health (no token) but reachable only over the loopback bind
-        // (hostname 127.0.0.1 below) — a same-user localhost page. The page's POSTs
-        // to the broker DO need the token, so inject the secret as a JS const the
-        // page's fetch() sends in the x-patrol-token header. This is acceptable
-        // exactly because the surface is localhost + a 0600 secret + the same user;
-        // the token never crosses the machine boundary. JSON.stringify keeps an
-        // arbitrary secret string safe to embed. Served from a file so it stays
-        // editable (not a megastring in this source).
+        // v0.2.7: nonce-gated (no longer open like /health). The page is served ONLY to a
+        // caller holding a valid dash nonce (?t=…), minted by `patrol dash` via the full
+        // secret. A missing/expired/unknown nonce gets 401 with no HTML and no secret — so
+        // an unauthenticated GET can't leak the key. The page's POSTs authenticate with the
+        // NONCE (injected below), not the secret, which the scope gate limits to read+answer.
+        const t = url.searchParams.get("t");
+        if (!dashTokenValid(t)) {
+          return new Response("unauthorized", { status: 401 });
+        }
         try {
           const raw = await Bun.file(new URL("./dashboard/index.html", import.meta.url)).text();
-          const html = raw.replaceAll('"__PATROL_TOKEN__"', JSON.stringify(SECRET));
+          // Inject the NONCE (not SECRET). JSON.stringify keeps the value safe to embed.
+          const html = raw.replaceAll('"__PATROL_TOKEN__"', JSON.stringify(t));
           return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
         } catch (e) {
           return new Response(`dashboard unavailable: ${e instanceof Error ? e.message : String(e)}`, { status: 500 });
@@ -1868,8 +1978,23 @@ Bun.serve({
       return new Response("claude-patrol broker", { status: 200 });
     }
 
-    if (req.headers.get(TOKEN_HEADER) !== SECRET) {
+    // Resolve the presented token to a scope ONCE. `full` = the real secret (CLI, full
+    // access, unchanged). `dash` = a live dashboard nonce (read set + /answer only, and
+    // loopback-only). `none` = neither -> 401.
+    const presented = req.headers.get(TOKEN_HEADER);
+    const scope: "full" | "dash" | "none" =
+      presented === SECRET ? "full" : dashTokenValid(presented) ? "dash" : "none";
+    if (scope === "none") {
       return Response.json({ error: "unauthorized" }, { status: 401 });
+    }
+    if (scope === "dash") {
+      // A nonce is accepted ONLY on the read set + /answer, and only from a loopback origin.
+      if (!DASH_ALLOWED.has(path)) {
+        return Response.json({ error: "unauthorized" }, { status: 401 });
+      }
+      if (!csrfOk(req)) {
+        return Response.json({ error: "cross-origin request refused" }, { status: 401 });
+      }
     }
 
     try {
@@ -1877,6 +2002,10 @@ Bun.serve({
       const invalid = validate(path, body);
       if (invalid) return Response.json({ error: invalid }, { status: 400 });
       switch (path) {
+        case "/dash-token":
+          // Mint a scoped dashboard nonce. Reachable only at scope `full` — a dash nonce
+          // can't reach here (not in DASH_ALLOWED), so it can't mint another nonce.
+          return Response.json({ token: mintDashToken() });
         case "/register":
           return Response.json(handleRegister(body as RegisterRequest));
         case "/heartbeat":
