@@ -7,7 +7,7 @@ import { spawnSync } from "bun";
 import { realpathSync } from "node:fs";
 import { join } from "node:path";
 import { brokerPost, BrokerError, resolveSeatTarget, gitRoot } from "./_client.ts";
-import type { WorktreeAddRequest } from "../../shared/types.ts";
+import type { WorktreeAddRequest, Worktree } from "../../shared/types.ts";
 
 // The fleet convention (init-core.ts implementer discipline): task worktrees live
 // under <repo>/.claude/worktrees/<branch-segment>.
@@ -120,6 +120,20 @@ export default async function worktree(args: string[]): Promise<number> {
         // git's own message is clear: "a branch named 'X' already exists" /
         // "'<path>' already exists" / "is not a valid ref". Surface it verbatim.
         console.error(`patrol worktree: ${add.stderr.trim() || "git worktree add failed"}`);
+        return 1;
+      }
+      // Recovery is only OURS to perform. v0.2.7 recovered on any path+branch match,
+      // so seat B re-running this against a tree seat A already owns would attach a
+      // SECOND seat to one worktree — both then work in it and either `checkpoint` can
+      // remove it under the other. Ask the broker who holds the path across ALL seats
+      // (the broker rejects the write too; this check names the owner instead of
+      // surfacing a bare upsert failure, and stops before the pointless POST).
+      const all = await brokerPost<Worktree[]>("/worktree-list", {});
+      const owner = all.find((w) => (w.path === path || w.path === canonical) && w.seat_id !== id);
+      if (owner) {
+        console.error(
+          `patrol worktree: ${path} is already the task worktree of seat ${owner.seat_id} (branch ${owner.branch}) — refusing to attach a second seat to one tree.`
+        );
         return 1;
       }
       console.error(`patrol worktree: ${path} already exists on ${branch} — recording the association (idempotent recovery).`);

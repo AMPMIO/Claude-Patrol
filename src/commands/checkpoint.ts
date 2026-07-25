@@ -12,6 +12,16 @@
 // trunk as a branch rather than `--detach`: a detached integration head would merge
 // without advancing the trunk ref, forcing an unsafe `update-ref` into a live tree.
 // No `git checkout`/`git merge`/`git reset` is ever run against the primary checkout.
+//
+// RESIDUAL RACE (not closable in this file). The seat is a standing process nobody can
+// pause from here, so checkpoint is fence-and-detect, not mutual exclusion: FENCE 1/2/3
+// below narrow the window to "between FENCE 3's rev-parse and the print", and every
+// fence that trips reports INCOMPLETE with the branch intact instead of a false success.
+// A commit landing inside that last sliver — only reachable by writing refs/heads/<branch>
+// from outside the (now removed) seat tree — would still be missed by the success line;
+// the branch keeps it, so nothing is lost, but the report would be wrong. Closing it for
+// real needs the seat QUIESCED across the whole sequence, i.e. a broker/protocol change
+// (a checkpoint lease the seat honors) that is out of scope for the CLI.
 import { spawnSync } from "bun";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -73,6 +83,29 @@ function git(argv: string[]): { ok: boolean; stdout: string; stderr: string } {
   return { ok: r.exitCode === 0, stdout: r.stdout?.toString() ?? "", stderr: r.stderr?.toString() ?? "" };
 }
 
+// The branch a worktree's HEAD points at, or "" when detached (`--quiet` makes a
+// detached HEAD exit non-zero with no output rather than an error).
+function symbolicHead(seatPath: string): string {
+  return git(["-C", seatPath, "symbolic-ref", "--quiet", "--short", "HEAD"]).stdout.trim();
+}
+
+// One fence point: has the standing seat moved off the pinned snapshot? Checks HEAD
+// FIRST — binding only to the recorded branch name misses a seat that switches branches
+// and commits there, which leaves `branch` untouched so every SHA check would pass while
+// the new work sits on a ref we never merge. Returns a drift description to STOP on, or
+// null when the seat is exactly where it was pinned.
+function seatDrift(seatPath: string, branch: string, branchSha: string, headAtSnapshot: string): string | null {
+  const head = symbolicHead(seatPath);
+  if (head !== headAtSnapshot) {
+    return `switched branches during checkpoint — HEAD in ${seatPath} moved ${headAtSnapshot || "(detached)"} → ${head || "(detached)"}`;
+  }
+  const tip = git(["-C", seatPath, "rev-parse", branch]).stdout.trim();
+  if (tip !== branchSha) {
+    return `advanced during checkpoint — branch ${branch} moved ${branchSha.slice(0, 12)} → ${tip.slice(0, 12)}`;
+  }
+  return null;
+}
+
 export default async function checkpoint(args: string[]): Promise<number> {
   const { positionals, gate } = parse(args);
   const [target] = positionals;
@@ -117,6 +150,10 @@ export default async function checkpoint(args: string[]): Promise<number> {
       return 1;
     }
     const branchSha = snap.stdout.trim();
+    // Pin HEAD as well as the tip: every later check compares against BOTH, so a seat
+    // that `git checkout`s elsewhere and commits there is caught instead of sailing
+    // through on an unchanged `branch` ref. "" means the seat was already detached.
+    const headAtSnapshot = symbolicHead(seatPath);
 
     // 1. Gate — run IN THE WORKTREE. A failing gate must never reach the merge.
     if (gate) {
@@ -127,14 +164,13 @@ export default async function checkpoint(args: string[]): Promise<number> {
       }
     }
 
-    // The seat may have committed during the gate. If the branch moved off the snapshot,
-    // STOP before merging a stale tip — nothing was integrated, so re-running picks up
-    // the new work cleanly.
-    const afterGate = git(["-C", seatPath, "rev-parse", branch]).stdout.trim();
-    if (afterGate !== branchSha) {
-      console.error(
-        `patrol checkpoint: ${target} advanced during checkpoint — branch ${branch} moved ${branchSha.slice(0, 12)} → ${afterGate.slice(0, 12)} after the gate; nothing was merged. Re-run to integrate the new work.`
-      );
+    // FENCE 1 (post-gate, pre-merge). The seat may have committed or switched branches
+    // during the gate. STOP before merging a stale tip — nothing was integrated, so
+    // re-running picks up the new work cleanly.
+    const gateDrift = seatDrift(seatPath, branch, branchSha, headAtSnapshot);
+    if (gateDrift) {
+      console.error(`patrol checkpoint: ${target} ${gateDrift} (after the gate); nothing was merged. Re-run to integrate the new work.`);
+      console.error(`  the worktree at ${seatPath} is left intact and still tracked.`);
       return 1;
     }
 
@@ -168,15 +204,15 @@ export default async function checkpoint(args: string[]): Promise<number> {
 
       const head = git(plan.resolveHead).stdout.trim();
 
-      // 3. Merge landed on the pinned snapshot. Before dropping the tree, re-check the
-      // branch: a standing seat could have committed DURING the merge. If it moved past
-      // the snapshot, main now holds exactly the snapshot (correct — not advanced past
-      // it), but newer work remains on the branch. STOP without removing the worktree or
-      // deregistering, so we never report a false success that strands that work.
-      const beforeRemove = git(["-C", seatPath, "rev-parse", branch]).stdout.trim();
-      if (beforeRemove !== branchSha) {
+      // FENCE 2 (post-merge, pre-remove). Merge landed on the pinned snapshot. A standing
+      // seat could have committed DURING the merge. If it moved, main now holds exactly
+      // the snapshot (correct — not advanced past it), but newer work remains on the
+      // branch. STOP without removing the worktree or deregistering, so we never report a
+      // false success that strands that work.
+      const mergeDrift = seatDrift(seatPath, branch, branchSha, headAtSnapshot);
+      if (mergeDrift) {
         console.error(
-          `patrol checkpoint: ${target} advanced during checkpoint — branch ${branch} moved ${branchSha.slice(0, 12)} → ${beforeRemove.slice(0, 12)}; merged ${head.slice(0, 12)} into ${TRUNK} but newer work remains on ${branch}. Re-run to integrate it.`
+          `patrol checkpoint: ${target} ${mergeDrift}; merged ${head.slice(0, 12)} into ${TRUNK}, but the seat is no longer on the pinned snapshot. Re-run to integrate the newer work.`
         );
         console.error(`  the worktree at ${seatPath} is left intact and still tracked.`);
         return 1;
@@ -190,6 +226,24 @@ export default async function checkpoint(args: string[]): Promise<number> {
           `patrol checkpoint: merged ${branch} into ${TRUNK} (${head.slice(0, 12)}), but could not remove the worktree at ${seatPath} — ${rm.stderr.trim()}`
         );
         console.error(`  the association is kept (the tree still exists); resolve it and re-run, or remove the tree by hand`);
+        return 1;
+      }
+
+      // FENCE 3 (post-remove, pre-deregister) — the last window. A commit landing between
+      // FENCE 2 and the removal leaves a CLEAN (committed) tree, so `worktree remove`
+      // succeeds and, without this check, we would deregister and print success while
+      // TRUNK holds only the pinned snapshot: the new commit is stranded. Re-resolve from
+      // the REPO, not the seat path — the seat's tree is gone, but linked worktrees share
+      // refs, so refs/heads/<branch> is still readable and still holds that work.
+      const afterRemove = git(["-C", repo, "rev-parse", branch]).stdout.trim();
+      if (afterRemove !== branchSha) {
+        console.error(
+          `patrol checkpoint: INCOMPLETE — ${target} advanced during worktree removal; branch ${branch} moved ${branchSha.slice(0, 12)} → ${afterRemove.slice(0, 12)}.`
+        );
+        console.error(`  merged ${head.slice(0, 12)} into ${TRUNK}; the worktree at ${seatPath} was removed but was NOT deregistered.`);
+        console.error(
+          `  NOTHING IS LOST: the tree is gone, but branch ${branch} still points at ${afterRemove.slice(0, 12)} and holds the newer work. Re-create a worktree on ${branch} and re-run checkpoint, or merge ${branch} into ${TRUNK} by hand.`
+        );
         return 1;
       }
 
