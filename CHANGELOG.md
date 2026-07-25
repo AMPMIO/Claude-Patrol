@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.2.7 — 2026-07-25
+
+Security + correctness pass closing all 8 findings from a Codex adversarial review
+of 0.2.5/0.2.6 (1 critical, 4 high, 3 medium — each verified against the code before
+fixing). 313 tests.
+
+### Fixed
+- **[critical] Dashboard no longer leaks the broker secret.** `GET /dashboard` was
+  unauthenticated and embedded the full POST secret. Now `patrol dash` mints a
+  short-lived nonce via `/dash-token` (full-secret only); `GET /dashboard?t=<nonce>`
+  is nonce-gated and injects the *nonce*, not the secret. A dash-nonce authenticates
+  ONLY the read routes + `/answer` (every write route is full-secret-only) and must
+  pass a loopback Origin/Host check — so a leaked nonce can't spoof seats, unregister,
+  ack another seat's mail, or send messages.
+- **[high] Fleet-level budget config is honored.** `parsePatrolConfig` preserves
+  top-level `budget_usd` / `budget_alert_to`; the fleet cap is each seat's default
+  (per-seat overrides), and `budget_alert_to` now reaches the broker's recipient
+  resolver via `RegisterRequest.budget_alert_to`.
+- **[high] Checkpoint can't report a false success.** It snapshots the branch SHA
+  before the gate, merges that exact SHA, and re-checks the ref after the gate and
+  again before removing the worktree — a seat that commits mid-checkpoint STOPs the
+  run instead of silently leaving the new commit unmerged.
+- **[high] Budget crossings aren't dropped.** A crossing with no live recipient no
+  longer latches `budget_alerted`; it retries on a later tick once a recipient exists.
+- **[high] `patrol init --ai` is isolated.** `claude -p` runs with
+  `--strict-mcp-config`, an empty MCP config, `--tools ""`, and a mkdtemp cwd (no
+  project CLAUDE.md/settings/hooks), with repo signals fenced as untrusted data —
+  closing the prompt-injection path from a hostile repo.
+- **[medium] Answering a dead seat's question is rejected** (the question stays open)
+  instead of showing success while the answer is silently swept.
+- **[medium] The working diff includes untracked files**, so a seat that only created
+  new files no longer shows "no changes" (still under the 256 KiB cap).
+- **[medium] `patrol worktree` recovers** after a broker-record failure: a re-run
+  detects the matching existing worktree and retries the association upsert.
+
 ## 0.2.6 — 2026-07-24
 
 Competitor steals, chosen against a small-verb-set discipline (the field's

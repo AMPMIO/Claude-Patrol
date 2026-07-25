@@ -4,3 +4,6 @@ node_modules/
 patrol.yaml
 
 .serena/
+
+# generated codebase index (local, do not commit)
+.codebase-memory/
