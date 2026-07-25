@@ -30,20 +30,24 @@ export const TRUNK = "main";
 // isolated worktree), never against the repo root or the seat's tree.
 export interface CheckpointPlan {
   integrationAdd: string[]; // worktree add <intPath> <trunk>   — in the repo; checks out trunk as a BRANCH
-  merge: string[]; //          -C <intPath> merge --no-edit <branch> — ff when it can, else a merge commit
+  merge: string[]; //          -C <intPath> merge --no-edit <mergeRef> — ff when it can, else a merge commit
   mergeAbort: string[]; //     -C <intPath> merge --abort         — conflict cleanup (trunk ref untouched on conflict)
   resolveHead: string[]; //    -C <intPath> rev-parse HEAD        — the resulting trunk commit
   integrationRemove: string[]; // worktree remove --force <intPath> — drop the throwaway tree
   seatRemove: string[]; //     worktree remove <seatPath>         — drop the seat's task tree (fails if dirty: no forced loss)
 }
 
-export function checkpointPlan(opts: { repo: string; intPath: string; seatPath: string; branch: string; trunk?: string }): CheckpointPlan {
+// mergeRef is the EXACT commit SHA snapshotted before the gate, not the branch name:
+// a standing seat can commit between the gate and worktree-removal, and merging by name
+// would silently integrate (or race) whatever the branch points at NOW. Merging the
+// pinned SHA is what makes the post-merge "did the branch move?" check meaningful.
+export function checkpointPlan(opts: { repo: string; intPath: string; seatPath: string; mergeRef: string; trunk?: string }): CheckpointPlan {
   const trunk = opts.trunk ?? TRUNK;
   const inRepo = ["-C", opts.repo];
   const inInt = ["-C", opts.intPath];
   return {
     integrationAdd: [...inRepo, "worktree", "add", opts.intPath, trunk],
-    merge: [...inInt, "merge", "--no-edit", opts.branch],
+    merge: [...inInt, "merge", "--no-edit", opts.mergeRef],
     mergeAbort: [...inInt, "merge", "--abort"],
     resolveHead: [...inInt, "rev-parse", "HEAD"],
     integrationRemove: [...inRepo, "worktree", "remove", "--force", opts.intPath],
@@ -101,6 +105,19 @@ export default async function checkpoint(args: string[]): Promise<number> {
     seatPath = wts[0]!.path;
     branch = wts[0]!.branch;
 
+    // Snapshot the branch tip BEFORE anything else. The seat is a STANDING process: it
+    // can commit between here and worktree-removal. We merge THIS exact commit and
+    // refuse to remove/deregister if the branch later moved past it — otherwise a
+    // commit landing after the merge would leave a clean tree, so remove + deregister
+    // "succeed" while main lacks that commit: a false success. rev-parse from the seat's
+    // tree resolves refs/heads/<branch> (linked worktrees share refs).
+    const snap = git(["-C", seatPath, "rev-parse", branch]);
+    if (!snap.ok) {
+      console.error(`patrol checkpoint: cannot resolve branch ${branch} in ${seatPath} — ${snap.stderr.trim() || "rev-parse failed"}`);
+      return 1;
+    }
+    const branchSha = snap.stdout.trim();
+
     // 1. Gate — run IN THE WORKTREE. A failing gate must never reach the merge.
     if (gate) {
       const g = spawnSync(["sh", "-c", gate], { cwd: seatPath, stdout: "inherit", stderr: "inherit" });
@@ -110,11 +127,22 @@ export default async function checkpoint(args: string[]): Promise<number> {
       }
     }
 
+    // The seat may have committed during the gate. If the branch moved off the snapshot,
+    // STOP before merging a stale tip — nothing was integrated, so re-running picks up
+    // the new work cleanly.
+    const afterGate = git(["-C", seatPath, "rev-parse", branch]).stdout.trim();
+    if (afterGate !== branchSha) {
+      console.error(
+        `patrol checkpoint: ${target} advanced during checkpoint — branch ${branch} moved ${branchSha.slice(0, 12)} → ${afterGate.slice(0, 12)} after the gate; nothing was merged. Re-run to integrate the new work.`
+      );
+      return 1;
+    }
+
     // 2. Safe merge in a throwaway integration worktree. `intPath` must NOT exist for
     // `git worktree add` to create it, so use a child of a fresh temp dir.
     const intParent = mkdtempSync(join(tmpdir(), "patrol-checkpoint-"));
     const intPath = join(intParent, "trunk");
-    const plan = checkpointPlan({ repo, intPath, seatPath, branch });
+    const plan = checkpointPlan({ repo, intPath, seatPath, mergeRef: branchSha });
     try {
       const add = git(plan.integrationAdd);
       if (!add.ok) {
@@ -140,8 +168,22 @@ export default async function checkpoint(args: string[]): Promise<number> {
 
       const head = git(plan.resolveHead).stdout.trim();
 
-      // 3. Merge landed. Remove the seat's task tree (plain remove — it fails on
-      // uncommitted changes rather than forcibly destroying unmerged work).
+      // 3. Merge landed on the pinned snapshot. Before dropping the tree, re-check the
+      // branch: a standing seat could have committed DURING the merge. If it moved past
+      // the snapshot, main now holds exactly the snapshot (correct — not advanced past
+      // it), but newer work remains on the branch. STOP without removing the worktree or
+      // deregistering, so we never report a false success that strands that work.
+      const beforeRemove = git(["-C", seatPath, "rev-parse", branch]).stdout.trim();
+      if (beforeRemove !== branchSha) {
+        console.error(
+          `patrol checkpoint: ${target} advanced during checkpoint — branch ${branch} moved ${branchSha.slice(0, 12)} → ${beforeRemove.slice(0, 12)}; merged ${head.slice(0, 12)} into ${TRUNK} but newer work remains on ${branch}. Re-run to integrate it.`
+        );
+        console.error(`  the worktree at ${seatPath} is left intact and still tracked.`);
+        return 1;
+      }
+
+      // Remove the seat's task tree (plain remove — it fails on uncommitted changes
+      // rather than forcibly destroying unmerged work).
       const rm = git(plan.seatRemove);
       if (!rm.ok) {
         console.error(

@@ -12,7 +12,7 @@ import { randomBytes } from "node:crypto";
 import { SEAT_TOKEN_RE } from "../../shared/types.ts";
 import { parsePatrolConfig } from "../launcher/yaml.ts";
 import {
-  validateConfig, planSeat, composeSeat, patrolMcpConfig,
+  validateConfig, applyFleetBudget, planSeat, composeSeat, patrolMcpConfig,
   type ComposePaths, type SeatPlan, type TmuxSeat, type RecordedBgSeat,
 } from "../launcher/compose.ts";
 import { hasSession, launchTmux } from "../launcher/tmux.ts";
@@ -95,7 +95,10 @@ export default async function up(args: string[]): Promise<number> {
   }
 
   const installed = readInstalledPlugins();
-  const plans = config.seats.map((s) => planSeat(s, installed, configDir));
+  // Fold the fleet-level budget_usd into each seat as its default cap before planning,
+  // so a seat without its own SeatSpec.budget_usd inherits the fleet cap (Codex #2).
+  const seats = applyFleetBudget(config);
+  const plans = seats.map((s) => planSeat(s, installed, configDir));
 
   // Codex + headless adapter seats intentionally run as visible tmux windows too;
   // tmux session teardown therefore stops them along with ordinary tmux seats.
@@ -112,7 +115,7 @@ export default async function up(args: string[]): Promise<number> {
   const composed = plans.map((plan) => {
     const paths = materialize(plan);
     const token = plan.spec.silent ? null : genSeatToken();
-    return { plan, token, ...composeSeat(plan, paths, token) };
+    return { plan, token, ...composeSeat(plan, paths, token, config.budget_alert_to ?? null) };
   });
 
   // tmux seats

@@ -5,8 +5,9 @@
 // writes. The plain wizard is the core, fully-working path; --ai only supplies
 // richer defaults the user still confirms.
 
-import { existsSync, readFileSync, writeFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, readdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { createInterface, type Interface } from "node:readline";
 import { parsePatrolConfig } from "../launcher/yaml.ts";
 import { validateConfig } from "../launcher/compose.ts";
@@ -17,6 +18,7 @@ import {
   mergeGitignore,
   parseAiFleet,
   buildAiPrompt,
+  buildAiSpawn,
   recommendModel,
   recommendBackend,
   recommendProfile,
@@ -200,10 +202,15 @@ async function runAi(cwd: string, goal: string): Promise<InitAnswers | null> {
     console.log("note: `claude` not on PATH — using the plain wizard.");
     return null;
   }
+  // Gather signals from the REAL repo (that's the context we want), but RUN claude in a
+  // throwaway temp dir so the repo's CLAUDE.md / settings / hooks never load, with no MCP
+  // and no tools — a hostile repo can't prompt-inject into auto-authorized tools (Codex #5).
   const prompt = buildAiPrompt(goal, gatherSignals(cwd));
+  const sandbox = mkdtempSync(join(tmpdir(), "patrol-init-ai-"));
   try {
-    const proc = Bun.spawn([claude, "-p", "--model", "sonnet", "--output-format", "json", prompt], {
-      cwd,
+    const { argv, cwd: spawnCwd } = buildAiSpawn(claude, prompt, sandbox);
+    const proc = Bun.spawn(argv, {
+      cwd: spawnCwd,
       stdin: "ignore", // a piped-but-open stdin makes `claude -p` wait for more input
       stdout: "pipe",
       stderr: "ignore",
@@ -222,6 +229,8 @@ async function runAi(cwd: string, goal: string): Promise<InitAnswers | null> {
   } catch (e) {
     console.log(`note: AI assist failed (${(e as Error).message}) — using the plain wizard.`);
     return null;
+  } finally {
+    rmSync(sandbox, { recursive: true, force: true });
   }
 }
 

@@ -72,6 +72,17 @@ export function validateConfig(config: PatrolConfig): void {
   }
 }
 
+// v0.2.7: fold the fleet-level budget cap into each seat as its DEFAULT. A seat
+// with its own SeatSpec.budget_usd keeps it (per-seat overrides fleet); a seat
+// without one inherits the fleet cap. Pure — returns a new seat list, mutating
+// nothing — so the effective cap is unit-testable. budget_alert_to is fleet-wide
+// (forwarded at register, not per-seat), so it is intentionally NOT folded here.
+export function applyFleetBudget(config: PatrolConfig): SeatSpec[] {
+  const fleet = config.budget_usd;
+  if (fleet == null) return config.seats;
+  return config.seats.map((s) => (s.budget_usd == null ? { ...s, budget_usd: fleet } : s));
+}
+
 // --- planning + argv composition -------------------------------------------
 
 export function planSeat(seat: SeatSpec, installedPlugins: Record<string, boolean>, configDir: string): SeatPlan {
@@ -105,7 +116,12 @@ export interface Composed {
 // seatToken is the Layer-1 cost-attribution marker (see below); pass null (or
 // omit) to compose without one. Kept pure — the token is a parameter, never
 // generated here — so tests can assert the exact argv+env.
-export function composeSeat(plan: SeatPlan, paths: ComposePaths, seatToken: string | null = null): Composed {
+export function composeSeat(
+  plan: SeatPlan,
+  paths: ComposePaths,
+  seatToken: string | null = null,
+  budgetAlertTo: string | null = null,
+): Composed {
   const { spec, resolved } = plan;
 
   // Codex seats are broker adapters, not Claude sessions. They deliberately
@@ -195,6 +211,11 @@ export function composeSeat(plan: SeatPlan, paths: ComposePaths, seatToken: stri
   // localized to the existing CLAUDE_PATROL_* block — codex/headless adapter seats
   // (which bill externally / return early above) are intentionally out of scope.
   if (spec.budget_usd != null) env.CLAUDE_PATROL_BUDGET_USD = String(spec.budget_usd);
+  // v0.2.7: fleet-wide budget-alert recipient. Same env → seat-server → /register
+  // path as budget_usd; the broker's recipient resolver honors a configured
+  // handle/role instead of only the orchestrator default. Every seat carries it so
+  // the broker learns it regardless of which seat registers first.
+  if (budgetAlertTo != null && budgetAlertTo !== "") env.CLAUDE_PATROL_BUDGET_ALERT_TO = budgetAlertTo;
   if (marker) env[SEAT_TOKEN_ENV] = seatToken!;
   return { argv, env };
 }

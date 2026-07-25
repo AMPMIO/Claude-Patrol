@@ -4,6 +4,7 @@
 // tree (this shells out to `git worktree add`); the broker only tracks the
 // association (see shared/types.ts Worktree). Idempotent recording, real git tree.
 import { spawnSync } from "bun";
+import { realpathSync } from "node:fs";
 import { join } from "node:path";
 import { brokerPost, BrokerError, resolveSeatTarget, gitRoot } from "./_client.ts";
 import type { WorktreeAddRequest } from "../../shared/types.ts";
@@ -25,6 +26,29 @@ export function worktreeDirSegment(branch: string): string {
 // ref/sha it branches from. Unit-tested; no git is run here.
 export function worktreeAddArgs(path: string, branch: string, base: string): string[] {
   return ["worktree", "add", "-b", branch, path, base];
+}
+
+// Pure: given `git worktree list --porcelain` output, classify what already exists at
+// `path`. `path` must be canonical (realpath'd) so it matches git's own normalized
+// output. Recovery decision for a re-run after the broker record failed but the tree
+// was already created:
+//   "match"    — a worktree at path is on branch: creation is done, upsert the record
+//   "mismatch" — a worktree at path exists but on a different branch (or detached): a
+//                real conflict — reject rather than clobber someone else's tree
+//   "absent"   — no worktree at path: the add failed for another reason — reject
+export type WorktreeAddState = "match" | "mismatch" | "absent";
+
+export function classifyExistingWorktree(porcelain: string, path: string, branch: string): WorktreeAddState {
+  for (const block of porcelain.split(/\n\s*\n/)) {
+    const lines = block.split("\n");
+    const wtLine = lines.find((l) => l.startsWith("worktree "));
+    if (!wtLine) continue;
+    if (wtLine.slice("worktree ".length).trim() !== path) continue;
+    const branchLine = lines.find((l) => l.startsWith("branch "));
+    const onBranch = branchLine?.slice("branch ".length).trim(); // e.g. "refs/heads/feat"
+    return onBranch === `refs/heads/${branch}` ? "match" : "mismatch";
+  }
+  return "absent";
 }
 
 // Split positionals from the one recognized flag (--base <ref>).
@@ -77,10 +101,28 @@ export default async function worktree(args: string[]): Promise<number> {
     const path = join(repo, WORKTREES_SUBDIR, worktreeDirSegment(branch));
     const add = git(repo, worktreeAddArgs(path, branch, baseRef));
     if (!add.ok) {
-      // git's own message is clear: "a branch named 'X' already exists" /
-      // "'<path>' already exists" / "is not a valid ref". Surface it verbatim.
-      console.error(`patrol worktree: ${add.stderr.trim() || "git worktree add failed"}`);
-      return 1;
+      // A prior run may have created the tree but died before (or on) the broker POST;
+      // re-running then fails here at `worktree add` (branch/path exists) and, before
+      // this fix, returned without re-contacting the broker — leaving the tree
+      // permanently untracked. Recover idempotently: if git already has a worktree at
+      // this exact path on this branch, treat creation as done and fall through to the
+      // broker upsert. Any other existing state (different branch at the path) or a
+      // genuinely new error stays fatal — surface git's own message.
+      let canonical = path;
+      try {
+        canonical = realpathSync(path);
+      } catch {
+        /* path doesn't exist → not a recoverable "already exists"; classify as absent */
+      }
+      const list = git(repo, ["worktree", "list", "--porcelain"]);
+      const state = list.ok ? classifyExistingWorktree(list.stdout, canonical, branch) : "absent";
+      if (state !== "match") {
+        // git's own message is clear: "a branch named 'X' already exists" /
+        // "'<path>' already exists" / "is not a valid ref". Surface it verbatim.
+        console.error(`patrol worktree: ${add.stderr.trim() || "git worktree add failed"}`);
+        return 1;
+      }
+      console.error(`patrol worktree: ${path} already exists on ${branch} — recording the association (idempotent recovery).`);
     }
 
     // Record the association. On a broker failure AFTER the tree exists, leave the
