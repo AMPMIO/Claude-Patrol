@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.2.8 — 2026-07-25
+
+A second adversarial review of the 0.2.7 fixes found 4 issues — three fixes that
+were incomplete rather than closed, and one regression 0.2.7 introduced. All four
+are closed here (each verified against the code first). 326 tests.
+
+### Fixed
+- **Worktree ownership (regression from 0.2.7).** 0.2.7's recovery path could
+  associate a worktree that already belonged to another seat, putting two seats in
+  one tree where either `checkpoint` could remove it under the other. The broker now
+  rejects a `/worktree-add` for a path owned by a different seat (check-then-write in
+  one transaction, naming the owner), and `patrol worktree` refuses before recovering.
+  No UNIQUE index was added: a db written by 0.2.6/0.2.7 may already hold duplicates,
+  and a unique index would fail at startup for exactly the affected users — the
+  invariant is enforced on every write from now on and existing duplicates stay
+  visible via `/worktree-list` so an operator can resolve them.
+- **Checkpoint fences.** The 0.2.7 SHA-fence still left a window: a commit landing
+  between the last check and `worktree remove` left a clean tree, so removal succeeded
+  and checkpoint reported success with that commit unmerged. There are now three
+  fences (post-gate, post-merge, and post-removal) and each binds BOTH the branch tip
+  and symbolic HEAD — so a seat that switches branches and commits there is caught
+  too. A tripped fence reports `INCOMPLETE` with the branch intact, never a false
+  success. **Residual, stated plainly:** checkpoint is fence-and-detect, not mutual
+  exclusion — nothing in the CLI can pause a standing seat. A sliver remains between
+  the final check and the success print; the branch would still hold the commit
+  (nothing lost), only the success line would be wrong. Closing it needs a checkpoint
+  lease the seat honors — a protocol change, not a patch.
+- **Adapter seats now carry the budget.** `composeSeat`'s codex/headless early returns
+  dropped the cap and alert recipient, so a mixed fleet silently launched adapter seats
+  uncapped — worst for headless seats, whose Agent-SDK spend IS ledger-indexed. Both
+  adapters now receive the env and register with `budget_usd`/`budget_alert_to`.
+- **The dashboard surfaces a failed answer.** The dead-asker guard returned `{ok:false}`
+  at HTTP 200, which the page read as success and cleared the input. The broker now
+  returns 409, and the page fails on either shape — restoring the typed text,
+  re-enabling the controls, and showing the broker's error inline.
+
+### Internal
+- Every test file gets its own broker port. Five shared 17901 and two shared 17902, so
+  a lingering broker made the next file's tests fail spuriously with EADDRINUSE — the
+  same load-dependent flake class as the earlier timing one.
+
 ## 0.2.7 — 2026-07-25
 
 Security + correctness pass closing all 8 findings from a Codex adversarial review
