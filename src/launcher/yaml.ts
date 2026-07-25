@@ -183,9 +183,31 @@ export function parsePatrolConfig(src: string): PatrolConfig {
   if (doc === null || typeof doc !== "object" || Array.isArray(doc)) {
     throw new Error("patrol.yaml must be a mapping with a top-level `seats:` list");
   }
-  const seats = (doc as Record<string, unknown>).seats;
+  const rec = doc as Record<string, unknown>;
+  const seats = rec.seats;
   if (!Array.isArray(seats)) {
     throw new Error("patrol.yaml `seats:` must be a list");
   }
-  return { seats: seats as PatrolConfig["seats"] };
+  const config: PatrolConfig = { seats: seats as PatrolConfig["seats"] };
+
+  // Fleet-level budget: forwarding these to the launcher is the whole point —
+  // dropping them silently discards a configured cap (Codex #2). The scalar parser
+  // coerces only integers to numbers, so a float budget (`budget_usd: 2.50`) arrives
+  // as a string; accept a number OR a numeric string and normalize to a number.
+  if (rec.budget_usd !== undefined) {
+    const raw = rec.budget_usd;
+    const n = typeof raw === "number" ? raw : typeof raw === "string" ? Number(raw) : NaN;
+    if (!Number.isFinite(n) || n <= 0) {
+      throw new Error(`patrol.yaml \`budget_usd\` must be a positive number (got ${JSON.stringify(raw)})`);
+    }
+    config.budget_usd = n;
+  }
+  if (rec.budget_alert_to !== undefined) {
+    const raw = rec.budget_alert_to;
+    if (typeof raw !== "string" || raw.trim() === "") {
+      throw new Error(`patrol.yaml \`budget_alert_to\` must be a non-empty string handle/role (got ${JSON.stringify(raw)})`);
+    }
+    config.budget_alert_to = raw;
+  }
+  return config;
 }

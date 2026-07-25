@@ -359,6 +359,10 @@ async function main() {
   // re-validates budget_usd at /register.
   const budgetEnv = process.env.CLAUDE_PATROL_BUDGET_USD;
   const budgetUsd = budgetEnv && Number.isFinite(Number(budgetEnv)) ? Number(budgetEnv) : null;
+  // v0.2.7: fleet-wide budget-alert recipient (compose.ts). Forwarded so the broker's
+  // recipient resolver can honor a configured handle/role, not just the orchestrator
+  // default. Empty/absent degrades to null (broker falls back to its default).
+  const budgetAlertTo = process.env.CLAUDE_PATROL_BUDGET_ALERT_TO || null;
 
   const reg = await brokerFetch<RegisterResponse>("/register", {
     pid: claudePid,
@@ -372,6 +376,7 @@ async function main() {
     session_id: discoverSessionId(),
     seat_token: seatToken,
     budget_usd: budgetUsd,
+    budget_alert_to: budgetAlertTo,
   });
   myId = reg.id;
   log(`Registered as seat ${myId} (cwd: ${cwd})`);

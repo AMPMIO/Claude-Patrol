@@ -20,6 +20,7 @@ import { join } from "node:path";
 import {
   worktreeDirSegment,
   worktreeAddArgs,
+  classifyExistingWorktree,
 } from "../src/commands/worktree.ts";
 import { checkpointPlan, TRUNK } from "../src/commands/checkpoint.ts";
 
@@ -314,8 +315,30 @@ describe("worktree git sequence (pure)", () => {
   });
 });
 
+describe("classifyExistingWorktree (pure — the add-failure recovery decision)", () => {
+  const porcelain =
+    "worktree /repo\nHEAD aaaa\nbranch refs/heads/main\n\n" +
+    "worktree /repo/.claude/worktrees/feat\nHEAD bbbb\nbranch refs/heads/feat\n";
+
+  test("same path + same branch → match (idempotent recovery: proceed to broker upsert)", () => {
+    expect(classifyExistingWorktree(porcelain, "/repo/.claude/worktrees/feat", "feat")).toBe("match");
+  });
+  test("same path + different branch → mismatch (a real conflict: reject)", () => {
+    expect(classifyExistingWorktree(porcelain, "/repo/.claude/worktrees/feat", "other")).toBe("mismatch");
+  });
+  test("no worktree at path → absent (add failed for another reason: reject)", () => {
+    expect(classifyExistingWorktree(porcelain, "/repo/.claude/worktrees/nope", "feat")).toBe("absent");
+  });
+  test("a detached worktree at the path → mismatch (no branch to match)", () => {
+    expect(classifyExistingWorktree("worktree /repo/wt\nHEAD cccc\ndetached\n", "/repo/wt", "feat")).toBe("mismatch");
+  });
+});
+
 describe("checkpointPlan (pure — the dangerous merge-back path, asserted without running git)", () => {
-  const plan = checkpointPlan({ repo: "/repo", intPath: "/tmp/int/trunk", seatPath: "/repo/.claude/worktrees/feat", branch: "feat" });
+  // mergeRef is the pinned pre-gate SHA, not the branch name — merging the exact
+  // snapshot is what makes the "did the seat commit during checkpoint?" check sound.
+  const SNAP = "abc123def456";
+  const plan = checkpointPlan({ repo: "/repo", intPath: "/tmp/int/trunk", seatPath: "/repo/.claude/worktrees/feat", mergeRef: SNAP });
 
   test("the integration worktree checks out the trunk as a BRANCH (not --detach)", () => {
     // Checking out `main` as a branch is what lets the merge itself advance
@@ -324,8 +347,8 @@ describe("checkpointPlan (pure — the dangerous merge-back path, asserted witho
     expect(plan.integrationAdd).not.toContain("--detach");
   });
 
-  test("the merge + abort run ONLY inside the integration worktree, never the primary or the seat tree", () => {
-    expect(plan.merge).toEqual(["-C", "/tmp/int/trunk", "merge", "--no-edit", "feat"]);
+  test("the merge pins the snapshot SHA (never the branch name) and runs ONLY inside the integration worktree", () => {
+    expect(plan.merge).toEqual(["-C", "/tmp/int/trunk", "merge", "--no-edit", SNAP]);
     expect(plan.mergeAbort).toEqual(["-C", "/tmp/int/trunk", "merge", "--abort"]);
     // Every mutating merge command targets the isolated tree, never -C /repo or the seat path.
     for (const argv of [plan.merge, plan.mergeAbort]) {
@@ -457,6 +480,91 @@ describe("end-to-end (real git repo, real CLI subprocess)", () => {
       expect(git(repo, "rev-parse", "main").out.trim()).toBe(mainBefore); // main NOT advanced
       expect(existsSync(wtPath)).toBe(true); // work preserved
       expect(await listWorktrees(seat)).toHaveLength(1); // association kept
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test("checkpoint STOPs when the seat advances the branch DURING checkpoint (no false success)", async () => {
+    // The race Codex #3 closes: a standing seat commits after the pre-gate snapshot but
+    // before worktree-removal. A gate that itself commits is a deterministic stand-in for
+    // that commit (it runs in the seat's tree, after the snapshot). The checkpoint must
+    // STOP — not remove the tree, not deregister, not falsely advance main past the snapshot.
+    const repo = makeRepo(true); // detached primary → trunk free (rules out the live-checkout STOP)
+    const env = { CLAUDE_PATROL_PORT: String(PORT), CLAUDE_PATROL_SECRET_FILE: SECRET_FILE };
+    const seat = await registerSeat({ cwd: repo, git_root: repo, handle: "e2e-advance" });
+    const mainBefore = git(repo, "rev-parse", "main").out.trim();
+    try {
+      const wt = sh(["bun", CLI, "worktree", seat, "adv", "--base", "main"], repo, env);
+      expect(wt.code).toBe(0);
+      const wtPath = wt.out.trim();
+
+      // First commit — the tip the checkpoint snapshots.
+      sh(["sh", "-c", `echo one > "${wtPath}/f.txt"`]);
+      git(wtPath, "commit", "-qam", "seat work 1");
+      const snapTip = git(wtPath, "rev-parse", "HEAD").out.trim();
+
+      // The gate commits a SECOND time, advancing the branch after the snapshot.
+      const gate = `echo two > f.txt && git commit -qam seatwork2`;
+      const cp = sh(["bun", CLI, "checkpoint", seat, "--gate", gate], repo, env);
+
+      expect(cp.code).not.toBe(0); // STOP, not a false success
+      expect(cp.err.toLowerCase()).toContain("advanced"); // reports the advance
+      expect(existsSync(wtPath)).toBe(true); // worktree intact
+      expect(await listWorktrees(seat)).toHaveLength(1); // association intact
+
+      const branchTip = git(wtPath, "rev-parse", "HEAD").out.trim();
+      expect(branchTip).not.toBe(snapTip); // the gate really did advance the branch
+      // main NOT falsely advanced past the snapshot: the after-gate STOP merged nothing.
+      const mainNow = git(repo, "rev-parse", "main").out.trim();
+      expect(mainNow).toBe(mainBefore);
+      expect(mainNow).not.toBe(branchTip); // the newer commit is unmerged into main
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test("worktree add-fails-because-exists → idempotent recovery still records the association", async () => {
+    // Codex #8: a prior run created the tree but the broker POST failed; the tree is now
+    // untracked. Re-running dies at `git worktree add` (branch/path exists). Recovery must
+    // detect the matching existing worktree and still run the broker upsert.
+    const repo = makeRepo(true); // detached primary so `worktree add ... main` isn't blocked
+    const env = { CLAUDE_PATROL_PORT: String(PORT), CLAUDE_PATROL_SECRET_FILE: SECRET_FILE };
+    const seat = await registerSeat({ cwd: repo, git_root: repo, handle: "e2e-recover" });
+    try {
+      // Pre-create the EXACT worktree the CLI would create, with NO broker record — this is
+      // the post-failure state. The CLI's own `git worktree add` will then fail on it.
+      const wtPath = join(repo, ".claude/worktrees/recover");
+      git(repo, "worktree", "add", "-q", "-b", "recover", wtPath, "main");
+      expect(existsSync(wtPath)).toBe(true);
+      expect(await listWorktrees(seat)).toHaveLength(0); // nothing tracked yet
+
+      const r = sh(["bun", CLI, "worktree", seat, "recover", "--base", "main"], repo, env);
+      expect(r.code).toBe(0); // recovered, not a hard failure
+      expect(r.out.trim()).toBe(wtPath); // still prints the tree path
+      const recorded = await listWorktrees(seat);
+      expect(recorded).toHaveLength(1); // the broker upsert ran despite the add failing
+      expect(recorded[0]!.path).toBe(wtPath);
+      expect(recorded[0]!.branch).toBe("recover");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test("worktree add-fails with a MISMATCH (different branch at the path) → rejected, no upsert", async () => {
+    // The guard rails: recovery only kicks in on an exact path+branch match. A different
+    // branch already checked out at the target path is a real conflict — reject, don't clobber.
+    const repo = makeRepo(true);
+    const env = { CLAUDE_PATROL_PORT: String(PORT), CLAUDE_PATROL_SECRET_FILE: SECRET_FILE };
+    const seat = await registerSeat({ cwd: repo, git_root: repo, handle: "e2e-mismatch" });
+    try {
+      // Occupy the path the CLI derives for branch "wanted" with a DIFFERENT branch.
+      const wtPath = join(repo, ".claude/worktrees/wanted");
+      git(repo, "worktree", "add", "-q", "-b", "squatter", wtPath, "main");
+
+      const r = sh(["bun", CLI, "worktree", seat, "wanted", "--base", "main"], repo, env);
+      expect(r.code).not.toBe(0); // rejected — the path holds a different branch
+      expect(await listWorktrees(seat)).toHaveLength(0); // no association recorded
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }

@@ -6,7 +6,7 @@ import {
   resolveProfile, buildEnabledPlugins, buildSettingsOverlay, matchPlugin, NAMED_PROFILES,
 } from "../src/profiles.ts";
 import {
-  validateConfig, planSeat, composeSeat, shQuote, seatShellLine, tmuxCommands, CODEX_SEAT, HEADLESS_SEAT,
+  validateConfig, applyFleetBudget, planSeat, composeSeat, shQuote, seatShellLine, tmuxCommands, CODEX_SEAT, HEADLESS_SEAT,
   selectBgPidsToKill, patrolMcpConfig, type SeatPlan, type ComposePaths,
 } from "../src/launcher/compose.ts";
 import { seatMarker, SEAT_TOKEN_ENV, type PatrolConfig, type SeatSpec } from "../shared/types.ts";
@@ -57,6 +57,53 @@ c: hello
 
   test("rejects non-mapping top level", () => {
     expect(() => parsePatrolConfig("- a\n- b")).toThrow(/seats/);
+  });
+});
+
+// --- fleet-level budget (Codex #2: no longer silently dropped) ---------------
+
+describe("fleet budget parse + default", () => {
+  test("top-level budget_usd + budget_alert_to round-trip into PatrolConfig", () => {
+    const cfg = parsePatrolConfig(`
+budget_usd: 25
+budget_alert_to: lead
+seats:
+  - name: a
+    model: opus
+`);
+    expect(cfg.budget_usd).toBe(25);
+    expect(cfg.budget_alert_to).toBe("lead");
+    expect(cfg.seats).toHaveLength(1);
+  });
+
+  test("a float budget (parsed as a string by the scalar reader) is normalized to a number", () => {
+    expect(parsePatrolConfig("budget_usd: 2.50\nseats:\n  - name: a\n    model: opus\n").budget_usd).toBe(2.5);
+  });
+
+  test("rejects a non-positive / non-numeric budget_usd and an empty budget_alert_to", () => {
+    expect(() => parsePatrolConfig("budget_usd: 0\nseats:\n  - name: a\n    model: opus\n")).toThrow(/positive number/);
+    expect(() => parsePatrolConfig("budget_usd: -5\nseats:\n  - name: a\n    model: opus\n")).toThrow(/positive number/);
+    expect(() => parsePatrolConfig("budget_usd: nope\nseats:\n  - name: a\n    model: opus\n")).toThrow(/positive number/);
+    expect(() => parsePatrolConfig('budget_alert_to: ""\nseats:\n  - name: a\n    model: opus\n')).toThrow(/budget_alert_to/);
+  });
+
+  test("applyFleetBudget: fleet cap is the DEFAULT; a per-seat budget_usd overrides it", () => {
+    const seats = applyFleetBudget({
+      budget_usd: 10,
+      seats: [
+        { name: "inherits", model: "opus" },
+        { name: "owns", model: "opus", budget_usd: 3 },
+      ],
+    });
+    expect(seats.find((s) => s.name === "inherits")!.budget_usd).toBe(10); // fleet default
+    expect(seats.find((s) => s.name === "owns")!.budget_usd).toBe(3); // per-seat wins
+  });
+
+  test("applyFleetBudget: no fleet cap leaves seats untouched (no accidental cap)", () => {
+    const original: SeatSpec[] = [{ name: "a", model: "opus" }];
+    const seats = applyFleetBudget({ seats: original });
+    expect(seats).toBe(original); // same reference — nothing folded
+    expect(seats[0]!.budget_usd).toBeUndefined();
   });
 });
 
@@ -273,6 +320,29 @@ describe("composeSeat seat-token marker", () => {
     const { argv, env } = composeSeat(p, pathsFor(p));
     expect(argv).toEqual(["claude", "--model", "opus", "--name", "bare", ...ADD_MCP, ...CHAN, "--", "hi"]);
     expect(env[SEAT_TOKEN_ENV]).toBeUndefined();
+  });
+});
+
+// --- budget forwarding to the /register path (Codex #2) ---------------------
+
+describe("composeSeat budget forwarding", () => {
+  test("effective per-seat budget_usd (fleet default folded in) → CLAUDE_PATROL_BUDGET_USD env", () => {
+    const [seat] = applyFleetBudget({ budget_usd: 12, seats: [{ name: "w", model: "opus" }] });
+    const p = plan(seat!);
+    const { env } = composeSeat(p, pathsFor(p));
+    expect(env.CLAUDE_PATROL_BUDGET_USD).toBe("12");
+  });
+
+  test("fleet budget_alert_to → CLAUDE_PATROL_BUDGET_ALERT_TO env (round-trips to /register)", () => {
+    const p = plan({ name: "w", model: "opus" });
+    const { env } = composeSeat(p, pathsFor(p), null, "lead");
+    expect(env.CLAUDE_PATROL_BUDGET_ALERT_TO).toBe("lead");
+  });
+
+  test("no alert recipient → no env key (broker keeps its default recipient)", () => {
+    const p = plan({ name: "w", model: "opus" });
+    const { env } = composeSeat(p, pathsFor(p));
+    expect(env.CLAUDE_PATROL_BUDGET_ALERT_TO).toBeUndefined();
   });
 });
 
