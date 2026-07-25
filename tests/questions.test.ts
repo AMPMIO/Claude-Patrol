@@ -201,7 +201,10 @@ test("answering a question whose asking seat has DIED is rejected; the question 
   await child.exited;
 
   const ans = await post("/answer", { question_id: ask.question_id, text: "too late?" });
-  expect(ans.status).toBe(200);
+  // v0.2.7.1: NON-2xx (409), not a 200 {ok:false} — a client that only checks res.ok
+  // (the dashboard did) would otherwise render the refusal as a successful answer.
+  expect(ans.status).toBe(409);
+  expect(ans.ok).toBe(false);
   const body = (await ans.json()) as { ok: boolean; error?: string };
   expect(body.ok).toBe(false);
   expect(body.error).toContain("no longer live");

@@ -14,7 +14,7 @@
  */
 import { test, expect, beforeAll, afterAll, describe } from "bun:test";
 import { spawnSync } from "bun";
-import { mkdtempSync, rmSync, existsSync, realpathSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -81,6 +81,9 @@ function sh(cmd: string[], cwd?: string, env?: Record<string, string>): { code: 
 function git(cwd: string, ...args: string[]) {
   return sh(["git", "-C", cwd, ...args]);
 }
+
+// Resolved BEFORE any PATH shim exists, so a shim can delegate to the real binary.
+const REAL_GIT = sh(["sh", "-c", "command -v git"]).out.trim();
 
 // A throwaway git repo with one commit on `main`. `detachPrimary` frees the trunk so
 // checkpoint can advance it (the correct worktree-per-task layout: nobody camps main).
@@ -169,11 +172,11 @@ test("/worktree-list by id returns only that seat's; omitted returns all", async
 test("/worktree-remove drops the association and is idempotent; owner-scoped by seat_id+path", async () => {
   const a = await registerSeat();
   const b = await registerSeat();
-  const p = "/wt/shared-name";
+  const p = "/wt/owned-by-a";
   await post("/worktree-add", { id: a, path: p, branch: "a", base_commit: "x" });
-  await post("/worktree-add", { id: b, path: p, branch: "b", base_commit: "y" });
+  await post("/worktree-add", { id: b, path: "/wt/owned-by-b", branch: "b", base_commit: "y" });
 
-  // b removing "its" (seat_id=b, path=p) must NOT drop a's row at the same path.
+  // b calling remove on a's path must NOT drop a's row (the delete is seat_id-scoped).
   expect(((await (await post("/worktree-remove", { id: b, path: p })).json()) as { ok: boolean }).ok).toBe(true);
   expect((await listWorktrees(a)).some((w) => w.path === p)).toBe(true); // a survives
   expect((await listWorktrees(b)).some((w) => w.path === p)).toBe(false);
@@ -182,6 +185,40 @@ test("/worktree-remove drops the association and is idempotent; owner-scoped by 
   expect(((await (await post("/worktree-remove", { id: a, path: p })).json()) as { ok: boolean }).ok).toBe(true);
   expect(((await (await post("/worktree-remove", { id: a, path: p })).json()) as { ok: boolean }).ok).toBe(true);
   expect((await listWorktrees(a)).some((w) => w.path === p)).toBe(false);
+});
+
+// --- v0.2.7.1 Finding #2: one PATH, one seat -----------------------------------
+// The v0.2.7 recovery regression: the table's PK is (seat_id, path), so nothing in the
+// schema stopped a second seat from claiming a path another seat already owned. Two
+// seats in one git tree means either `checkpoint` can remove it under the other.
+
+test("/worktree-add REJECTS a path already owned by a DIFFERENT seat; the owner's row is untouched", async () => {
+  const a = await registerSeat({ name: "owner-a" });
+  const b = await registerSeat({ name: "intruder-b" });
+  const p = "/wt/contested";
+  expect(((await (await post("/worktree-add", { id: a, path: p, branch: "a", base_commit: "x" })).json()) as { ok: boolean }).ok).toBe(true);
+
+  const stolen = await post("/worktree-add", { id: b, path: p, branch: "b", base_commit: "y" });
+  const body = (await stolen.json()) as { ok: boolean; error?: string };
+  expect(body.ok).toBe(false);
+  expect(body.error).toContain("already owned by");
+  expect(body.error).toContain("owner-a"); // names the owner, not just the slug
+
+  expect((await listWorktrees(b)).some((w) => w.path === p)).toBe(false); // no row for b
+  const mine = (await listWorktrees(a)).find((w) => w.path === p)!;
+  expect(mine).toBeDefined(); // a's association intact...
+  expect(mine.branch).toBe("a"); // ...and unchanged
+});
+
+test("/worktree-add stays an idempotent upsert for the SAME seat re-adding its own path", async () => {
+  const a = await registerSeat();
+  const p = "/wt/self-readd";
+  await post("/worktree-add", { id: a, path: p, branch: "s", base_commit: "sha1" });
+  const again = await post("/worktree-add", { id: a, path: p, branch: "s", base_commit: "sha2" });
+  expect(((await again.json()) as { ok: boolean }).ok).toBe(true);
+  const rows = (await listWorktrees(a)).filter((w) => w.path === p);
+  expect(rows).toHaveLength(1);
+  expect(rows[0]!.base_commit).toBe("sha2");
 });
 
 test("endSeat drops a seat's worktree ASSOCIATIONS (git tree never touched)", async () => {
@@ -563,6 +600,128 @@ describe("end-to-end (real git repo, real CLI subprocess)", () => {
       expect(recorded).toHaveLength(1); // the broker upsert ran despite the add failing
       expect(recorded[0]!.path).toBe(wtPath);
       expect(recorded[0]!.branch).toBe("recover");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test("checkpoint STOPs when the seat SWITCHED BRANCHES during checkpoint (HEAD binding, not just the branch name)", async () => {
+    // Binding only to the recorded branch name misses this: the seat checks out a new
+    // branch and commits there, so refs/heads/<recorded> never moves and every SHA check
+    // would pass — while the work sits on a ref checkpoint never merges. The gate is a
+    // deterministic stand-in for the switch (it runs in the seat's tree, after the snapshot).
+    const repo = makeRepo(true);
+    const env = { CLAUDE_PATROL_PORT: String(PORT), CLAUDE_PATROL_SECRET_FILE: SECRET_FILE };
+    const seat = await registerSeat({ cwd: repo, git_root: repo, handle: "e2e-switch" });
+    const mainBefore = git(repo, "rev-parse", "main").out.trim();
+    try {
+      const wtPath = sh(["bun", CLI, "worktree", seat, "swit", "--base", "main"], repo, env).out.trim();
+      sh(["sh", "-c", `echo one > "${wtPath}/f.txt"`]);
+      git(wtPath, "commit", "-qam", "seat work 1");
+      const switTip = git(wtPath, "rev-parse", "swit").out.trim();
+
+      // The gate switches branches and commits THERE — `swit` stays exactly where pinned.
+      const gate = `git checkout -q -b elsewhere && echo two > f.txt && git commit -qam sidework`;
+      const cp = sh(["bun", CLI, "checkpoint", seat, "--gate", gate], repo, env);
+
+      expect(cp.code).not.toBe(0); // STOP
+      expect(cp.err).toContain("switched branches");
+      expect(git(wtPath, "rev-parse", "swit").out.trim()).toBe(switTip); // recorded branch never moved...
+      expect(cp.err).toContain("nothing was merged"); // ...and we stopped BEFORE the merge
+      expect(git(repo, "rev-parse", "main").out.trim()).toBe(mainBefore); // trunk untouched
+      expect(existsSync(wtPath)).toBe(true); // tree intact
+      expect(await listWorktrees(seat)).toHaveLength(1); // association intact
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test("checkpoint reports INCOMPLETE (no success, no deregister) when a commit lands in the FINAL window, during worktree removal", async () => {
+    // The last TOCTOU window: a commit landing between the pre-remove check and
+    // `git worktree remove` leaves a CLEAN tree, so removal succeeds and — before the
+    // FENCE 3 re-resolve — checkpoint printed success while TRUNK held only the pinned
+    // snapshot, stranding that commit. Injected DETERMINISTICALLY with a `git` shim
+    // earlier on the CLI's PATH: it fires exactly once, on the seat-worktree removal
+    // argv, commits on the branch, then delegates to the real git.
+    const repo = makeRepo(true);
+    const seatWt = join(repo, ".claude/worktrees/late");
+    const shimDir = mkdtempSync(join(tmpdir(), "patrol-gitshim-"));
+    const marker = join(shimDir, "armed");
+    writeFileSync(marker, "1");
+    writeFileSync(
+      join(shimDir, "git"),
+      `#!/bin/sh\n` +
+        `if [ -f "${marker}" ] && [ "$*" = "-C ${repo} worktree remove ${seatWt}" ]; then\n` +
+        `  rm -f "${marker}"\n` +
+        `  echo late > "${seatWt}/f.txt"\n` +
+        `  "${REAL_GIT}" -C "${seatWt}" commit -qam late-commit >/dev/null 2>&1\n` +
+        `fi\n` +
+        `exec "${REAL_GIT}" "$@"\n`,
+      { mode: 0o755 }
+    );
+    const env = { CLAUDE_PATROL_PORT: String(PORT), CLAUDE_PATROL_SECRET_FILE: SECRET_FILE, PATH: `${shimDir}:${process.env.PATH}` };
+    const seat = await registerSeat({ cwd: repo, git_root: repo, handle: "e2e-late" });
+    try {
+      const wtPath = sh(["bun", CLI, "worktree", seat, "late", "--base", "main"], repo, env).out.trim();
+      expect(wtPath).toBe(seatWt);
+      sh(["sh", "-c", `echo one > "${wtPath}/f.txt"`]);
+      git(wtPath, "commit", "-qam", "seat work 1");
+      const snapTip = git(repo, "rev-parse", "late").out.trim();
+
+      const cp = sh(["bun", CLI, "checkpoint", seat, "--gate", "true"], repo, env);
+
+      expect(existsSync(marker)).toBe(false); // the shim really fired
+      expect(cp.code).not.toBe(0); // NOT a success
+      expect(cp.err).toContain("INCOMPLETE");
+      expect(cp.out).not.toContain("removed worktree"); // no success print
+      expect(await listWorktrees(seat)).toHaveLength(1); // NOT deregistered
+
+      // The merge itself was correct and nothing is lost: trunk holds the pinned snapshot,
+      // and the branch still holds the later commit even though the tree is gone.
+      expect(existsSync(wtPath)).toBe(false); // removal did succeed (clean tree)
+      expect(git(repo, "rev-parse", "main").out.trim()).toBe(snapTip);
+      const lateTip = git(repo, "rev-parse", "late").out.trim();
+      expect(lateTip).not.toBe(snapTip);
+      expect(cp.err).toContain(lateTip.slice(0, 12)); // reports pinned → current
+      expect(cp.err).toContain(snapTip.slice(0, 12));
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(shimDir, { recursive: true, force: true });
+    }
+  });
+
+  test("two seats CANNOT share one worktree: recovery for a second seat is REFUSED and the owner's association survives", async () => {
+    // v0.2.7 regression (Finding #2): recovery treated ANY `worktree add` failure with a
+    // matching path+branch as recoverable, so seat B re-running against seat A's tree
+    // attached a SECOND seat to it — both work in one tree, and either checkpoint can
+    // remove it under the other. Both halves must refuse: the CLI names the owner, and
+    // the broker rejects the write even if a client bypasses the CLI.
+    const repo = makeRepo(true);
+    const env = { CLAUDE_PATROL_PORT: String(PORT), CLAUDE_PATROL_SECRET_FILE: SECRET_FILE };
+    const a = await registerSeat({ cwd: repo, git_root: repo, handle: "e2e-own-a" });
+    const b = await registerSeat({ cwd: repo, git_root: repo, handle: "e2e-own-b" });
+    try {
+      const first = sh(["bun", CLI, "worktree", a, "shared", "--base", "main"], repo, env);
+      expect(first.code).toBe(0);
+      const wtPath = first.out.trim();
+
+      // B re-runs the same command: `git worktree add` fails (path+branch exist), which is
+      // exactly the state the recovery path handles — but the path belongs to A.
+      const second = sh(["bun", CLI, "worktree", b, "shared", "--base", "main"], repo, env);
+      expect(second.code).not.toBe(0);
+      expect(second.err).toContain(a); // names the owning seat
+      expect(second.err.toLowerCase()).toContain("refusing");
+
+      expect(await listWorktrees(b)).toHaveLength(0); // B never got an association
+      const owned = await listWorktrees(a);
+      expect(owned).toHaveLength(1); // A's is intact
+      expect(owned[0]!.path).toBe(wtPath);
+      expect(owned[0]!.branch).toBe("shared");
+
+      // And the broker refuses it directly, not only via the CLI's pre-check.
+      const direct = await post("/worktree-add", { id: b, path: wtPath, branch: "shared", base_commit: owned[0]!.base_commit });
+      expect(((await direct.json()) as { ok: boolean }).ok).toBe(false);
+      expect(await listWorktrees(b)).toHaveLength(0);
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }

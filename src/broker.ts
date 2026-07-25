@@ -532,6 +532,13 @@ const selectAllWorktrees = db.prepare(
   `SELECT seat_id, path, branch, base_commit, created_at FROM worktrees ORDER BY created_at`
 );
 const deleteWorktree = db.prepare(`DELETE FROM worktrees WHERE seat_id = ? AND path = ?`);
+// v0.2.7.1: who (if anyone) already holds this PATH, regardless of seat. The handle is
+// joined in so the rejection can name a human-readable owner; LEFT JOIN because the
+// seat row may have been reaped while the association lingers.
+const selectWorktreeOwnerByPath = db.prepare(
+  `SELECT w.seat_id AS seat_id, s.handle AS handle FROM worktrees w
+   LEFT JOIN seats s ON s.id = w.seat_id WHERE w.path = ? LIMIT 1`
+);
 
 // --- Seat ID ---
 
@@ -1200,6 +1207,8 @@ function handleQuestions(body: QuestionsRequest): Question[] {
 // answer is delivered by inserting it through the SAME message-insert path a normal
 // /send-message uses, from the reserved sender id "human" (not a seat slug, like "cli"):
 // so /poll-messages leases and delivers it exactly like any inter-seat message.
+// Compared by identity at the route below, so the 409 mapping can't drift from the wording.
+const ASKER_GONE = "asking seat is no longer live";
 const answerTxn = db.transaction((questionId: number, text: string, now: string): { ok: true } | { ok: false; error: string } => {
   const q = selectQuestionById.get(questionId) as { id: number; from_id: string; answered: number } | null;
   if (!q) return { ok: false, error: `question ${questionId} not found` };
@@ -1212,14 +1221,21 @@ const answerTxn = db.transaction((questionId: number, text: string, now: string)
   // dashboard shows "answered" while the seat never receives it. Leave the question
   // OPEN so a live re-ask can still resolve it. Mirrors handleAsk's from_id liveness guard.
   const seat = db.query("SELECT pid FROM seats WHERE id = ?").get(q.from_id) as { pid: number } | null;
-  if (!seat || !pidAlive(seat.pid)) return { ok: false, error: "asking seat is no longer live" };
+  if (!seat || !pidAlive(seat.pid)) return { ok: false, error: ASKER_GONE };
   markAnswered.run(text, now, questionId);
   insertMessage.run("human", q.from_id, text, now);
   return { ok: true };
 });
 
-function handleAnswer(body: AnswerRequest): { ok: true } | { ok: false; error: string } {
-  return answerTxn(body.question_id, body.text, new Date().toISOString());
+// The dead-asker refusal must be a NON-2xx: a `{ok:false}` under 200 is indistinguishable
+// from success to any client that checks `res.ok` (the dashboard cleared the input and
+// showed the question as handled). 409 Conflict — the request is well-formed, but the
+// question cannot be answered because the asker is gone; it stays OPEN. The status is
+// carried out-of-band so the response BODY shape is unchanged. Other {ok:false} results
+// (unknown question id) keep their 200: only the liveness refusal is being fixed here.
+function handleAnswer(body: AnswerRequest): { body: { ok: true } | { ok: false; error: string }; status: number } {
+  const res = answerTxn(body.question_id, body.text, new Date().toISOString());
+  return { body: res, status: !res.ok && res.error === ASKER_GONE ? 409 : 200 };
 }
 
 // --- v0.2.6 worktree association ---
@@ -1229,10 +1245,32 @@ function handleAnswer(body: AnswerRequest): { ok: true } | { ok: false; error: s
 // later; the existing pattern is not re-invented here). The recorder must be a LIVE
 // seat (mirrors handleAsk/handleClaimPath): a row owned by a ghost is exactly what
 // endSeat's reap prevents, so refuse to create one.
+//
+// v0.2.7.1: a PATH may be associated with at most ONE seat. The table's PK is
+// (seat_id, path), so the schema alone would happily let seat B claim a path seat A
+// owns — two seats then share one git tree and either `patrol checkpoint` can remove
+// it out from under the other. Enforced HERE rather than by a UNIQUE INDEX on path:
+// a db written by v0.2.6/v0.2.7 may ALREADY hold such duplicate rows, and
+// `CREATE UNIQUE INDEX IF NOT EXISTS` fails hard on existing duplicates — that would
+// brick the broker at startup for exactly the users hit by the bug. Migrations here
+// are additive-only, so the invariant is upheld on write and pre-existing duplicates
+// are left readable (visible in /worktree-list) for the operator to resolve.
+// Check-then-write runs inside ONE db.transaction (same idiom as claimBatch/answerTxn):
+// no await between reading the owner and writing the row.
+const worktreeAddTxn = db.transaction(
+  (id: string, path: string, branch: string, baseCommit: string, now: string): { ok: true } | { ok: false; error: string } => {
+    const owner = selectWorktreeOwnerByPath.get(path) as { seat_id: string; handle: string | null } | null;
+    if (owner && owner.seat_id !== id) {
+      return { ok: false, error: `${path} is already owned by ${owner.handle ? `${owner.handle} (${owner.seat_id})` : owner.seat_id}` };
+    }
+    upsertWorktree.run(id, path, branch, baseCommit, now); // same seat re-adding: idempotent upsert
+    return { ok: true };
+  }
+);
+
 function handleWorktreeAdd(body: WorktreeAddRequest): { ok: true } | { ok: false; error: string } {
   if (!liveSeat(body.id)) return { ok: false, error: `${body.id} is not a live seat` };
-  upsertWorktree.run(body.id, body.path, body.branch, body.base_commit, new Date().toISOString());
-  return { ok: true };
+  return worktreeAddTxn(body.id, body.path, body.branch, body.base_commit, new Date().toISOString());
 }
 
 // id given => that seat's worktrees; omitted => all seats' (raw array, like
@@ -2067,8 +2105,10 @@ Bun.serve({
           return Response.json(handleAsk(body as AskRequest));
         case "/questions":
           return Response.json(handleQuestions(body as QuestionsRequest));
-        case "/answer":
-          return Response.json(handleAnswer(body as AnswerRequest));
+        case "/answer": {
+          const a = handleAnswer(body as AnswerRequest);
+          return Response.json(a.body, { status: a.status });
+        }
         case "/worktree-add":
           return Response.json(handleWorktreeAdd(body as WorktreeAddRequest));
         case "/worktree-list":
