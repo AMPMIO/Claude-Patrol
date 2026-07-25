@@ -313,6 +313,13 @@ export interface RegisterRequest {
   // this seat's writes can actually be paused. `patrol checkpoint` REFUSES an unguarded
   // seat (adapter seats, hand-launched sessions) rather than pretend a fence is a lease.
   guarded?: boolean | null;
+  // v0.2.9: the absolute lease-file path the launcher handed this seat (LEASE_FILE_ENV).
+  // The seat reports it because ONLY the seat knows its own env — `patrol checkpoint`
+  // runs in a different process and must write the exact file this seat's hook stats.
+  // Deriving it from a shared convention instead would fail silently on any drift: the
+  // hook would watch one path while checkpoint wrote another, and the lease would never
+  // fire while appearing to work.
+  lease_file?: string | null;
 }
 
 // v0.2 Layer 2 (exact attribution for manual seats): a plugin SessionStart
