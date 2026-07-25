@@ -8,6 +8,12 @@ import { brokerPost, gitRoot, relTime, truncate, usd, renderTable, seatLabel, Br
 // rather than editing shared/types.ts.
 type SeatWithBudget = Seat & { budget_usd?: number | null };
 
+// v0.2.9: /worktree-list joins the checkpoint lease in (additive, same reasoning as above).
+// A held lease means the seat's guard hook is DENYING its writes right now — without this
+// column, a checkpoint that died before releasing looks like a seat that inexplicably
+// stopped working until the TTL burns down.
+type WorktreeWithLease = Worktree & { lease_expires_at?: string | null };
+
 export default async function status(_args: string[]): Promise<number> {
   const cwd = process.cwd();
 
@@ -34,10 +40,16 @@ export default async function status(_args: string[]): Promise<number> {
   // v0.2.6 active task branch per seat. Best-effort like /costs: a failed call just
   // renders "-" in the BRANCH column, it must never block the board.
   const branchBySeat = new Map<string, string>();
+  const leasedUntil = new Map<string, string>();
   try {
-    for (const w of await brokerPost<Worktree[]>("/worktree-list", {})) {
+    for (const w of await brokerPost<WorktreeWithLease[]>("/worktree-list", {})) {
       const prev = branchBySeat.get(w.seat_id);
       branchBySeat.set(w.seat_id, prev ? `${prev},${w.branch}` : w.branch);
+      // Only a lease that has not expired is worth showing: past expires_at the guard hook
+      // fails open, so the seat is writing again and a LEASED marker would be a lie.
+      if (w.lease_expires_at && Date.parse(w.lease_expires_at) > Date.now()) {
+        leasedUntil.set(w.seat_id, w.lease_expires_at);
+      }
     }
   } catch {
     /* worktree tracking unavailable — leave the column blank */
@@ -72,7 +84,9 @@ export default async function status(_args: string[]): Promise<number> {
         s.model ?? "-",
         s.profile ?? "-",
         s.tty ?? "-",
-        truncate(branchBySeat.get(s.id) ?? "-", 24),
+        // The LEASED marker rides in the BRANCH cell (like OVER rides in SPEND) rather than
+        // costing a column that is blank for every seat almost all of the time.
+        `${truncate(branchBySeat.get(s.id) ?? "-", 24)}${leasedUntil.has(s.id) ? " LEASED" : ""}`,
         relTime(s.last_seen),
         costs ? `${usd(spend)}${over ? " OVER" : ""}` : "—",
         budget != null ? usd(budget) : "—",
