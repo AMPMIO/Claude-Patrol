@@ -133,6 +133,10 @@
     border: 1.5px solid var(--line); border-radius: var(--radius); background: var(--ink); color: var(--paper);
   }
   .q .ans button:hover { background: var(--rust); }
+  .q .q-err {
+    margin-top: 6px; font-size: 11px; font-weight: 700; color: var(--rust);
+    border-left: 3px solid var(--rust); padding-left: 8px; overflow-wrap: anywhere;
+  }
   .inbox-empty { padding: 14px; color: var(--ink-2); font-size: 12px; }
 
   /* --- kanban --- */
@@ -371,6 +375,24 @@
     return res.json();
   }
 
+  // /answer needs the failure BODY (the broker's reason), which api() throws away.
+  // Never rejects on a non-2xx — the caller decides via answerOutcome().
+  async function apiRaw(path, body) {
+    const res = await fetch(path, { method: "POST", headers: HEADERS, body: JSON.stringify(body || {}) });
+    let parsed = null;
+    try { parsed = await res.json(); } catch (e) { parsed = null; }
+    return { status: res.status, body: parsed };
+  }
+
+  // The broker's dead-asker guard signals failure in TWO shapes: a 2xx carrying
+  // {ok:false,error} and (newer brokers) a non-2xx status. Both must count as
+  // failure, or the page clears the input on an answer that was never delivered.
+  function answerOutcome(status, body) {
+    if (!(status >= 200 && status < 300)) return "failure";
+    if (body && body.ok === false) return "failure";
+    return "success";
+  }
+
   // In-flight-guarded poller — mirrors usePoll in src/tui/watch-app.tsx: a tick is
   // SKIPPED while the previous fetch is outstanding, so a slow/wedged broker can
   // never let ticks pile up. Runaway polling once burned 46 CPU-hours; don't
@@ -432,7 +454,7 @@
       '<div class="body"><div class="ans">' +
         '<input placeholder="answer — routes back to the seat…">' +
         '<button>Send</button>' +
-      '</div></div>';
+      '</div><div class="q-err" role="alert" hidden></div></div>';
     const who = q.from_handle && q.from_handle.length ? q.from_handle : String(q.from_id).slice(0, 8);
     node.querySelector(".who").textContent = who;
     // body text set as a text node before the .ans block (keeps the answer UI intact)
@@ -476,19 +498,37 @@
   async function answerQuestion(qid, node, input) {
     const text = input.value.trim();
     if (!text) { input.focus(); return; }
+    const button = node.querySelector(".ans button");
+    const errBox = node.querySelector(".q-err");
+    errBox.hidden = true;
+    errBox.innerHTML = "";
     // Optimistic: grey out + clear immediately; the next /questions poll drops it
     // for real. Drop it from local state too so it can't flash back in between.
     node.style.opacity = "0.4";
     input.value = "";
     input.disabled = true;
+    button.disabled = true;
     state.questions = state.questions.filter((q) => q.id !== qid);
-    try {
-      await api("/answer", { question_id: qid, text });
-    } catch (e) {
-      // restore on failure so the answer isn't silently lost
+    // A failed answer never reached the seat: put the typed text back, re-open BOTH
+    // controls, and say why. Leaving them cleared/disabled told the human it landed.
+    const restore = (msg) => {
       node.style.opacity = "1";
       input.disabled = false;
+      button.disabled = false;
       input.value = text;
+      errBox.innerHTML = esc(msg);
+      errBox.hidden = false;
+      input.focus();
+    };
+    let res;
+    try {
+      res = await apiRaw("/answer", { question_id: qid, text });
+    } catch (e) {
+      restore("broker unreachable — answer not delivered");
+      return;
+    }
+    if (answerOutcome(res.status, res.body) === "failure") {
+      restore((res.body && res.body.error) || ("answer rejected (" + res.status + ")"));
     }
   }
 

@@ -344,6 +344,41 @@ describe("composeSeat budget forwarding", () => {
     const { env } = composeSeat(p, pathsFor(p));
     expect(env.CLAUDE_PATROL_BUDGET_ALERT_TO).toBeUndefined();
   });
+
+  // The regression this pair pins: composeSeat's codex/headless early returns used to
+  // build a role+model-only env, so a mixed fleet launched its adapter seats uncapped.
+  for (const backend of ["codex", "headless"] as const) {
+    test(`${backend} adapter seat carries the fleet cap + alert recipient in its env`, () => {
+      const [seat] = applyFleetBudget({
+        budget_usd: 12,
+        seats: [{ name: "a", role: "adapter", model: "opus", backend }],
+      });
+      const p = plan(seat!);
+      const { env } = composeSeat(p, pathsFor(p), "cp-0375a012", "lead");
+      expect(env).toEqual({
+        CLAUDE_PATROL_ROLE: "adapter",
+        CLAUDE_PATROL_MODEL: "opus",
+        CLAUDE_PATROL_BUDGET_USD: "12",
+        CLAUDE_PATROL_BUDGET_ALERT_TO: "lead",
+      });
+    });
+
+    test(`${backend} adapter seat with no budget set omits BOTH keys`, () => {
+      const p = plan({ name: "a", role: "adapter", model: "opus", backend });
+      const { env } = composeSeat(p, pathsFor(p), "cp-0375a012");
+      expect(env).toEqual({ CLAUDE_PATROL_ROLE: "adapter", CLAUDE_PATROL_MODEL: "opus" });
+    });
+  }
+
+  test("per-seat budget on an adapter seat overrides the fleet default", () => {
+    const [seat] = applyFleetBudget({
+      budget_usd: 12,
+      seats: [{ name: "a", role: "adapter", model: "opus", backend: "headless", budget_usd: 3.5 }],
+    });
+    const p = plan(seat!);
+    const { env } = composeSeat(p, pathsFor(p));
+    expect(env.CLAUDE_PATROL_BUDGET_USD).toBe("3.5");
+  });
 });
 
 // --- cwd resolution against the config directory ---------------------------

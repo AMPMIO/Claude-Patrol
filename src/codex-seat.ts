@@ -87,6 +87,26 @@ export function parseCodexSeatArgs(args: string[], env: NodeJS.ProcessEnv = proc
   };
 }
 
+// v0.2.7 fix: adapter seats receive the same CLAUDE_PATROL_BUDGET_* env the launcher
+// gives claude seats (src/launcher/compose.ts) and must forward it at /register, or a
+// mixed fleet's adapter seats register uncapped. Parsing mirrors src/seat-server.ts:
+// a malformed/empty value degrades to null (no cap) rather than shipping NaN — the
+// broker also re-validates budget_usd at /register. Shared with headless-seat.ts.
+export function budgetFieldsFromEnv(env: NodeJS.ProcessEnv = process.env): {
+  budget_usd: number | null;
+  budget_alert_to: string | null;
+} {
+  // Stricter than a bare Number() cast on purpose: the broker REJECTS the whole
+  // /register body when budget_usd is present but not positive, so a whitespace-only
+  // env var (Number("  ") === 0) would take the seat off the fleet entirely.
+  const raw = (env.CLAUDE_PATROL_BUDGET_USD ?? "").trim();
+  const parsed = raw === "" ? NaN : Number(raw);
+  return {
+    budget_usd: Number.isFinite(parsed) && parsed > 0 ? parsed : null,
+    budget_alert_to: env.CLAUDE_PATROL_BUDGET_ALERT_TO || null,
+  };
+}
+
 export type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 export const VALID_SANDBOX: readonly SandboxMode[] = ["read-only", "workspace-write", "danger-full-access"];
 
@@ -649,6 +669,10 @@ async function main() {
     model: config.model,
     profile: null,
     // Intentionally no seat_token and no session_id; see file comment.
+    // A codex seat has no Claude session log, so it never accrues ledger spend and
+    // this cap cannot trip today — forwarded anyway so every backend registers the
+    // same way and a future external-spend source needs no launcher change.
+    ...budgetFieldsFromEnv(),
   });
   myId = reg.id;
   log(`Registered as seat ${myId} (cwd: ${config.cwd})`);

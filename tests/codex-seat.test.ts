@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   billableTokens,
+  budgetFieldsFromEnv,
   buildFirstTurnArgv,
   buildHookArgs,
   buildResumeTurnArgv,
@@ -427,4 +428,22 @@ test("thread-less failures do not abandon the next thread on arrival", async () 
   expect(calls).toHaveLength(4);
   expect(calls[3]).toContain("exec resume fake-thread");
   expect(calls[3]).not.toContain("--cd"); // resume shape, i.e. genuinely not a fresh exec
+});
+
+// --- budget env → /register (Codex re-review #1) -----------------------------
+// The launcher hands adapter seats CLAUDE_PATROL_BUDGET_* exactly like claude seats;
+// both adapters spread this into their /register body, so bad parsing here would ship
+// NaN to the broker instead of "no cap".
+
+test("budgetFieldsFromEnv reads the launcher's cap + alert recipient", () => {
+  expect(budgetFieldsFromEnv({ CLAUDE_PATROL_BUDGET_USD: "12.5", CLAUDE_PATROL_BUDGET_ALERT_TO: "lead" }))
+    .toEqual({ budget_usd: 12.5, budget_alert_to: "lead" });
+});
+
+test("budgetFieldsFromEnv degrades absent/empty/malformed to null, never NaN", () => {
+  for (const raw of [undefined, "", "  ", "abc", "NaN", "0", "-5"]) {
+    const fields = budgetFieldsFromEnv(raw === undefined ? {} : { CLAUDE_PATROL_BUDGET_USD: raw });
+    expect(fields).toEqual({ budget_usd: null, budget_alert_to: null });
+    expect(Number.isNaN(fields.budget_usd as number)).toBe(false);
+  }
 });
