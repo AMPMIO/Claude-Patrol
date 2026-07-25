@@ -1022,6 +1022,30 @@ describe("end-to-end (real git repo, real CLI subprocess)", () => {
     }
   });
 
+  test("a guarded seat with NO lease_file is treated as unguarded (never guess the path)", async () => {
+    const repo = makeRepo(true);
+    const env = { CLAUDE_PATROL_PORT: String(PORT), CLAUDE_PATROL_SECRET_FILE: SECRET_FILE };
+    // The half-wired case: the hook is installed but the seat never reported where its lease
+    // file lives. Writing a guessed path would leave the hook watching a different file — the
+    // lease would look taken while quiescing nothing, which is worse than refusing outright.
+    const seat = await registerSeat({ cwd: repo, git_root: repo, guarded: true });
+    const mainBefore = git(repo, "rev-parse", "main").out.trim();
+    try {
+      const wtPath = sh(["bun", CLI, "worktree", seat, "nofile", "--base", "main"], repo, env).out.trim();
+      sh(["sh", "-c", `echo work > "${wtPath}/f.txt"`]);
+      git(wtPath, "commit", "-qam", "seat work");
+
+      const cp = sh(["bun", CLI, "checkpoint", seat, "--gate", "true"], repo, env);
+      expect(cp.code).not.toBe(0);
+      expect(cp.err).toContain("no lease-file path");
+      expect(git(repo, "rev-parse", "main").out.trim()).toBe(mainBefore); // nothing merged
+      expect(await listWorktrees(seat)).toHaveLength(1); // still tracked
+      expect(leaseRow(wtPath)).toBeNull(); // refused BEFORE acquiring
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
   test("a guarded checkpoint HOLDS the lease across the merge and releases it after", async () => {
     const repo = makeRepo(true);
     const env = { CLAUDE_PATROL_PORT: String(PORT), CLAUDE_PATROL_SECRET_FILE: SECRET_FILE };

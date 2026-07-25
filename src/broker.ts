@@ -159,12 +159,12 @@ db.run(`
 // hand-launched seats, which reads as NOT guarded — `patrol checkpoint` refuses those
 // rather than pretending a fence is a lease.
 //
-// `lease_file` is the LEASE_FILE_ENV path the LAUNCHER handed this seat, stored verbatim
-// and echoed back by /list-seats. checkpoint cannot read the seat's env, so this is the
-// only way it can write the file the guard hook stats. It is a PASS-THROUGH of the
-// launcher's choice, never a path derived here: a convention this broker invents that
-// disagrees with the hook's means the hook never fires and the lease buys nothing.
-// NULL => checkpoint refuses rather than claim a seat is quiesced when it isn't.
+// `lease_file` is the LEASE_FILE_ENV path the SEAT reports at register, stored verbatim and
+// echoed back by /list-seats. checkpoint cannot read the seat's env, so this relay is the
+// only way it can write the file the guard hook stats. It is a PASS-THROUGH of the seat's
+// own value, never a path derived here: a convention this broker invents that disagrees with
+// the hook's means the hook never fires and the lease buys nothing. NULL => checkpoint
+// treats the seat as unguarded rather than claim it is quiesced when it isn't.
 for (const col of ["role TEXT", "model TEXT", "profile TEXT", "session_id TEXT", "state TEXT", "handle TEXT", "budget_usd REAL", "budget_alerted INTEGER NOT NULL DEFAULT 0", "budget_alert_to TEXT", "guarded INTEGER", "lease_file TEXT"]) {
   try {
     db.run(`ALTER TABLE seats ADD COLUMN ${col}`);
@@ -726,8 +726,8 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     // v0.2.9: SQLite has no bool. Absent/null => 0 (NOT guarded) — the safe read, since
     // checkpoint refuses an unguarded seat rather than assume it can be quiesced.
     body.guarded ? 1 : 0,
-    // Stored verbatim — the launcher owns this path (it is what it put in LEASE_FILE_ENV).
-    (body as RegisterRequest & { lease_file?: string | null }).lease_file ?? null
+    // Stored verbatim — the SEAT owns this path (it is what it was handed in LEASE_FILE_ENV).
+    body.lease_file ?? null
   );
 
   // Durable run row (survives dereg). session_id is the env-override/guarded
@@ -763,17 +763,16 @@ function handleListSeats(body: ListSeatsRequest): Seat[] {
   // Drop seats whose process has died since last cleanup tick. Full retirement
   // (endSeat), not a bare row delete: `patrol status` right after a seat dies
   // must not leave the run unbounded or its undelivered mail behind.
-  // v0.2.9: `guarded` is a real column (0/1) but the frozen Seat contract has no field for
-  // it, so it rides out as an additive property clients read off a widened view (same as
-  // budget_usd). Normalized to a BOOLEAN here — `patrol checkpoint` branches on it, and a
-  // raw 0 from SQLite is truthy in no language anyone should have to remember.
+  // v0.2.9: SQLite stores `guarded` as 0/1, but Seat.guarded is a BOOLEAN — normalize here so
+  // no client has to remember that a raw 0 from the driver is truthy. `lease_file` passes
+  // through as the TEXT/NULL it already is.
   return seats
     .filter((s) => {
       if (pidAlive(s.pid)) return true;
       endSeat(s.id);
       return false;
     })
-    .map((s) => ({ ...s, guarded: !!(s as Seat & { guarded?: number | null }).guarded }));
+    .map((s) => ({ ...s, guarded: !!s.guarded }));
 }
 
 function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {

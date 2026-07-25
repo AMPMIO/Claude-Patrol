@@ -30,14 +30,8 @@ import { mkdtempSync, rmSync, realpathSync, writeFileSync, unlinkSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { brokerPost, BrokerError, resolveSeatTarget, gitRoot } from "./_client.ts";
+import { LEASE_FILE_ENV } from "../../shared/types.ts";
 import type { Worktree, Seat, LeaseWorktreeResponse } from "../../shared/types.ts";
-
-// /list-seats carries both as REAL columns; the frozen Seat contract predates them, so they
-// are read off a widened view rather than by editing shared/types.ts (same as status.ts does
-// for budget_usd). `lease_file` is the path the LAUNCHER put in the seat's LEASE_FILE_ENV —
-// checkpoint cannot read the seat's env, so the broker relaying it is the only way to reach
-// the file the guard hook watches.
-type GuardedSeat = Seat & { guarded?: boolean; lease_file?: string | null };
 
 // A worktree row plus the lease column /worktree-list now joins in (v0.2.9, additive).
 type LeasedWorktree = Worktree & { lease_expires_at?: string | null };
@@ -213,7 +207,7 @@ export default async function checkpoint(args: string[]): Promise<number> {
     // The guard requirement. An UNGUARDED seat has no PreToolUse hook to deny its writes, so
     // no lease can quiesce it and every fence below degrades to the racy detection this
     // release exists to replace. Refuse rather than report a success we cannot stand behind.
-    const seats = await brokerPost<GuardedSeat[]>("/list-seats", { scope: "machine", cwd: process.cwd(), git_root: repo });
+    const seats = await brokerPost<Seat[]>("/list-seats", { scope: "machine", cwd: process.cwd(), git_root: repo });
     const seat = seats.find((s) => s.id === id) ?? null;
     const leaseFilePath = seat?.lease_file ?? null;
     if (!force) {
@@ -227,7 +221,7 @@ export default async function checkpoint(args: string[]): Promise<number> {
       // a guarded label — the one case where proceeding silently would be worst.
       if (!leaseFilePath) {
         console.error(`patrol checkpoint: ${target} reports guarded but the broker has no lease-file path for it, so its guard hook can never see this lease.`);
-        console.error(`  relaunch the seat with a launcher that registers its ${"CLAUDE_PATROL_LEASE_FILE"} path, or pass --force to accept fences-only behavior.`);
+        console.error(`  relaunch the seat so it registers its ${LEASE_FILE_ENV} path, or pass --force to accept fences-only behavior.`);
         return 1;
       }
     }
