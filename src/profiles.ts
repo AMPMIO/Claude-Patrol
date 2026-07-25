@@ -62,18 +62,41 @@ export function buildEnabledPlugins(
   return out;
 }
 
-// The full --settings overlay object (enabledPlugins + raw settings merged
-// last), or null when there is nothing to write (profile=full/none-override
-// AND no raw settings).
+// Tool names the checkpoint guard is matched against — the mutating set. The hook
+// itself inspects neither tool nor path: path/command matching is how the earlier
+// deny-hook earned six proven bypasses (a `cd` defeats it), so matching stops at
+// the tool name and the lease decides the rest. Kept in step with the same matcher
+// in plugin/hooks/hooks.json (that copy guards MANUAL, non-launcher sessions).
+export const GUARD_MATCHER = "Edit|Write|NotebookEdit|Bash";
+
+// The full --settings overlay object. ALWAYS non-null for a Claude seat as of
+// v0.2.9: the overlay is what carries the checkpoint-guard PreToolUse hook, and a
+// seat without it cannot be quiesced — so `patrol checkpoint` would have to refuse
+// it. enabledPlugins/raw settings behave exactly as before; they just no longer
+// decide whether a file gets written. guardHookPath must be ABSOLUTE (a seat's cwd
+// is arbitrary).
 export function buildSettingsOverlay(
   resolved: ResolvedProfile,
   installed: Record<string, boolean>,
-): Record<string, unknown> | null {
+  guardHookPath: string,
+): Record<string, unknown> {
   const enabled = buildEnabledPlugins(resolved.plugins, installed);
-  const hasRaw = Object.keys(resolved.settings).length > 0;
-  if (enabled === null && !hasRaw) return null;
+  // A profile's raw `hooks` is preserved and the guard APPENDED to its PreToolUse
+  // list — replacing it would silently drop a user's hooks, and appending is safe
+  // because a single deny decides the call no matter what the others return.
+  const rawHooks = (resolved.settings.hooks ?? {}) as Record<string, unknown[]>;
   return {
     ...(enabled === null ? {} : { enabledPlugins: enabled }),
     ...resolved.settings,
+    hooks: {
+      ...rawHooks,
+      PreToolUse: [
+        ...(rawHooks.PreToolUse ?? []),
+        {
+          matcher: GUARD_MATCHER,
+          hooks: [{ type: "command", command: `bun "${guardHookPath}"` }],
+        },
+      ],
+    },
   };
 }
