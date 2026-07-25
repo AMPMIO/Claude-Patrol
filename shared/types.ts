@@ -99,7 +99,8 @@ export interface CostRow {
 //   /worktree-add     WorktreeAddRequest     → { ok: true }      (v0.2.6 record a seat→worktree association)
 //   /worktree-list    WorktreeListRequest    → Worktree[]        (v0.2.6 raw array)
 //   /worktree-remove  WorktreeRemoveRequest  → { ok: true }      (v0.2.6 drop the association; git tree untouched)
-//   GET /dashboard    (no auth)              → text/html         (v0.2.5 serves the command-center page)
+//   /dash-token       (full secret only)     → { token: string }  (v0.2.7 mint a scoped read+answer dashboard nonce)
+//   GET /dashboard?t= (valid dash nonce)     → text/html          (v0.2.7: nonce-gated; injects the NONCE, not the secret)
 //   GET /health       (no auth)              → { status: "ok"; seats: number }
 
 // --- v0.2.4: billing source ---
@@ -275,6 +276,7 @@ export interface RegisterRequest {
   seat_token?: string | null; // v0.2 Layer-1 marker token (SEAT_TOKEN_ENV); broker content-matches it to a session
   name?: string | null; // v0.2.4: requested handle; broker slugifies + dedupes it. Falls back to role, then hex.
   budget_usd?: number | null; // v0.2.6: per-seat spend cap; launcher passes SeatSpec.budget_usd through.
+  budget_alert_to?: string | null; // v0.2.7: fleet PatrolConfig.budget_alert_to, so the broker's recipient resolver can honor a configured handle/role (not just the orchestrator default).
 }
 
 // v0.2 Layer 2 (exact attribution for manual seats): a plugin SessionStart
