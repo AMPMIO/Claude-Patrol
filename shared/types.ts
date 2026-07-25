@@ -99,6 +99,8 @@ export interface CostRow {
 //   /worktree-add     WorktreeAddRequest     → { ok: true }      (v0.2.6 record a seat→worktree association)
 //   /worktree-list    WorktreeListRequest    → Worktree[]        (v0.2.6 raw array)
 //   /worktree-remove  WorktreeRemoveRequest  → { ok: true }      (v0.2.6 drop the association; git tree untouched)
+//   /lease-worktree   LeaseWorktreeRequest   → LeaseWorktreeResponse (v0.2.9 quiesce a seat for checkpoint)
+//   /release-worktree ReleaseWorktreeRequest → { ok: true }      (v0.2.9 release it)
 //   /dash-token       (full secret only)     → { token: string }  (v0.2.7 mint a scoped read+answer dashboard nonce)
 //   GET /dashboard?t= (valid dash nonce)     → text/html          (v0.2.7: nonce-gated; injects the NONCE, not the secret)
 //   GET /health       (no auth)              → { status: "ok"; seats: number }
@@ -217,6 +219,36 @@ export interface WorktreeRemoveRequest {
   path: string;
 }
 
+// v0.2.9 checkpoint lease — MUTUAL EXCLUSION, not detection. Three rounds of fences
+// each lost the race to a concurrent writer (a fence after `worktree remove` can't even
+// read the seat's HEAD — the tree is gone). So the seat is quiesced instead: while a
+// lease is held, its PreToolUse guard hook DENIES every mutating tool.
+//
+// The hook's fast path is a FILE, not this route: PreToolUse fires on every tool call,
+// so a broker round-trip per call would tax the whole fleet. The launcher hands each
+// guarded seat a lease path via LEASE_FILE_ENV; the hook just stats it. These routes are
+// the broker's record of who holds what (status/dashboard visibility + expiry sweeping).
+//
+// expires_at is load-bearing: a checkpoint killed between acquire and release must NOT
+// wedge a seat forever, so the hook treats an EXPIRED lease as absent (fail-open on
+// staleness — a wedged seat is worse than a missed fence).
+export const LEASE_FILE_ENV = "CLAUDE_PATROL_LEASE_FILE";
+export const LEASE_TTL_SECONDS = 120; // >> a checkpoint, << a work session
+
+export interface LeaseWorktreeRequest {
+  id: SeatId;
+  path: string; // the worktree being checkpointed (canonical)
+}
+export interface LeaseWorktreeResponse {
+  ok: boolean;
+  expires_at?: string; // ISO; absent when ok:false
+  error?: string; // e.g. the seat is not guarded, or someone else holds the lease
+}
+export interface ReleaseWorktreeRequest {
+  id: SeatId;
+  path: string;
+}
+
 export interface ClaimPortRequest {
   id: SeatId;
   count?: number; // default 1
@@ -277,6 +309,10 @@ export interface RegisterRequest {
   name?: string | null; // v0.2.4: requested handle; broker slugifies + dedupes it. Falls back to role, then hex.
   budget_usd?: number | null; // v0.2.6: per-seat spend cap; launcher passes SeatSpec.budget_usd through.
   budget_alert_to?: string | null; // v0.2.7: fleet PatrolConfig.budget_alert_to, so the broker's recipient resolver can honor a configured handle/role (not just the orchestrator default).
+  // v0.2.9: true when the launcher installed the checkpoint-guard PreToolUse hook, so
+  // this seat's writes can actually be paused. `patrol checkpoint` REFUSES an unguarded
+  // seat (adapter seats, hand-launched sessions) rather than pretend a fence is a lease.
+  guarded?: boolean | null;
 }
 
 // v0.2 Layer 2 (exact attribution for manual seats): a plugin SessionStart
