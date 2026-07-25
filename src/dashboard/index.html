@@ -317,8 +317,10 @@
 </div>
 
 <script>
-  // The broker injects the shared secret here (replaces the placeholder at serve
-  // time); the page sends it in x-patrol-token on every POST. Localhost only.
+  // The broker injects a short-lived SCOPED dashboard nonce here (replaces the
+  // placeholder at serve time — never the full secret); the page sends it in
+  // x-patrol-token on every POST. The nonce is limited to the read set + /answer and
+  // accepted only from a loopback origin, so a leaked page URL can't drive the fleet.
   const TOKEN = "__PATROL_TOKEN__";
   const HEADERS = { "content-type": "application/json", "x-patrol-token": TOKEN };
 

@@ -2,7 +2,9 @@
  * v0.2.5 question inbox + dashboard route. Spins a real broker on an alternate
  * port with a temp DB + secret, then exercises /ask, /questions, /answer (incl.
  * the answer landing back at the asking seat via /poll-messages), the dead-seat
- * reap of open questions, and GET /dashboard (token injection + marker).
+ * reap of open questions, the dead-asker answer guard (v0.2.7 Fix #6), and the
+ * v0.2.7 scoped-nonce dashboard: /dash-token minting, nonce-gated GET /dashboard,
+ * the read+answer scope gate, and the loopback-Origin CSRF guard.
  */
 import { test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -183,12 +185,104 @@ test("a dead seat's OPEN questions are reaped; ANSWERED history survives", async
   expect(survived.answer).toBe("here you go");
 });
 
-test("GET /dashboard returns 200 text/html with a marker and the injected token", async () => {
-  const res = await fetch(`${URL_BASE}/dashboard`); // no token — open like /health
+// --- v0.2.7 Fix #6: answering a DEAD asker's question is refused, question stays open ---
+
+test("answering a question whose asking seat has DIED is rejected; the question stays OPEN", async () => {
+  // A killable child gives a pid that is LIVE at ask time (so /ask succeeds) and DEAD at
+  // answer time. kill + REAP (`await exited`) so the broker's pidAlive reads ESRCH — a
+  // zombie would still read alive. No /unregister and no sweep runs, so the seat row and
+  // its open question linger exactly as they would between a crash and the next sweep.
+  const child = Bun.spawn(["sleep", "120"], { stdio: ["ignore", "ignore", "ignore"] });
+  const reg = await post("/register", { pid: child.pid, cwd: "/tmp/q-crash", git_root: null, tty: null, summary: "crasher", role: "worker", model: null });
+  const seat = ((await reg.json()) as { id: string }).id;
+  const ask = (await (await post("/ask", { id: seat, text: "answer me before I crash" })).json()) as { question_id: number };
+
+  child.kill();
+  await child.exited;
+
+  const ans = await post("/answer", { question_id: ask.question_id, text: "too late?" });
+  expect(ans.status).toBe(200);
+  const body = (await ans.json()) as { ok: boolean; error?: string };
+  expect(body.ok).toBe(false);
+  expect(body.error).toContain("no longer live");
+
+  // NOT marked answered — the question stays open so a live re-ask can still resolve it.
+  const still = (await questions(true)).find((q) => q.id === ask.question_id);
+  expect(still).toBeDefined();
+  expect(still!.answered).toBe(false);
+});
+
+// --- v0.2.7 Fix #1: scoped dashboard nonce (no more leaking the global secret) ---
+
+async function mintDashToken(): Promise<string> {
+  const res = await post("/dash-token", {}); // authed by the REAL secret (default token)
+  expect(res.status).toBe(200);
+  return ((await res.json()) as { token: string }).token;
+}
+
+test("GET /dashboard without a valid nonce is 401 — no HTML, no secret leaked", async () => {
+  for (const url of [`${URL_BASE}/dashboard`, `${URL_BASE}/dashboard?t=bogus-nonce`]) {
+    const res = await fetch(url);
+    expect(res.status).toBe(401);
+    const text = await res.text();
+    expect(text).not.toContain("Patrol Command Center"); // no page served
+    expect(text).not.toContain(TOKEN);                   // and no secret in the body
+  }
+});
+
+test("POST /dash-token mints a nonce; GET /dashboard?t=<nonce> serves the page injecting the NONCE, not the secret", async () => {
+  const nonce = await mintDashToken();
+  expect(nonce.length).toBeGreaterThan(0);
+  expect(nonce).not.toBe(TOKEN); // a scoped nonce, distinct from the full secret
+
+  const res = await fetch(`${URL_BASE}/dashboard?t=${encodeURIComponent(nonce)}`);
   expect(res.status).toBe(200);
   expect(res.headers.get("content-type")).toContain("text/html");
   const html = await res.text();
   expect(html).toContain("Patrol Command Center"); // page marker
-  expect(html).toContain(TOKEN); // secret injected for the page's POSTs
-  expect(html).not.toContain("__PATROL_TOKEN__"); // placeholder was replaced
+  expect(html).toContain(nonce);                   // the NONCE drives the page's POSTs
+  expect(html).not.toContain(TOKEN);               // the full secret NEVER reaches the page
+  expect(html).not.toContain("__PATROL_TOKEN__");  // placeholder replaced
+});
+
+test("a dash-nonce is REJECTED on write routes (/send-message, /unregister), ACCEPTED on /list-seats and /answer", async () => {
+  const seat = await registerSeat({ name: "scope-target" });
+  const ask = (await (await post("/ask", { id: seat, text: "scoped?" })).json()) as { question_id: number };
+  const nonce = await mintDashToken();
+
+  // Write routes reject the nonce (401) — a leaked page token can't act on the fleet.
+  expect((await post("/send-message", { from_id: "cli", to_id: seat, text: "hi" }, nonce)).status).toBe(401);
+  expect((await post("/unregister", { id: seat }, nonce)).status).toBe(401);
+
+  // A read route is accepted...
+  const list = await post("/list-seats", { scope: "machine", cwd: "/", git_root: null }, nonce);
+  expect(list.status).toBe(200);
+  expect(Array.isArray(await list.json())).toBe(true);
+
+  // ...and /answer (the human replying to the inbox) is accepted.
+  const ans = await post("/answer", { question_id: ask.question_id, text: "yes, scoped" }, nonce);
+  expect(ans.status).toBe(200);
+  expect(((await ans.json()) as { ok: boolean }).ok).toBe(true);
+
+  // The full secret still reaches the write routes it always did.
+  expect((await post("/unregister", { id: seat })).status).toBe(200);
+});
+
+test("a dash-nonce from a NON-loopback Origin is refused (CSRF guard); loopback + the CLI secret are unaffected", async () => {
+  const nonce = await mintDashToken();
+  const body = JSON.stringify({ scope: "machine", cwd: "/", git_root: null });
+  const call = (token: string, origin?: string) =>
+    fetch(`${URL_BASE}/list-seats`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-patrol-token": token, ...(origin ? { Origin: origin } : {}) },
+      body,
+    });
+
+  // A cross-site page's Origin => refused even on an allowed route.
+  expect((await call(nonce, "http://evil.example")).status).toBe(401);
+  // The loopback Origin the served page actually sends => accepted.
+  expect((await call(nonce, `http://127.0.0.1:${PORT}`)).status).toBe(200);
+  // The full-secret (CLI) path is NOT subject to the Origin check — no browser Origin,
+  // and an odd one must never lock the operator out.
+  expect((await call(TOKEN, "http://evil.example")).status).toBe(200);
 });

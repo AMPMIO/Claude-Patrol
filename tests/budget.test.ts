@@ -111,6 +111,8 @@ async function registerSeat(opts: {
   role: string;
   session_id?: string;
   budget_usd?: number;
+  name?: string;
+  budget_alert_to?: string;
 }): Promise<string> {
   const res = await post("/register", {
     pid: opts.pid,
@@ -122,6 +124,8 @@ async function registerSeat(opts: {
     model: "opus",
     session_id: opts.session_id ?? null,
     budget_usd: opts.budget_usd ?? null,
+    name: opts.name ?? null,
+    budget_alert_to: opts.budget_alert_to ?? null,
   });
   return ((await res.json()) as { id: string }).id;
 }
@@ -214,6 +218,47 @@ test("a seat with no budget cap never alerts even when it spends", async () => {
   await registerSeat({ pid: liveHold(), cwd, role: "worker", session_id: "budnone" }); // budget_usd omitted
 
   await pollCostVisible("budnone");
+  const { messages } = (await (await post("/poll-messages", { id: orchId })).json()) as { messages: Msg[] };
+  expect(messages.filter((m) => m.from_id === "patrol")).toHaveLength(0);
+});
+
+test("a crossing with NO live recipient does NOT latch — a later tick re-alerts once a recipient is live", async () => {
+  await clearSeats();
+  // NO orchestrator yet: the crossing has nowhere to page. The old code latched here
+  // (budget_alerted=1) and dropped the alert forever; the fix leaves it un-latched.
+  const cwd = "/tmp/bud-relatch";
+  seedCost(cwd, "budrelatch", { i: 4000, o: 0 }); // $0.02 > $0.01 cap
+  const capId = await registerSeat({ pid: liveHold(), cwd, role: "worker", session_id: "budrelatch", budget_usd: 0.01 });
+  const handle = (await listSeats()).find((s) => s.id === capId)!.handle!;
+
+  // The crossing has been indexed AND checked at least once (with no recipient) — proven
+  // by the spend being visible (index -> checkBudgets is one synchronous tick).
+  await pollCostVisible("budrelatch");
+
+  // NOW a recipient appears. Because the earlier tick did NOT latch, a later tick must
+  // still fire the alert to it — the load-bearing assertion of Fix #4.
+  const orchId = await registerSeat({ pid: liveHold(), cwd: "/tmp/bud-orch", role: "orchestrator" });
+  const alerts = await pollForAlert(orchId);
+  expect(alerts).toHaveLength(1);
+  expect(alerts[0]!.text).toBe(`⚠ ${handle} crossed its $0.01 budget — now $0.02`);
+});
+
+test("a configured budget_alert_to recipient receives the alert (winning over the orchestrator default)", async () => {
+  await clearSeats();
+  // Both an orchestrator AND a configured target are live; the alert must go to the
+  // configured handle, proving budget_alert_to wins over the orchestrator default.
+  const orchId = await registerSeat({ pid: liveHold(), cwd: "/tmp/bud-orch", role: "orchestrator" });
+  const copId = await registerSeat({ pid: liveHold(), cwd: "/tmp/bud-cop", role: "watcher", name: "costcop" });
+  const copHandle = (await listSeats()).find((s) => s.id === copId)!.handle!;
+
+  const cwd = "/tmp/bud-config";
+  seedCost(cwd, "budconfig", { i: 4000, o: 0 }); // $0.02 > $0.01 cap
+  await registerSeat({ pid: liveHold(), cwd, role: "worker", session_id: "budconfig", budget_usd: 0.01, budget_alert_to: copHandle });
+
+  const alerts = await pollForAlert(copId);
+  expect(alerts).toHaveLength(1); // the configured recipient got it
+
+  // ...and the orchestrator did NOT (the configured target took precedence).
   const { messages } = (await (await post("/poll-messages", { id: orchId })).json()) as { messages: Msg[] };
   expect(messages.filter((m) => m.from_id === "patrol")).toHaveLength(0);
 });

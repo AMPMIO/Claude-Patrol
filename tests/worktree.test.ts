@@ -274,6 +274,23 @@ describe("/diff (per-seat working diff)", () => {
     }
   });
 
+  test("includes UNTRACKED (new, unstaged) files a seat created — not just tracked changes", async () => {
+    const repo = makeRepo(false); // HEAD exists (f.txt committed); no tracked changes below
+    try {
+      // A brand-new file that was never `git add`ed: absent from `git diff HEAD`, so
+      // without the untracked pass this seat would show "no changes".
+      sh(["sh", "-c", `printf 'UNTRACKED_MARKER\\n' > "${repo}/newfile.txt"`]);
+      const seat = await registerSeat({ cwd: repo, git_root: repo });
+
+      const res = await diffOf(seat);
+      expect(res.truncated).toBe(false);      // one tiny file, well under the cap
+      expect(res.diff).toContain("newfile.txt");     // the untracked path appears
+      expect(res.diff).toContain("UNTRACKED_MARKER"); // and its content
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
   test("a non-repo cwd returns an empty diff, not an error", async () => {
     const notRepo = mkdtempSync(join(tmpdir(), "patrol-nonrepo-"));
     try {
