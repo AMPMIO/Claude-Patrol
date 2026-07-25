@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const HOOK = new URL("../plugin/hooks/reg-session.ts", import.meta.url).pathname;
-const PORT = 17901; // clear of the broker test port (17900)
+const PORT = 17906; // clear of the broker test port (17900)
 
 const dir = mkdtempSync(join(tmpdir(), "patrol-hook-"));
 const SECRET_FILE = join(dir, "secret");

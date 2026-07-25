@@ -24,7 +24,7 @@ import {
 } from "../src/commands/worktree.ts";
 import { checkpointPlan, TRUNK } from "../src/commands/checkpoint.ts";
 
-const PORT = 17902;
+const PORT = 17909;
 const URL_BASE = `http://127.0.0.1:${PORT}`;
 const dir = mkdtempSync(join(tmpdir(), "patrol-worktree-"));
 const SECRET_FILE = join(dir, "secret");

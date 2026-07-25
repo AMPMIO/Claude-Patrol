@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { projectDirName } from "../src/costs.ts";
 
-const PORT = 17901;
+const PORT = 17907;
 const URL_BASE = `http://127.0.0.1:${PORT}`;
 // realpath: macOS tmpdir is a /var → /private/var symlink; the seat process
 // reports its cwd as the realpath, and project-dir encoding must match it

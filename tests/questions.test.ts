@@ -11,7 +11,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const PORT = 17901;
+const PORT = 17908;
 const URL_BASE = `http://127.0.0.1:${PORT}`;
 const dir = mkdtempSync(join(tmpdir(), "patrol-questions-"));
 const SECRET_FILE = join(dir, "secret");
