@@ -129,13 +129,17 @@ export function composeSeat(
   if (plan.backend === "codex") {
     const argv = ["bun", CODEX_SEAT, "--cwd", plan.cwd, "--role", plan.role, "--model", spec.model];
     if (spec.prompt) argv.push("--prompt", spec.prompt);
-    return {
-      argv,
-      env: {
-        CLAUDE_PATROL_ROLE: plan.role,
-        CLAUDE_PATROL_MODEL: spec.model,
-      },
+    const env: Record<string, string> = {
+      CLAUDE_PATROL_ROLE: plan.role,
+      CLAUDE_PATROL_MODEL: spec.model,
     };
+    // v0.2.7 fix: adapter seats DO carry the budget env — without it a mixed fleet
+    // silently launched them uncapped. A codex seat has no Claude session log, so it
+    // never accrues ledger spend and its cap cannot trip today; it is wired anyway so
+    // there is one budget path across backends, not two.
+    if (spec.budget_usd != null) env.CLAUDE_PATROL_BUDGET_USD = String(spec.budget_usd);
+    if (budgetAlertTo != null && budgetAlertTo !== "") env.CLAUDE_PATROL_BUDGET_ALERT_TO = budgetAlertTo;
+    return { argv, env };
   }
 
   // Headless seats are also broker adapter daemons (bun, not `claude` sessions):
@@ -144,13 +148,16 @@ export function composeSeat(
   if (plan.backend === "headless") {
     const argv = ["bun", HEADLESS_SEAT, "--cwd", plan.cwd, "--role", plan.role, "--model", spec.model];
     if (spec.prompt) argv.push("--prompt", spec.prompt);
-    return {
-      argv,
-      env: {
-        CLAUDE_PATROL_ROLE: plan.role,
-        CLAUDE_PATROL_MODEL: spec.model,
-      },
+    const env: Record<string, string> = {
+      CLAUDE_PATROL_ROLE: plan.role,
+      CLAUDE_PATROL_MODEL: spec.model,
     };
+    // v0.2.7 fix: same budget env as every other backend. This is the load-bearing
+    // adapter case — a headless seat spends the Agent-SDK pool and its transcript IS
+    // indexed, so an uncapped headless seat is real uncapped spend.
+    if (spec.budget_usd != null) env.CLAUDE_PATROL_BUDGET_USD = String(spec.budget_usd);
+    if (budgetAlertTo != null && budgetAlertTo !== "") env.CLAUDE_PATROL_BUDGET_ALERT_TO = budgetAlertTo;
+    return { argv, env };
   }
 
   const argv = ["claude", "--model", spec.model, "--name", spec.name];
@@ -208,8 +215,8 @@ export function composeSeat(
   }
   // v0.2.6: carry the per-seat spend cap to the seat-server, which forwards it in
   // /register. An env var (not a new argv flag) keeps composeSeat pure and this change
-  // localized to the existing CLAUDE_PATROL_* block — codex/headless adapter seats
-  // (which bill externally / return early above) are intentionally out of scope.
+  // localized to the existing CLAUDE_PATROL_* block. The codex/headless early returns
+  // above set the same two keys — keep all three blocks in step.
   if (spec.budget_usd != null) env.CLAUDE_PATROL_BUDGET_USD = String(spec.budget_usd);
   // v0.2.7: fleet-wide budget-alert recipient. Same env → seat-server → /register
   // path as budget_usd; the broker's recipient resolver honors a configured

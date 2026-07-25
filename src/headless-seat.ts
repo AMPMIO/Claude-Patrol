@@ -19,6 +19,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { getSecret, TOKEN_HEADER } from "../shared/auth.ts";
 import {
   type BrokerClient,
+  budgetFieldsFromEnv,
   fenceBody,
   genFenceBoundary,
   MAX_SEND_BYTES,
@@ -383,6 +384,9 @@ async function main() {
     // Like codex: no seat_token/session_id at register time. The headless session
     // id is minted per-conversation inside ClaudeSession; the cost indexer attributes
     // its transcript by entrypoint + project scope, and tags it billing_source=agent-sdk.
+    // Because that spend IS indexed, this is the adapter where the cap actually bites —
+    // omitting it left headless seats burning the Agent-SDK pool uncapped.
+    ...budgetFieldsFromEnv(),
   });
   myId = reg.id;
   log(`Registered as seat ${myId} (cwd: ${config.cwd})`);

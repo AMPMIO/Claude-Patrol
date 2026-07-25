@@ -7,7 +7,7 @@
  * the read+answer scope gate, and the loopback-Origin CSRF guard.
  */
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -285,4 +285,25 @@ test("a dash-nonce from a NON-loopback Origin is refused (CSRF guard); loopback 
   // The full-secret (CLI) path is NOT subject to the Origin check — no browser Origin,
   // and an odd one must never lock the operator out.
   expect((await call(TOKEN, "http://evil.example")).status).toBe(200);
+});
+
+// --- dashboard: a failed answer must not read as delivered (Codex re-review #2) ---
+// The page's JS lives inside index.html with no module boundary, so the decision it
+// hinges on is extracted from the served source and evaluated here. If the function is
+// renamed or its shape changes, this test fails loudly rather than silently passing.
+test("answerOutcome treats BOTH failure shapes as failure (non-2xx, and 2xx with ok:false)", () => {
+  const html = readFileSync(new URL("../src/dashboard/index.html", import.meta.url), "utf8");
+  const src = html.match(/function answerOutcome\(status, body\) \{[\s\S]*?\n  \}/);
+  expect(src).not.toBeNull();
+  const answerOutcome = new Function(`${src![0]}; return answerOutcome;`)() as
+    (status: number, body: unknown) => string;
+
+  // Today's shape: the dead-asker guard answers 200 with {ok:false,error}.
+  expect(answerOutcome(200, { ok: false, error: "asker is gone" })).toBe("failure");
+  // The parallel package's shape: the same guard as a non-2xx status.
+  expect(answerOutcome(409, { ok: false, error: "asker is gone" })).toBe("failure");
+  expect(answerOutcome(400, { error: "question_id must be a positive integer" })).toBe("failure");
+  // A non-2xx with an unparseable body is still a failure, not a silent success.
+  expect(answerOutcome(500, null)).toBe("failure");
+  expect(answerOutcome(200, { ok: true })).toBe("success");
 });
