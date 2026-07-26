@@ -25,7 +25,7 @@ import {
   billingSourceFromEntrypoint,
   classifyCacheRebuild,
 } from "./costs.ts";
-import { randomBytes } from "node:crypto";
+import { randomBytes, createHash } from "node:crypto";
 import { SEAT_TOKEN_RE, LEASE_TTL_SECONDS, LEASE_TOKEN_RE } from "../shared/types.ts";
 import type {
   RegisterRequest,
@@ -69,6 +69,7 @@ import type {
   AskResponse,
   QuestionsRequest,
   AnswerRequest,
+  Scope,
   Worktree,
   WorktreeAddRequest,
   WorktreeListRequest,
@@ -109,16 +110,37 @@ const MAX_CLAIM_PATHS = 64;
 // consumer would have its work redelivered underneath it. Overridable so a test can expire a
 // lease without waiting 15 minutes (same pattern as INDEX_INTERVAL_MS).
 //
-// READ THIS BEFORE TRUSTING THE LEASE: it does NOT survive a consumer CRASH. cleanStaleSeats
-// runs every 30s, sees the dead pid, and endSeat() DELETES that seat's undelivered mail long
-// before this 15-minute lease could expire — and a restarted seat registers under a NEW slug,
-// so its old mail is orphaned by to_id anyway. What the lease actually buys in v0.2.3 is
-// narrower and still worth having: a live seat whose notification throws, or whose broker was
-// briefly unreachable, redelivers instead of dropping; and a broker restart mid-flight
-// redelivers. Real consumer-crash recovery needs stable seat identity across restarts, which
-// is v0.3's capability tokens. Do not write crash-survival claims against this code.
+// WHAT THIS LEASE DOES AND DOES NOT COVER. On its own it only rescues a LIVE consumer: one
+// whose notification threw, or whose broker was briefly unreachable, redelivers instead of
+// dropping, and a broker restart mid-flight redelivers. It never rescued a consumer CRASH,
+// because endSeat destroyed the backlog within a sweep and a restarted seat came back under a
+// new slug. v0.3 closes that separately — not by lengthening this lease but by giving the mail
+// somewhere to survive to (ORPHAN_RETENTION_MS) and the returning seat a way to prove it is
+// the same seat (stable_key adoption in handleRegister). The two mechanisms compose: adoption
+// re-points the rows and clears leased_at, so an adopted batch is immediately leasable again.
 const LEASE_TTL_MS = parseInt(process.env.CLAUDE_PATROL_LEASE_TTL_MS ?? String(15 * 60_000), 10);
+// v0.3 crash redelivery. endSeat used to DELETE a dead seat's undelivered mail on the spot,
+// which is the reason the note above says the message lease does not survive a consumer
+// crash. It no longer does: the mail is left ORPHANED (its to_id names a seat that no longer
+// exists) for this long, so a seat that crashes and comes back with the same stable_key can
+// ADOPT it. Past the window the sweep purges it — an orphan nobody reclaimed can never drain,
+// and unbounded retention is just SQLite growth plus phantom rows in /log.
+//
+// 10 minutes: long enough for a tmux relaunch or a `patrol up` re-run, short enough that a
+// seat retired on purpose doesn't leave a queue lying around for the rest of the session.
+// Env-overridable on the INDEX_INTERVAL_MS pattern so a test can expire an orphan instantly.
+const ORPHAN_RETENTION_MS = parseInt(process.env.CLAUDE_PATROL_ORPHAN_RETENTION_MS ?? String(10 * 60_000), 10);
 const BROKER_START = new Date().toISOString();
+
+// v0.3 per-seat capability token: "cps-" + 32 lowercase hex (128 bits of crypto random).
+// Distinct prefix from the two existing token conventions it sits beside — `cp-<8hex>` is the
+// COST-attribution marker (SEAT_TOKEN_RE, a launcher-issued log needle, not a credential) and
+// `cpl-<32hex>` is the per-checkpoint lease token. Neither regex matches this one, so a token
+// presented in the wrong place is refused rather than silently half-accepted.
+//
+// Broker-local by necessity: shared/types.ts is frozen, and clients never need to VALIDATE the
+// shape — they receive an opaque string from /register and echo it in the auth header.
+const SEAT_CAP_TOKEN_RE = /^cps-[0-9a-f]{32}$/;
 
 function log(msg: string) {
   console.error(`[claude-patrol broker] ${msg}`);
@@ -167,7 +189,13 @@ db.run(`
 // own value, never a path derived here: a convention this broker invents that disagrees with
 // the hook's means the hook never fires and the lease buys nothing. NULL => checkpoint
 // treats the seat as unguarded rather than claim it is quiesced when it isn't.
-for (const col of ["role TEXT", "model TEXT", "profile TEXT", "session_id TEXT", "state TEXT", "handle TEXT", "budget_usd REAL", "budget_alerted INTEGER NOT NULL DEFAULT 0", "budget_alert_to TEXT", "guarded INTEGER", "lease_file TEXT"]) {
+//
+// v0.3 adds `fleet` (which fleet this seat launched into; NULL = the default fleet, which is
+// also what every pre-0.3 row reads as) and `stable_key` (fleet + seat name, unchanged across
+// a crash and relaunch — the handle a returning seat presents to re-claim its prior identity).
+// Handle uniqueness is enforced PER FLEET from here on, so two projects may each run a
+// `builder`; `fleet IS ?` (not `= ?`) is what keeps that null-safe for default-fleet rows.
+for (const col of ["role TEXT", "model TEXT", "profile TEXT", "session_id TEXT", "state TEXT", "handle TEXT", "budget_usd REAL", "budget_alerted INTEGER NOT NULL DEFAULT 0", "budget_alert_to TEXT", "guarded INTEGER", "lease_file TEXT", "fleet TEXT", "stable_key TEXT"]) {
   try {
     db.run(`ALTER TABLE seats ADD COLUMN ${col}`);
   } catch {
@@ -209,13 +237,39 @@ db.run(`CREATE INDEX IF NOT EXISTS idx_seat_runs_ended ON seat_runs(ended_at)`);
 
 // Additive: which attribution layer bound this run's session_id (v0.2 telemetry).
 // Written only when a binding is established; NULL until (and if) that happens.
-for (const col of ["bound_via TEXT"]) {
+//
+// v0.3 `fleet` + `stable_key`: the crash-redelivery lookup runs against seat_runs, NOT seats,
+// precisely because the seats row is GONE by the time a crashed seat comes back — a run row
+// outlives dereg (that is why it exists) and is therefore the only durable record of "which
+// seat id was `builder` in fleet `web` a minute ago". Adoption matches on (fleet, stable_key)
+// and the run's ended_at, so a returning seat can find the identity it left behind.
+for (const col of ["bound_via TEXT", "fleet TEXT", "stable_key TEXT"]) {
   try {
     db.run(`ALTER TABLE seat_runs ADD COLUMN ${col}`);
   } catch {
     // column already exists
   }
 }
+db.run(`CREATE INDEX IF NOT EXISTS idx_seat_runs_stable ON seat_runs(stable_key, ended_at)`);
+
+// v0.3 capability tokens. The credential a seat presents to prove it IS the seat it claims to
+// be in `body.id`. STORED HASHED, never in the clear: this db is a file on disk that several
+// tooling paths already read, and a plaintext column here would turn it into a credential
+// store — a reader of the db could then act as any seat, which is the entire hole being
+// closed. SHA-256 with no salt/stretching is the right primitive: the token is 128 bits of
+// crypto random, so there is no dictionary to mount and nothing for a KDF to slow down; a
+// per-row salt would only forbid the O(1) primary-key lookup this needs on every request.
+//
+// Keyed by the HASH so resolution is one indexed lookup of hash(presented) — the broker never
+// holds a table of live tokens to leak, and a mismatch simply finds no row.
+db.run(`
+  CREATE TABLE IF NOT EXISTS seat_tokens (
+    token_hash TEXT PRIMARY KEY,
+    seat_id TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  )
+`);
+db.run(`CREATE INDEX IF NOT EXISTS idx_seat_tokens_seat ON seat_tokens(seat_id)`);
 
 // v0.2.3 lease/ack. Additive, same try/catch pattern: an existing db keeps its rows,
 // and leased_at NULL reads as "never leased", which is exactly right for them.
@@ -459,16 +513,32 @@ function pidAlive(pid: number): boolean {
 // /list-seats, explicit /unregister). ONE definition so no removal path can
 // forget a step: bound the run FIRST (keeps the row + its token->session binding
 // for the /costs overlap join, so a killed seat's spend still attributes), then
-// purge its undelivered mail (a dead seat's queue can never drain — those rows
-// only bloat SQLite and orphan the run in every future stats window), then drop
-// the live row. Uses inline SQL, not the prepared statements below, because it
+// drop the live row. Uses inline SQL, not the prepared statements below, because it
 // runs during module init (cleanStaleSeats) before those are declared.
+//
+// v0.3: the undelivered-mail purge is now CONDITIONAL on whether that mail can ever be
+// reclaimed. Unconditional deletion here is what made consumer-crash redelivery impossible —
+// the sweep saw the dead pid and destroyed the backlog within 30s, long before a restart could
+// come back for it. But retention is only worth its cost for a seat that can prove it is the
+// same seat later:
+//   stable_key NULL  -> nothing can ever adopt this queue, so purge it now, exactly as before.
+//                       Every pre-0.3 seat and every hand-launched one is in this branch, so
+//                       the old behaviour is not merely preserved for them, it is the default.
+//   stable_key set   -> leave the rows ORPHANED (their to_id names a seat row that is gone) for
+//                       the returning seat to adopt; cleanStaleSeats purges them once
+//                       ORPHAN_RETENTION_MS has passed and no one came back.
+// Everything else here still reaps immediately: a port, a path, a worktree row or a checkpoint
+// lease held by a ghost is a resource nobody can free, not work somebody can finish.
 function endSeat(seatId: string) {
+  const seat = db.query("SELECT stable_key FROM seats WHERE id = ?").get(seatId) as { stable_key: string | null } | null;
   db.run("UPDATE seat_runs SET ended_at = ? WHERE seat_id = ? AND ended_at IS NULL", [
     new Date().toISOString(),
     seatId,
   ]);
-  db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [seatId]);
+  if (!seat?.stable_key) db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [seatId]);
+  // Revoke the capability token with the seat. A token outliving its holder would authorize a
+  // dead seat's id forever — and an ADOPTING seat is issued a fresh one, so nothing needs it.
+  db.run("DELETE FROM seat_tokens WHERE seat_id = ?", [seatId]);
   // Checklist #2/#4: reap the seat's resource claims HERE, the one removal path all
   // three reap triggers (stale sweep, list-seats lazy drop, unregister) funnel
   // through — so a port/path claim can never outlive its holder (a port allocated
@@ -499,12 +569,25 @@ function cleanStaleSeats() {
   }
   const cutoff = new Date(Date.now() - 7 * 86_400_000).toISOString();
   db.run("DELETE FROM messages WHERE delivered = 1 AND sent_at < ?", [cutoff]);
+  // v0.3 orphan purge — the retention half of crash redelivery. endSeat leaves a stable-keyed
+  // seat's undelivered mail behind so a restart can adopt it; this is what stops that from
+  // being a leak. An orphan is undelivered mail whose to_id has no live seat row AND no
+  // run that is either still open or ended inside the window. The double NOT IN is what makes
+  // it safe: a seat mid-register (row written, run open) is never a purge candidate, and mail
+  // addressed to an id that never had a run at all — legacy rows, a bad to_id — is
+  // unrecoverable by anyone and goes on the first pass.
+  db.run(
+    `DELETE FROM messages
+      WHERE delivered = 0
+        AND to_id NOT IN (SELECT id FROM seats)
+        AND to_id NOT IN (SELECT seat_id FROM seat_runs WHERE ended_at IS NULL OR ended_at > ?)`,
+    [new Date(Date.now() - ORPHAN_RETENTION_MS).toISOString()]
+  );
   // Release leases a live seat never settled (its notification threw, or the broker was
   // briefly unreachable), so the message is offered again rather than sitting leased forever.
   // The poll itself also treats an expired lease as leasable, so this is belt-and-braces.
-  // NOTE: this does NOT rescue a CRASHED consumer's mail — endSeat() above already deleted a
-  // dead seat's undelivered rows on this same pass, and a restarted seat gets a new id. See
-  // LEASE_TTL_MS.
+  // A CRASHED consumer's mail is handled elsewhere: it survives above as an orphan and is
+  // re-pointed by stable_key adoption at register. See LEASE_TTL_MS.
   db.run("UPDATE messages SET leased_at = NULL WHERE delivered = 0 AND leased_at IS NOT NULL AND leased_at <= ?", [
     new Date(Date.now() - LEASE_TTL_MS).toISOString(),
   ]);
@@ -514,23 +597,33 @@ function cleanStaleSeats() {
   db.run("DELETE FROM checkpoint_leases WHERE expires_at <= ?", [new Date().toISOString()]);
 }
 
+// 30s in production. Overridable on the same pattern as INDEX_INTERVAL_MS/LEASE_TTL_MS: the
+// orphan purge above lives ONLY on this timer (handleListSeats reaps dead seats but never
+// sweeps orphans), so without a knob the retention half of crash redelivery has no test that
+// doesn't sleep half a minute.
+const SWEEP_INTERVAL_MS = parseInt(process.env.CLAUDE_PATROL_SWEEP_INTERVAL_MS ?? "30000", 10);
 cleanStaleSeats();
-setInterval(cleanStaleSeats, 30_000);
+setInterval(cleanStaleSeats, SWEEP_INTERVAL_MS);
 
 // --- Prepared statements ---
 
 const insertSeat = db.prepare(`
-  INSERT INTO seats (id, pid, cwd, git_root, tty, summary, role, model, profile, session_id, registered_at, last_seen, handle, budget_usd, budget_alert_to, guarded, lease_file)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO seats (id, pid, cwd, git_root, tty, summary, role, model, profile, session_id, registered_at, last_seen, handle, budget_usd, budget_alert_to, guarded, lease_file, fleet, stable_key)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 const updateLastSeen = db.prepare(`UPDATE seats SET last_seen = ? WHERE id = ?`);
 const updateSummary = db.prepare(`UPDATE seats SET summary = ? WHERE id = ?`);
 const updateState = db.prepare(`UPDATE seats SET state = ? WHERE id = ?`);
 const updateHandle = db.prepare(`UPDATE seats SET handle = ? WHERE id = ?`);
 const insertSeatRun = db.prepare(`
-  INSERT INTO seat_runs (seat_id, session_id, seat_token, cwd, role, model, profile, registered_at, ended_at, bound_via)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+  INSERT INTO seat_runs (seat_id, session_id, seat_token, cwd, role, model, profile, registered_at, ended_at, bound_via, fleet, stable_key)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
 `);
+// v0.3 capability tokens. Insert stores the HASH; resolution looks the hash up. There is no
+// statement anywhere that reads a token back — the broker cannot produce one after /register
+// even if asked, which is the property "stored hashed" is bought for.
+const insertSeatToken = db.prepare(`INSERT INTO seat_tokens (token_hash, seat_id, created_at) VALUES (?, ?, ?)`);
+const selectSeatByTokenHash = db.prepare(`SELECT seat_id FROM seat_tokens WHERE token_hash = ?`);
 const insertDelivery = db.prepare(`INSERT INTO delivery_log (to_id, batch_size, delivered_at) VALUES (?, ?, ?)`);
 const upsertLedger = db.prepare(`
   INSERT INTO cost_ledger (session_id, attr_session_id, model, bucket_ts, input, output, cache_write, cache_read, billing_source, cache_rebuilds, cache_rebuild_tokens)
@@ -698,10 +791,19 @@ function looksLikeSeatId(s: string): boolean {
   return /^[a-z0-9]{8}$/.test(s);
 }
 
-// A handle is "taken" only if a LIVE seat OTHER than excludeId holds it — dead
-// seats free their handle (and it's reaped from the row on endSeat anyway).
-function handleTaken(handle: string, excludeId: string): boolean {
-  const rows = db.query("SELECT pid FROM seats WHERE handle = ? AND id != ?").all(handle, excludeId) as { pid: number }[];
+// A handle is "taken" only if a LIVE seat OTHER than excludeId holds it IN THE SAME FLEET —
+// dead seats free their handle (and it's reaped from the row on endSeat anyway).
+//
+// v0.3: the fleet term is the change. Uniqueness used to be machine-wide, so the second
+// project to launch a `builder` got `builder-<proj>` and every briefing, doc and muscle-memory
+// `patrol send builder` in that project silently addressed the wrong shape. A fleet IS the
+// handle namespace now. `fleet IS ?` rather than `= ?`: NULL is the default fleet and a
+// SQL `=` never matches it, which would make the default fleet's handles unique against
+// nothing at all.
+function handleTaken(handle: string, excludeId: string, fleet: string | null): boolean {
+  const rows = db
+    .query("SELECT pid FROM seats WHERE handle = ? AND id != ? AND fleet IS ?")
+    .all(handle, excludeId, fleet) as { pid: number }[];
   return rows.some((r) => pidAlive(r.pid));
 }
 
@@ -714,16 +816,98 @@ function handleTaken(handle: string, excludeId: string): boolean {
 //                   never routes to the wrong seat, it just reads less prettily).
 // The suffixed forms all contain a dash, so they can never be 8-pure-alnum — only
 // the bare `base` could collide with the id space, so that's the branch we guard.
-function assignHandle(baseName: string | null | undefined, ownId: string, gitRoot: string | null, cwd: string): string {
+//
+// v0.3: every step now dedupes WITHIN `fleet`. The project-prefix rung therefore stops firing
+// for the common case it was invented for (two projects, one `builder`) — those are different
+// fleets and both keep the bare name. It stays as the collision fallback for a genuine clash
+// INSIDE one fleet, which is the case it actually disambiguates.
+function assignHandle(
+  baseName: string | null | undefined,
+  ownId: string,
+  gitRoot: string | null,
+  cwd: string,
+  fleet: string | null
+): string {
   const base = slug(baseName);
-  if (!looksLikeSeatId(base) && !handleTaken(base, ownId)) return base;
+  if (!looksLikeSeatId(base) && !handleTaken(base, ownId, fleet)) return base;
   const proj = slug(basename(gitRoot || cwd)).slice(0, 8).replace(/-+$/g, "") || "seat";
   const withProj = `${base}-${proj}`;
-  if (!handleTaken(withProj, ownId)) return withProj;
+  if (!handleTaken(withProj, ownId, fleet)) return withProj;
   return `${base}-${ownId.slice(0, 4)}`;
 }
 
+// --- v0.3 capability tokens ---
+
+// "cps-" + 32 lowercase hex, verified against SEAT_CAP_TOKEN_RE before it leaves the broker —
+// same discipline as genLeaseToken: a drift in the generator must fail HERE, not silently ship
+// a token the resolver will never match again.
+function genSeatCapToken(): string {
+  const token = "cps-" + randomBytes(16).toString("hex");
+  if (!SEAT_CAP_TOKEN_RE.test(token)) throw new Error(`bug: generated malformed seat token "${token}"`);
+  return token;
+}
+
+// The one place a token becomes a stored value. Used on mint and on every resolution, so the
+// two can never disagree about the encoding.
+function hashToken(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
 // --- Handlers ---
+
+// v0.3 crash redelivery. A seat that comes back after a crash presents the SAME stable_key
+// (fleet + seat name; the launcher owns its construction) and re-claims the mail its previous
+// incarnation never acked. Returns the prior seat id to adopt, or null.
+//
+// THE ABUSE GUARD IS THE WHOLE FEATURE'S SAFETY. stable_key is not a secret — a seat name and
+// a fleet name are both public — so adoption must never be a way to STEAL a queue. Two rules
+// make it a resurrection primitive rather than a hijack primitive:
+//   1. A key held by a LIVE seat is never adoptable. Checked by pid, not by row presence: a
+//      seat whose row lingers between its death and the next sweep must still be adoptable,
+//      while a seat that is genuinely running must not. So an attacker registering with a
+//      victim's stable_key while the victim runs gets a fresh, empty identity.
+//   2. Only within the SAME fleet, and only inside ORPHAN_RETENTION_MS. A stale key from
+//      yesterday resolves to nothing, and `builder` in fleet `web` can never adopt `builder`
+//      in fleet `api`.
+// Ordered by ended_at DESC so a seat that crashed and restarted several times adopts its most
+// recent incarnation, not an ancient one.
+function findAdoptableSeat(stableKey: string, fleet: string | null, nowMs: number): string | null {
+  const liveHolder = (
+    db.query("SELECT pid FROM seats WHERE stable_key = ? AND fleet IS ?").all(stableKey, fleet) as { pid: number }[]
+  ).some((r) => pidAlive(r.pid));
+  if (liveHolder) return null; // guard 1: the key's owner is still running
+
+  const cutoff = new Date(nowMs - ORPHAN_RETENTION_MS).toISOString();
+  const candidates = db
+    .query(
+      `SELECT seat_id FROM seat_runs
+        WHERE stable_key = ? AND fleet IS ? AND ended_at IS NOT NULL AND ended_at > ?
+        ORDER BY ended_at DESC`
+    )
+    .all(stableKey, fleet, cutoff) as { seat_id: string }[];
+  for (const c of candidates) {
+    // Belt-and-braces on guard 1: a run may be ended while a NEWER row under the same id is
+    // live (re-register churn). Never adopt an id something is currently answering as.
+    const row = db.query("SELECT pid FROM seats WHERE id = ?").get(c.seat_id) as { pid: number } | null;
+    if (row && pidAlive(row.pid)) continue;
+    return c.seat_id;
+  }
+  return null;
+}
+
+// Re-point the adopted identity's UNACKED mail (undelivered — leased-but-unacked rows included,
+// since a lease is not a delivery) at the new seat id. leased_at is cleared so the batch is
+// immediately leasable rather than waiting out a lease taken by the process that died holding
+// it. delivery_attempts is deliberately NOT reset: it is the dead-letter counter, and a seat
+// crash-looping on the same poison batch must still stop at MAX_DELIVERY_ATTEMPTS instead of
+// waking (and billing) itself forever. A batch leased once before the crash is at 1, so the
+// ordinary case redelivers with room to spare.
+function adoptMail(fromId: string, toId: string): number {
+  return db.run("UPDATE messages SET to_id = ?, leased_at = NULL WHERE to_id = ? AND delivered = 0", [
+    toId,
+    fromId,
+  ]).changes;
+}
 
 function handleRegister(body: RegisterRequest): RegisterResponse {
   const id = generateId();
@@ -750,10 +934,13 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     }
   }
 
-  // Readable handle, deduped among live seats. Base is the requested name, else the
-  // role, else "seat". Computed AFTER the same-pid endSeat above, so a re-register
-  // doesn't collide with the row it just retired.
-  const handle = assignHandle(body.name ?? body.role, id, body.git_root, body.cwd);
+  const fleet = body.fleet ?? null;
+  const stableKey = body.stable_key ?? null;
+
+  // Readable handle, deduped among live seats IN THIS FLEET. Base is the requested name, else
+  // the role, else "seat". Computed AFTER the same-pid endSeat above, so a re-register doesn't
+  // collide with the row it just retired.
+  const handle = assignHandle(body.name ?? body.role, id, body.git_root, body.cwd, fleet);
 
   insertSeat.run(
     id, body.pid, body.cwd, body.git_root, body.tty, body.summary,
@@ -763,7 +950,8 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     // checkpoint refuses an unguarded seat rather than assume it can be quiesced.
     body.guarded ? 1 : 0,
     // Stored verbatim — the SEAT owns this path (it is what it was handed in LEASE_FILE_ENV).
-    body.lease_file ?? null
+    body.lease_file ?? null,
+    fleet, stableKey
   );
 
   // Durable run row (survives dereg). session_id is the env-override/guarded
@@ -774,11 +962,40 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     id, sessionId, seatToken, body.cwd,
     body.role ?? null, body.model ?? null, body.profile ?? null, now,
     // session_id present at register-time == the env/session_id fast path bound it.
-    sessionId ? "env" : null
+    sessionId ? "env" : null,
+    fleet, stableKey
   );
 
-  return rejected ? { id, session_id_rejected: true } : { id };
+  // v0.3 crash redelivery. Runs AFTER the new row exists so the adopted mail is never
+  // momentarily addressed to an id with no seat (a concurrent sweep would read that as an
+  // orphan). The seat row this adopts from is already gone — endSeat retired it, here or on an
+  // earlier sweep — so nothing is taken from a running seat; see findAdoptableSeat's guards.
+  if (stableKey) {
+    const prior = findAdoptableSeat(stableKey, fleet, Date.parse(now));
+    if (prior) {
+      const n = adoptMail(prior, id);
+      if (n > 0) log(`seat ${id} adopted ${n} unacked message(s) from ${prior} via stable_key ${stableKey}`);
+    }
+  }
+
+  // Mint the capability token LAST: only a seat that fully registered gets a credential.
+  // Returned once, in this response, and stored only as a hash — the broker cannot re-issue or
+  // reveal it afterwards, so a seat that loses it re-registers.
+  const capToken = genSeatCapToken();
+  insertSeatToken.run(hashToken(capToken), id, now);
+
+  const res: RegisterResponse = { id, seat_token: capToken };
+  if (rejected) res.session_id_rejected = true;
+  return res;
 }
+
+// The whole of /register is check-then-write several times over — the same-pid retirement, the
+// session_id uniqueness guard, handle dedupe, and the adoption lookup all read state they then
+// depend on. ONE transaction (the broker's standing idiom, as in claimBatch and answerTxn), and
+// the handler stays SYNCHRONOUS so no await can interleave two registers between a check and
+// its write. Two seats racing the same stable_key would otherwise both read "adoptable" and
+// both re-point the same rows.
+const registerTxn = db.transaction((body: RegisterRequest): RegisterResponse => handleRegister(body));
 
 function handleListSeats(body: ListSeatsRequest): Seat[] {
   let seats: Seat[];
@@ -794,6 +1011,15 @@ function handleListSeats(body: ListSeatsRequest): Seat[] {
     case "machine":
     default:
       seats = selectAllSeats.all() as Seat[];
+  }
+  // v0.3 fleet filter. The KEY's presence is the switch, not its value: absent (the dashboard,
+  // which wants every project at once) returns all fleets, while an explicit `null` means the
+  // DEFAULT fleet — pre-0.3 seats and any launch without a configured fleet name. JSON.stringify
+  // drops undefined, so a client passing an unset variable lands on "absent" and gets the old
+  // machine-wide behaviour unchanged; only a caller that deliberately sends the key filters.
+  if ("fleet" in body) {
+    const want = body.fleet ?? null;
+    seats = seats.filter((s) => (s.fleet ?? null) === want);
   }
   if (body.exclude_id) seats = seats.filter((s) => s.id !== body.exclude_id);
   // Drop seats whose process has died since last cleanup tick. Full retirement
@@ -924,9 +1150,11 @@ async function handleWaitFor(body: WaitForRequest): Promise<WaitForResponse> {
 // Owner-scoped by body.id — same trust model as /set-state (the v0.3 capability-token
 // gate covers spoofing later; the existing pattern is not re-invented here).
 function handleRename(body: RenameRequest): RenameResponse | { ok: false; error: string } {
-  const seat = db.query("SELECT pid, cwd, git_root FROM seats WHERE id = ?").get(body.id) as { pid: number; cwd: string; git_root: string | null } | null;
+  const seat = db.query("SELECT pid, cwd, git_root, fleet FROM seats WHERE id = ?").get(body.id) as { pid: number; cwd: string; git_root: string | null; fleet: string | null } | null;
   if (!seat || !pidAlive(seat.pid)) return { ok: false, error: `${body.id} is not a live seat` };
-  const handle = assignHandle(body.name, body.id, seat.git_root, seat.cwd);
+  // Deduped against the seat's OWN fleet — a rename must not be blocked by, or collide with,
+  // a handle another project happens to be using.
+  const handle = assignHandle(body.name, body.id, seat.git_root, seat.cwd, seat.fleet);
   updateHandle.run(handle, body.id);
   return { ok: true, handle };
 }
@@ -1703,9 +1931,17 @@ const alertTxn = db.transaction((seatId: string, recipientId: string, text: stri
 // no live seat, fall back to the contract DEFAULT recipient — the live seat whose role
 // is "orchestrator". Returns a live seat id, or null when nothing resolves (caller
 // no-ops + logs, and MUST NOT latch — a later tick retries once a recipient is live).
-function resolveAlertRecipient(target: string | null): string | null {
+//
+// v0.3: resolution is FLEET-SCOPED. This is the one message-routing helper that resolves a
+// human-readable name (a handle or a role) rather than an id, so it is the one place two
+// fleets can leak into each other: with handles unique only per fleet, a machine-wide lookup
+// for "orchestrator" would page whichever project's orchestrator happened to register first —
+// another fleet's operator receiving a budget alert about a seat they have never heard of, and
+// the owning fleet never hearing it. Everything else that routes (send-message, claims,
+// worktrees) is keyed by the globally-unique seat id and cannot cross fleets by construction.
+function resolveAlertRecipient(target: string | null, fleet: string | null): string | null {
   const live = (
-    db.query("SELECT id, pid, handle, role FROM seats").all() as {
+    db.query("SELECT id, pid, handle, role FROM seats WHERE fleet IS ?").all(fleet) as {
       id: string; pid: number; handle: string | null; role: string | null;
     }[]
   ).filter((s) => pidAlive(s.pid));
@@ -1729,8 +1965,8 @@ function resolveAlertRecipient(target: string | null): string | null {
 // must NEVER throw inside the index tick and starve indexing.
 function checkBudgets() {
   const capped = db.query(
-    "SELECT id, handle, role, budget_usd, budget_alert_to FROM seats WHERE budget_usd IS NOT NULL AND budget_alerted = 0"
-  ).all() as { id: string; handle: string | null; role: string | null; budget_usd: number; budget_alert_to: string | null }[];
+    "SELECT id, handle, role, budget_usd, budget_alert_to, fleet FROM seats WHERE budget_usd IS NOT NULL AND budget_alerted = 0"
+  ).all() as { id: string; handle: string | null; role: string | null; budget_usd: number; budget_alert_to: string | null; fleet: string | null }[];
   if (capped.length === 0) return;
 
   const { tallies, seatBySession } = readLedgerWindow({});
@@ -1747,7 +1983,7 @@ function checkBudgets() {
     if (spend < seat.budget_usd) continue;
     const handle = seat.handle ?? seat.id;
     const text = `⚠ ${handle} crossed its $${seat.budget_usd} budget — now $${spend.toFixed(2)}`;
-    const recipient = resolveAlertRecipient(seat.budget_alert_to); // configured handle/role wins; else orchestrator default
+    const recipient = resolveAlertRecipient(seat.budget_alert_to, seat.fleet); // configured handle/role wins; else orchestrator default — within the spending seat's own fleet
     if (!recipient) {
       // Do NOT latch: a crossing with no live recipient is retried next tick (once an
       // orchestrator/configured seat is live it alerts) instead of being dropped forever.
@@ -2109,6 +2345,25 @@ export function validate(path: string, body: unknown): string | null {
       if (!isOptStr(b.budget_alert_to, MAX_LABEL)) return "budget_alert_to too long or not a string";
       if (b.guarded != null && typeof b.guarded !== "boolean") return "guarded must be a boolean";
       if (!isOptStr(b.lease_file, MAX_PATH)) return "lease_file too long or not a string";
+      // v0.3. Both are bounded labels, not free text: `fleet` is a namespace key compared with
+      // `IS` on every handle check, and `stable_key` is the adoption lookup key. An unbounded
+      // string in either is a row an attacker sizes at will on an unauthenticated-by-seat route.
+      if (!isOptStr(b.fleet, MAX_LABEL)) return "fleet too long or not a string";
+      if (!isOptStr(b.stable_key, MAX_LABEL)) return "stable_key too long or not a string";
+      return null;
+    case "/list-seats":
+      // v0.3: previously unvalidated (it fell through to the permissive default). The fleet
+      // filter is a new query term, so the route gets a case. Deliberately tolerant of what
+      // was already accepted — scope/cwd/git_root are checked for SHAPE only, since every
+      // existing caller sends all three and the handler already defaults an unknown scope to
+      // "machine". `fleet` is checked for presence-vs-null in the handler, not here: null is
+      // meaningful (the default fleet), so it must survive validation.
+      if (b.scope != null && !["machine", "directory", "repo"].includes(b.scope as string))
+        return "scope must be machine|directory|repo";
+      if (!isOptStr(b.cwd, MAX_PATH)) return "cwd too long or not a string";
+      if (!isOptStr(b.git_root, MAX_PATH)) return "git_root too long or not a string";
+      if (b.exclude_id != null && !isSlug(b.exclude_id)) return "exclude_id must be an 8-char [a-z0-9] slug";
+      if (!isOptStr(b.fleet, MAX_LABEL)) return "fleet too long or not a string";
       return null;
     case "/heartbeat":
     case "/poll-messages":
@@ -2266,6 +2521,90 @@ const dashTokens = new Map<string, number>(); // nonce -> expiry epoch ms
 // worktree, set-state, rename, ack, ...) rejects a nonce, so a leaked one can't act.
 const DASH_ALLOWED = new Set(["/list-seats", "/log", "/stats", "/costs", "/questions", "/diff", "/answer"]);
 
+// --- v0.3 seat capability scope ---
+//
+// THE FINDING THIS CLOSES. Every route below took the seat it acts on from `body.id` and
+// believed it. The shared secret is machine-wide, so ANY holder — a rogue local process, or
+// one seat reaching outside its lane — could set another seat's state, ack its mail out from
+// under it, release its path claims, drop its worktree association, or burn ports charged to
+// it. `body.id` stops being an assertion here: a request at `seat` scope is only ever about
+// the seat its token was minted for.
+//
+// Value = the body field naming the seat acted upon. It is `id` everywhere (the frozen request
+// types all use that name); the map exists so a route added later has to state its subject
+// rather than inherit a default.
+//
+// /rename is in this table though the v0.3 brief's list omits it: it is `id`-keyed
+// self-mutation of exactly the /set-state shape, and leaving it out would let a token-bearing
+// seat rename any other seat — a real capability (handles are how humans and `patrol send`
+// address seats) and an odd one to leave open while closing /set-summary.
+const SEAT_OWNED: Record<string, string> = {
+  "/heartbeat": "id",
+  "/poll-messages": "id",
+  "/ack": "id",
+  "/set-state": "id",
+  "/set-summary": "id",
+  "/rename": "id",
+  "/claim-port": "id",
+  "/claim-path": "id",
+  "/release-claims": "id",
+  "/worktree-add": "id",
+  "/worktree-remove": "id",
+  "/lease-worktree": "id",
+  "/release-worktree": "id",
+  "/ask": "id",
+  "/unregister": "id",
+};
+
+// Routes a seat token may reach that are NOT about one seat's own row. Fleet-visibility reads
+// (a seat has to be able to see its teammates and their state) plus /send-message, whose
+// `from_id` IS an identity assertion and is checked below against the token's seat — a seat
+// can talk, but only ever as itself. Everything absent from BOTH tables is refused at `seat`
+// scope: /register (a seat has no token until it has registered), /dash-token (minting a
+// second credential class), /answer (the human's reply channel), /observe-session (a hook's
+// binding), /costs and /stats (fleet-wide spend is the operator's view). Default-deny is the
+// point — a route added later is closed to seats until someone decides otherwise.
+const SEAT_SHARED = new Set(["/send-message", "/list-seats", "/wait-for", "/worktree-list", "/list-claims", "/questions", "/log", "/diff"]);
+
+// Which seat, if any, this request acts on — the value the token's seat must equal. Returns
+// undefined for a route with no single subject (the SEAT_SHARED set), which the caller reads
+// as "no identity check needed beyond the route allowlist".
+//
+// /unregister is the one route whose subject may arrive as a PID instead of an id (the
+// SessionEnd hook knows only its $PPID), so it is resolved the same way the handler resolves
+// it. A pid that matches no seat yields null — an id nothing can equal — so a seat token can
+// never dereg another seat by guessing pids.
+function seatSubject(path: string, b: Record<string, unknown>): string | null | undefined {
+  if (path === "/unregister") {
+    if (typeof b.id === "string") return b.id;
+    const row = db.query("SELECT id FROM seats WHERE pid = ?").get(b.pid as number) as { id: string } | null;
+    return row?.id ?? null;
+  }
+  if (path === "/send-message") return b.from_id === "cli" ? null : (b.from_id as string);
+  const field = SEAT_OWNED[path];
+  if (field === undefined) return undefined;
+  const v = b[field];
+  return typeof v === "string" ? v : null;
+}
+
+// Resolve a presented token to a scope ONCE per request, generalizing the v0.2.7 dash gate
+// (which already did exactly this for full|dash|none). Order is deliberate: the operator's
+// secret first, so nothing about seat tokens can change what the human can do; then a seat
+// capability token, which carries WHICH seat; then a dash nonce.
+//
+// The lookup is by hash, so a presented value that is not a live token simply finds no row.
+// The shape pre-check is a cheap filter, not a security boundary — it keeps every stray header
+// value off the db.
+function resolveScope(presented: string | null): { scope: Scope; seatId?: string } {
+  if (presented === SECRET) return { scope: "full" };
+  if (presented && SEAT_CAP_TOKEN_RE.test(presented)) {
+    const row = selectSeatByTokenHash.get(hashToken(presented)) as { seat_id: string } | null;
+    if (row) return { scope: "seat", seatId: row.seat_id };
+  }
+  if (dashTokenValid(presented)) return { scope: "dash" };
+  return { scope: "none" };
+}
+
 function mintDashToken(): string {
   const now = Date.now();
   for (const [tok, exp] of dashTokens) if (exp <= now) dashTokens.delete(tok); // lazy prune
@@ -2336,15 +2675,15 @@ Bun.serve({
     }
 
     // Resolve the presented token to a scope ONCE. `full` = the real secret (CLI, full
-    // access, unchanged). `dash` = a live dashboard nonce (read set + /answer only, and
-    // loopback-only). `none` = neither -> 401.
+    // access, unchanged — a seat that presents no capability token still works exactly as
+    // before). `seat` = a capability token, carrying WHICH seat. `dash` = a live dashboard
+    // nonce (read set + /answer only, and loopback-only). `none` = -> 401.
     const presented = req.headers.get(TOKEN_HEADER);
-    const scope: "full" | "dash" | "none" =
-      presented === SECRET ? "full" : dashTokenValid(presented) ? "dash" : "none";
-    if (scope === "none") {
+    const auth = resolveScope(presented);
+    if (auth.scope === "none") {
       return Response.json({ error: "unauthorized" }, { status: 401 });
     }
-    if (scope === "dash") {
+    if (auth.scope === "dash") {
       // A nonce is accepted ONLY on the read set + /answer, and only from a loopback origin.
       if (!DASH_ALLOWED.has(path)) {
         return Response.json({ error: "unauthorized" }, { status: 401 });
@@ -2353,18 +2692,33 @@ Bun.serve({
         return Response.json({ error: "cross-origin request refused" }, { status: 401 });
       }
     }
+    // Route allowlist for a seat token, before the body is even read. Default-deny: a route in
+    // neither table is closed.
+    if (auth.scope === "seat" && !(path in SEAT_OWNED) && !SEAT_SHARED.has(path)) {
+      return Response.json({ error: "unauthorized" }, { status: 401 });
+    }
 
     try {
       const body = await req.json();
       const invalid = validate(path, body);
       if (invalid) return Response.json({ error: invalid }, { status: 400 });
+      // The identity check, after validate() so the subject field is known to be well-shaped.
+      // 403, not 401: the token is genuine, it just does not speak for this seat. Refusing on
+      // a null subject is what makes an unresolvable target (a pid matching nothing) a denial
+      // rather than a pass.
+      if (auth.scope === "seat") {
+        const subject = seatSubject(path, body as Record<string, unknown>);
+        if (subject !== undefined && subject !== auth.seatId) {
+          return Response.json({ error: "seat token does not authorize this seat" }, { status: 403 });
+        }
+      }
       switch (path) {
         case "/dash-token":
           // Mint a scoped dashboard nonce. Reachable only at scope `full` — a dash nonce
           // can't reach here (not in DASH_ALLOWED), so it can't mint another nonce.
           return Response.json({ token: mintDashToken() });
         case "/register":
-          return Response.json(handleRegister(body as RegisterRequest));
+          return Response.json(registerTxn(body as RegisterRequest));
         case "/heartbeat":
           updateLastSeen.run(new Date().toISOString(), (body as HeartbeatRequest).id);
           return Response.json({ ok: true });
