@@ -2,7 +2,7 @@
 // patrol CLI — thin dispatcher. Each subcommand lives in src/commands/<name>.ts
 // and default-exports (args: string[]) => Promise<number>.
 
-const COMMANDS = ["init", "up", "down", "status", "send", "list", "doctor", "stats", "watch", "cockpit", "dash", "claim-port", "claim", "claims", "release", "rename", "wait", "worktree", "checkpoint"] as const;
+const COMMANDS = ["init", "up", "down", "status", "send", "list", "doctor", "stats", "watch", "cockpit", "dash", "claim-port", "claim", "claims", "release", "rename", "wait", "worktree", "checkpoint", "recall"] as const;
 
 async function main(): Promise<number> {
   const [cmd, ...args] = process.argv.slice(2);
@@ -29,6 +29,7 @@ Usage:
   patrol claims [git-root]       list current path claims
   patrol release <id> [path...]  release a seat's path claims
   patrol worktree <seat> <branch> [--base <ref>]  create a task worktree for a seat
+  patrol recall <seat>   pointers to a seat's prior sessions (survives the seat)
   patrol checkpoint <seat> [--gate "<cmd>"] [--force]
                                  merge the seat's branch back, remove the worktree
                                  (--force allows an unguarded seat: no lease, fences only)`);
