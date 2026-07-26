@@ -4,25 +4,28 @@ import { cockpitCommands, STATUS_HINTS, PROMOTE_KEY } from "../src/commands/cock
 // The command list is pure data (tmux is never touched); assert the exact
 // sequence a live `patrol cockpit` would run. Mirrors tests/launcher.test.ts's
 // `tmuxCommands` coverage.
+//
+// v0.3: every target is the fleet's `=`-exact session (`=patrol-acme`), so a
+// cockpit run in one project can never fold a neighbouring fleet's windows.
 
 describe("cockpitCommands", () => {
   test("4-seat cold start: rename first, join the rest, layout, borders, hints, one bind", () => {
-    const cmds = cockpitCommands(["orchestrator", "executor", "scout", "probe"], false);
+    const cmds = cockpitCommands(["orchestrator", "executor", "scout", "probe"], false, "acme");
 
     // The first seat window BECOMES the cockpit: label its pane, then rename it.
-    expect(cmds[0]).toEqual(["set-option", "-p", "-t", "patrol:orchestrator", "@seat", "orchestrator"]);
-    expect(cmds[1]).toEqual(["rename-window", "-t", "patrol:orchestrator", "cockpit"]);
+    expect(cmds[0]).toEqual(["set-option", "-p", "-t", "=patrol-acme:orchestrator", "@seat", "orchestrator"]);
+    expect(cmds[1]).toEqual(["rename-window", "-t", "=patrol-acme:orchestrator", "cockpit"]);
 
     // Each remaining seat is labelled, then its pane is MOVED in (process-preserving).
     for (const s of ["executor", "scout", "probe"]) {
-      expect(cmds).toContainEqual(["set-option", "-p", "-t", `patrol:${s}`, "@seat", s]);
-      expect(cmds).toContainEqual(["join-pane", "-s", `patrol:${s}`, "-t", "patrol:cockpit"]);
+      expect(cmds).toContainEqual(["set-option", "-p", "-t", `=patrol-acme:${s}`, "@seat", s]);
+      expect(cmds).toContainEqual(["join-pane", "-s", `=patrol-acme:${s}`, "-t", "=patrol-acme:cockpit"]);
     }
     // Exactly 3 joins for 4 seats — the first is renamed, not joined.
     expect(cmds.filter((c) => c[0] === "join-pane")).toHaveLength(3);
 
     // One big main pane on top, the rest tiled below.
-    expect(cmds).toContainEqual(["select-layout", "-t", "patrol:cockpit", "main-horizontal"]);
+    expect(cmds).toContainEqual(["select-layout", "-t", "=patrol-acme:cockpit", "main-horizontal"]);
 
     // Every join happens BEFORE the layout is applied.
     const lastJoin = cmds.map((c) => c[0]).lastIndexOf("join-pane");
@@ -31,14 +34,14 @@ describe("cockpitCommands", () => {
     expect(lastJoin).toBeLessThan(layoutIdx);
 
     // Labelled previews.
-    expect(cmds).toContainEqual(["set-option", "-w", "-t", "patrol:cockpit", "pane-border-status", "top"]);
+    expect(cmds).toContainEqual(["set-option", "-w", "-t", "=patrol-acme:cockpit", "pane-border-status", "top"]);
     const borderFmt = cmds.find((c) => c[0] === "set-option" && c[4] === "pane-border-format");
     expect(borderFmt?.[5]).toContain("#{@seat}");
     expect(borderFmt?.[5]).toContain("#{pane_index}");
 
     // Key hints in the session status bar.
     const statusLeft = cmds.find((c) => c[3] === "status-left");
-    expect(statusLeft).toEqual(["set-option", "-t", "patrol", "status-left", STATUS_HINTS]);
+    expect(statusLeft).toEqual(["set-option", "-t", "=patrol-acme", "status-left", STATUS_HINTS]);
     for (const hint of ["focus", "zoom", "main", "detach", PROMOTE_KEY]) {
       expect(STATUS_HINTS).toContain(hint);
     }
@@ -49,24 +52,24 @@ describe("cockpitCommands", () => {
     expect(binds[0]).toEqual(["bind-key", PROMOTE_KEY, "swap-pane", "-t", "{top-left}"]);
 
     // Ends by landing on the cockpit window.
-    expect(cmds[cmds.length - 1]).toEqual(["select-window", "-t", "patrol:cockpit"]);
+    expect(cmds[cmds.length - 1]).toEqual(["select-window", "-t", "=patrol-acme:cockpit"]);
   });
 
   test("idempotent re-run: cockpit exists, no seat windows -> no rename/join, still re-applies the view", () => {
-    const cmds = cockpitCommands([], true);
+    const cmds = cockpitCommands([], true, "acme");
     expect(cmds.some((c) => c[0] === "rename-window")).toBe(false);
     expect(cmds.some((c) => c[0] === "join-pane")).toBe(false);
     // The whole chrome is still re-applied — that is what makes a re-run safe.
-    expect(cmds).toContainEqual(["select-layout", "-t", "patrol:cockpit", "main-horizontal"]);
-    expect(cmds).toContainEqual(["set-option", "-w", "-t", "patrol:cockpit", "pane-border-status", "top"]);
+    expect(cmds).toContainEqual(["select-layout", "-t", "=patrol-acme:cockpit", "main-horizontal"]);
+    expect(cmds).toContainEqual(["set-option", "-w", "-t", "=patrol-acme:cockpit", "pane-border-status", "top"]);
     expect(cmds.filter((c) => c[0] === "bind-key")).toHaveLength(1);
   });
 
   test("cockpit exists with a straggler seat window -> joins it, never renames", () => {
-    const cmds = cockpitCommands(["latecomer"], true);
+    const cmds = cockpitCommands(["latecomer"], true, "acme");
     expect(cmds.some((c) => c[0] === "rename-window")).toBe(false);
-    expect(cmds).toContainEqual(["set-option", "-p", "-t", "patrol:latecomer", "@seat", "latecomer"]);
-    expect(cmds).toContainEqual(["join-pane", "-s", "patrol:latecomer", "-t", "patrol:cockpit"]);
+    expect(cmds).toContainEqual(["set-option", "-p", "-t", "=patrol-acme:latecomer", "@seat", "latecomer"]);
+    expect(cmds).toContainEqual(["join-pane", "-s", "=patrol-acme:latecomer", "-t", "=patrol-acme:cockpit"]);
     expect(cmds.filter((c) => c[0] === "join-pane")).toHaveLength(1);
   });
 });

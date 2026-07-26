@@ -10,6 +10,7 @@
 // Bun.YAML is absent in Bun 1.2.20 (checked), hence this parser rather than a dep.
 
 import type { PatrolConfig } from "../../shared/types.ts";
+import { validateFleetName } from "./fleet.ts";
 
 type Line = { indent: number; text: string };
 
@@ -189,6 +190,19 @@ export function parsePatrolConfig(src: string): PatrolConfig {
     throw new Error("patrol.yaml `seats:` must be a list");
   }
   const config: PatrolConfig = { seats: seats as PatrolConfig["seats"] };
+
+  // v0.3: the optional fleet name. Rejected here, at parse time, because it
+  // becomes a tmux session name, a state-file path segment and part of every
+  // seat's stable_key — a `../` or `;` shaped value reaching any of those is
+  // target injection, and by the time `up` composes commands it is too late to
+  // tell a config typo from an attack.
+  if (rec.fleet !== undefined && rec.fleet !== null) {
+    try {
+      config.fleet = validateFleetName(rec.fleet);
+    } catch (e) {
+      throw new Error(`patrol.yaml ${(e as Error).message}`);
+    }
+  }
 
   // Fleet-level budget: forwarding these to the launcher is the whole point —
   // dropping them silently discards a configured cap (Codex #2). The scalar parser

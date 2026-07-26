@@ -1,7 +1,7 @@
 // patrol status — the fleet board. Flagship view: per-seat spend is the
 // differentiator no competitor peer tool has (see research/r2).
 import type { Seat, CostsResponse, Worktree } from "../../shared/types.ts";
-import { brokerPost, gitRoot, relTime, truncate, usd, renderTable, seatLabel, BrokerError } from "./_client.ts";
+import { brokerPost, gitRoot, relTime, truncate, usd, renderTable, seatLabel, detectFleet, BrokerError } from "./_client.ts";
 
 // v0.2.6: /list-seats now carries the seat's spend cap (a REAL column added to the
 // seats table). The frozen Seat contract predates it, so read it off a widened view
@@ -77,16 +77,20 @@ export default async function status(_args: string[]): Promise<number> {
   } else {
     // Handle is the primary identifier; the hex id stays as a secondary column
     // (disambiguator + fallback). BRANCH (v0.2.6) is the seat's active task worktree.
-    // SPEND is column 8, BUDGET column 9 — both right-aligned. An OVER marker rides in
+    // SPEND is column 9, BUDGET column 10 — both right-aligned (v0.3 added FLEET). An OVER marker rides in
     // the SPEND cell (v0.2.6 observe-only cap; the broker has already pinged the
     // recipient, this just surfaces it on the board).
-    const headers = ["SEAT", "ID", "ROLE", "MODEL", "PROFILE", "TTY", "BRANCH", "SEEN", "SPEND", "BUDGET", "SUMMARY"];
+    // v0.3 FLEET column: the board is machine-wide, so on a two-fleet machine the
+    // rows are otherwise indistinguishable. The caller's own fleet carries "*".
+    const mine = detectFleet();
+    const headers = ["SEAT", "FLEET", "ID", "ROLE", "MODEL", "PROFILE", "TTY", "BRANCH", "SEEN", "SPEND", "BUDGET", "SUMMARY"];
     const rows = seats.map((s) => {
       const budget = (s as SeatWithBudget).budget_usd ?? null;
       const spend = spendBySeat.get(s.id) ?? 0;
       const over = costs != null && budget != null && spend >= budget;
       return [
         seatLabel(s),
+        s.fleet ? `${s.fleet}${s.fleet === mine ? " *" : ""}` : "-",
         s.id.slice(0, 8),
         s.role ?? "-",
         s.model ?? "-",
@@ -101,7 +105,7 @@ export default async function status(_args: string[]): Promise<number> {
         truncate(s.summary, 40),
       ];
     });
-    console.log(renderTable(headers, rows, new Set([8, 9])));
+    console.log(renderTable(headers, rows, new Set([9, 10])));
   }
 
   if (!costs) {

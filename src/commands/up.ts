@@ -16,18 +16,26 @@ import {
   type ComposePaths, type SeatPlan, type TmuxSeat, type RecordedBgSeat,
 } from "../launcher/compose.ts";
 import { hasSession, launchTmux } from "../launcher/tmux.ts";
+import { fleetForConfig } from "../launcher/fleet-detect.ts";
+import { fleetStateFileName, sessionName } from "../launcher/fleet.ts";
 import { launchBg, listAgents } from "../launcher/bg.ts";
 import { spawnSync } from "bun";
 
 const CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude");
 const PROFILE_DIR = join(CONFIG_DIR, "patrol-profiles");
-const FLEET_STATE = join(PROFILE_DIR, "fleet.json");
+// v0.3: one state file PER FLEET. A single global fleet.json meant the second
+// fleet to boot overwrote the first's bg-seat records, so the first `patrol down`
+// had nothing to stop and those seats leaked.
+function fleetStatePath(fleet: string): string {
+  return join(PROFILE_DIR, fleetStateFileName(fleet));
+}
 // up.ts lives at src/commands/ ; seat-server.ts (W1) is at src/ under pkg root.
 const PKG_ROOT = resolve(import.meta.dir, "../..");
 const SEAT_SERVER = join(PKG_ROOT, "src", "seat-server.ts");
 
 export interface FleetState {
   started_at: string;
+  fleet: string;
   tmux: boolean;
   bg: RecordedBgSeat[];
 }
@@ -107,6 +115,18 @@ export default async function up(args: string[]): Promise<number> {
     return 1;
   }
 
+  // Resolve the fleet ONCE, here, through the shared resolver — `patrol down`
+  // and the CLI's seat resolution call the same function, so teardown can never
+  // target a session `up` did not create.
+  let fleet: string;
+  try {
+    fleet = fleetForConfig(configPath, config.fleet);
+  } catch (e) {
+    console.error(`patrol up: ${(e as Error).message}`);
+    return 1;
+  }
+  const session = sessionName(fleet);
+
   const installed = readInstalledPlugins();
   // Fold the fleet-level budget_usd into each seat as its default cap before planning,
   // so a seat without its own SeatSpec.budget_usd inherits the fleet cap (Codex #2).
@@ -116,8 +136,8 @@ export default async function up(args: string[]): Promise<number> {
   // Codex + headless adapter seats intentionally run as visible tmux windows too;
   // tmux session teardown therefore stops them along with ordinary tmux seats.
   const tmuxSeats = plans.filter((p) => p.backend === "tmux" || p.backend === "codex" || p.backend === "headless");
-  if (tmuxSeats.length > 0 && hasSession()) {
-    console.error(`patrol up: tmux session "patrol" already exists — run \`patrol down\` first`);
+  if (tmuxSeats.length > 0 && hasSession(fleet)) {
+    console.error(`patrol up: tmux session "${session}" already exists — run \`patrol down\` first (other fleets are unaffected)`);
     return 1;
   }
 
@@ -134,7 +154,7 @@ export default async function up(args: string[]): Promise<number> {
   const composed = plans.map((plan) => {
     const paths = materialize(plan);
     const token = plan.spec.silent ? null : genSeatToken();
-    return { plan, token, ...composeSeat(plan, paths, token, config.budget_alert_to ?? null) };
+    return { plan, token, ...composeSeat(plan, paths, token, config.budget_alert_to ?? null, fleet) };
   });
 
   // tmux seats
@@ -142,8 +162,8 @@ export default async function up(args: string[]): Promise<number> {
     .filter((c) => c.plan.backend === "tmux" || c.plan.backend === "codex" || c.plan.backend === "headless")
     .map((c) => ({ name: c.plan.spec.name, cwd: c.plan.cwd, env: c.env, argv: c.argv }));
   if (tmuxLaunch.length > 0) {
-    launchTmux(tmuxLaunch);
-    console.log(`patrol up: ${tmuxLaunch.length} tmux seat(s) in session "patrol" — attach with \`tmux attach -t patrol\``);
+    launchTmux(tmuxLaunch, fleet);
+    console.log(`patrol up: ${tmuxLaunch.length} tmux seat(s) in session "${session}" — attach with \`tmux attach -t ${session}\``);
   }
 
   // bg seats: snapshot before, launch, diff to capture fresh agents by name
@@ -170,7 +190,7 @@ export default async function up(args: string[]): Promise<number> {
     spawnSync(c.argv, { cwd: c.plan.cwd, env: { ...process.env, ...c.env }, stdout: "inherit", stderr: "inherit", stdin: "inherit" });
   }
 
-  const state: FleetState = { started_at: new Date().toISOString(), tmux: tmuxLaunch.length > 0, bg: bgRecorded };
-  writeFileSync(FLEET_STATE, JSON.stringify(state, null, 1));
+  const state: FleetState = { started_at: new Date().toISOString(), fleet, tmux: tmuxLaunch.length > 0, bg: bgRecorded };
+  writeFileSync(fleetStatePath(fleet), JSON.stringify(state, null, 1));
   return 0;
 }

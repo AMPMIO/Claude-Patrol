@@ -517,17 +517,29 @@ describe("shQuote", () => {
 });
 
 describe("tmuxCommands", () => {
-  test("first seat new-session, rest new-window, send-keys per seat", () => {
+  test("first seat new-session, rest new-window, send-keys per seat — all in the fleet's session", () => {
     const cmds = tmuxCommands([
       { name: "a", cwd: "/w", env: {}, argv: ["claude", "--model", "opus"] },
       { name: "b", cwd: "/w", env: {}, argv: ["claude", "--model", "sonnet"] },
-    ]);
-    expect(cmds[0]).toEqual(["new-session", "-d", "-s", "patrol", "-n", "a"]);
+    ], "acme");
+    // -s creates a session, so it takes the LITERAL name; every -t is the
+    // `=`-exact target form, because tmux would otherwise prefix-match a -t
+    // "patrol-acme" onto a live "patrol-acme2".
+    expect(cmds[0]).toEqual(["new-session", "-d", "-s", "patrol-acme", "-n", "a"]);
     expect(cmds[1]![0]).toBe("send-keys");
-    expect(cmds[1]![2]).toBe("patrol:a");
+    expect(cmds[1]![2]).toBe("=patrol-acme:a");
     expect(cmds[1]![4]).toBe("Enter");
-    expect(cmds[2]).toEqual(["new-window", "-t", "patrol", "-n", "b"]);
-    expect(cmds[3]![2]).toBe("patrol:b");
+    expect(cmds[2]).toEqual(["new-window", "-t", "=patrol-acme", "-n", "b"]);
+    expect(cmds[3]![2]).toBe("=patrol-acme:b");
+  });
+
+  test("two fleets never share a session name or a target", () => {
+    const seat = [{ name: "builder", cwd: "/w", env: {}, argv: ["claude"] }];
+    const a = tmuxCommands(seat, "alpha");
+    const b = tmuxCommands(seat, "beta");
+    expect(a[0]).toEqual(["new-session", "-d", "-s", "patrol-alpha", "-n", "builder"]);
+    expect(b[0]).toEqual(["new-session", "-d", "-s", "patrol-beta", "-n", "builder"]);
+    expect(a.flat().some((s) => typeof s === "string" && s.includes("beta"))).toBe(false);
   });
 });
 

@@ -8,8 +8,22 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { seatMarker, SEAT_TOKEN_ENV, LEASE_FILE_ENV, type PatrolConfig, type SeatSpec } from "../../shared/types.ts";
 import { resolveProfile, buildSettingsOverlay, PRESET_NAMES, NAMED_PROFILES, type ResolvedProfile } from "../profiles.ts";
+import { sessionName, exactSession, exactWindow } from "./fleet.ts";
 
-export const TMUX_SESSION = "patrol";
+// v0.3: the seat's fleet and its stable identity, both read by the seat-server
+// (owned by the broker package) and forwarded at /register. Plain string literals
+// on both sides, matching how CLAUDE_PATROL_ROLE / _MODEL / _BUDGET_USD already
+// cross this seam — shared/types.ts is frozen.
+export const FLEET_ENV = "CLAUDE_PATROL_FLEET";
+export const STABLE_KEY_ENV = "CLAUDE_PATROL_STABLE_KEY";
+
+// A seat's identity across relaunches: fleet + seat name, both already validated
+// as path/target-safe segments. Unchanged by a crash, so a returning seat
+// re-claims its prior broker identity and its unacked mail instead of coming
+// back as a stranger whose mail was purged.
+export function stableKey(fleet: string, seatName: string): string {
+  return `${fleet}/${seatName}`;
+}
 // Kept here (rather than in up.ts) so composeSeat remains pure and callers can
 // assert the executable adapter path without touching the filesystem.
 export const CODEX_SEAT = resolve(import.meta.dir, "../codex-seat.ts");
@@ -158,8 +172,16 @@ export function composeSeat(
   paths: ComposePaths,
   seatToken: string | null = null,
   budgetAlertTo: string | null = null,
+  fleet: string | null = null,
 ): Composed {
   const { spec, resolved } = plan;
+
+  // v0.3 fleet identity, carried by every backend. A seat that boots without it
+  // registers unfleeted and is reachable from every project's `patrol send` —
+  // the isolation this release exists for. `patrol up` always passes one.
+  const fleetEnv: Record<string, string> = fleet
+    ? { [FLEET_ENV]: fleet, [STABLE_KEY_ENV]: stableKey(fleet, spec.name) }
+    : {};
 
   // Codex seats are broker adapters, not Claude sessions. They deliberately
   // receive no Claude argv, marker, settings, or MCP configuration.
@@ -167,6 +189,7 @@ export function composeSeat(
     const argv = ["bun", CODEX_SEAT, "--cwd", plan.cwd, "--role", plan.role, "--model", spec.model];
     if (spec.prompt) argv.push("--prompt", spec.prompt);
     const env: Record<string, string> = {
+      ...fleetEnv,
       CLAUDE_PATROL_ROLE: plan.role,
       CLAUDE_PATROL_MODEL: spec.model,
     };
@@ -186,6 +209,7 @@ export function composeSeat(
     const argv = ["bun", HEADLESS_SEAT, "--cwd", plan.cwd, "--role", plan.role, "--model", spec.model];
     if (spec.prompt) argv.push("--prompt", spec.prompt);
     const env: Record<string, string> = {
+      ...fleetEnv,
       CLAUDE_PATROL_ROLE: plan.role,
       CLAUDE_PATROL_MODEL: spec.model,
     };
@@ -244,6 +268,7 @@ export function composeSeat(
   if (promptArg !== null) argv.push("--", promptArg);
 
   const env: Record<string, string> = {
+    ...fleetEnv,
     CLAUDE_PATROL_ROLE: plan.role,
     CLAUDE_PATROL_MODEL: spec.model,
   };
@@ -307,19 +332,23 @@ export interface TmuxSeat {
   argv: string[];
 }
 
-// The exact sequence of tmux argv arrays to stand up the fleet: one detached
-// session, first window named after seat[0], a new-window per remaining seat,
-// and a send-keys per seat running its composed command.
-export function tmuxCommands(seats: TmuxSeat[]): string[][] {
+// The exact sequence of tmux argv arrays to stand up ONE fleet: one detached
+// session `patrol-<fleet>`, first window named after seat[0], a new-window per
+// remaining seat, and a send-keys per seat running its composed command.
+//
+// Every -t here is the `=`-exact form: tmux otherwise falls back to prefix
+// matching, so a fleet `app` could aim a send-keys at a live `patrol-app2`.
+export function tmuxCommands(seats: TmuxSeat[], fleet: string): string[][] {
   const cmds: string[][] = [];
   seats.forEach((seat, idx) => {
     if (idx === 0) {
-      cmds.push(["new-session", "-d", "-s", TMUX_SESSION, "-n", seat.name]);
+      // -s takes the literal name being CREATED; `=` is target syntax and would
+      // become part of the session name.
+      cmds.push(["new-session", "-d", "-s", sessionName(fleet), "-n", seat.name]);
     } else {
-      cmds.push(["new-window", "-t", TMUX_SESSION, "-n", seat.name]);
+      cmds.push(["new-window", "-t", exactSession(fleet), "-n", seat.name]);
     }
-    const target = `${TMUX_SESSION}:${seat.name}`;
-    cmds.push(["send-keys", "-t", target, seatShellLine(seat.cwd, seat.env, seat.argv), "Enter"]);
+    cmds.push(["send-keys", "-t", exactWindow(fleet, seat.name), seatShellLine(seat.cwd, seat.env, seat.argv), "Enter"]);
   });
   return cmds;
 }
