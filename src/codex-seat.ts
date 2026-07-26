@@ -7,7 +7,8 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { getSecret, TOKEN_HEADER } from "../shared/auth.ts";
+import { getSecret, TOKEN_HEADER, adoptCapability } from "../shared/auth.ts";
+import { FLEET_ENV, STABLE_KEY_ENV } from "./launcher/compose.ts";
 import type {
   DeliveredMessage,
   PollMessagesResponse,
@@ -104,6 +105,22 @@ export function budgetFieldsFromEnv(env: NodeJS.ProcessEnv = process.env): {
   return {
     budget_usd: Number.isFinite(parsed) && parsed > 0 ? parsed : null,
     budget_alert_to: env.CLAUDE_PATROL_BUDGET_ALERT_TO || null,
+  };
+}
+
+// v0.3: same seam as budgetFieldsFromEnv above — the launcher exports these (compose.ts
+// FLEET_ENV / STABLE_KEY_ENV) and only the seat can read its own env, so only the seat can
+// forward them at /register. An adapter that omitted them registered fleet=NULL, stable_key=NULL:
+// its handle collided with every other project's, it resolved into every fleet's `patrol send`,
+// and endSeat purged its unacked mail on the crash stable_key exists to survive. Shared with
+// headless-seat.ts. Empty degrades to null (the default fleet), the same read as absent.
+export function fleetFieldsFromEnv(env: NodeJS.ProcessEnv = process.env): {
+  fleet: string | null;
+  stable_key: string | null;
+} {
+  return {
+    fleet: env[FLEET_ENV] || null,
+    stable_key: env[STABLE_KEY_ENV] || null,
   };
 }
 
@@ -471,10 +488,17 @@ export class SerialTurnQueue {
   }
 }
 
+// v0.3: the credential this seat presents. The machine-wide secret authenticates the BOOTSTRAP
+// /register only — a seat has no capability until it has registered — and leaves this process's
+// request path the moment /register answers with one. The shared secret resolves to `full`
+// scope, so a seat that kept using it would never be measured against the broker's per-seat
+// route allowlist, subject check, or fleet boundary.
+let credential: string | null = null;
+
 async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", [TOKEN_HEADER]: getSecret() },
+    headers: { "Content-Type": "application/json", [TOKEN_HEADER]: credential ?? getSecret() },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(2500),
   });
@@ -673,8 +697,12 @@ async function main() {
     // this cap cannot trip today — forwarded anyway so every backend registers the
     // same way and a future external-spend source needs no launcher change.
     ...budgetFieldsFromEnv(),
+    ...fleetFieldsFromEnv(),
   });
   myId = reg.id;
+  // Before the poll/heartbeat timers below exist: any of them firing on the shared secret
+  // would put a `full`-scope request back on the wire.
+  credential = adoptCapability(reg, log);
   log(`Registered as seat ${myId} (cwd: ${config.cwd})`);
   if (config.sandbox === "danger-full-access") {
     // The deny-hook is a best-effort backstop; the OS sandbox is the real boundary.

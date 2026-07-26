@@ -109,6 +109,28 @@ function downOne(fleet: string, force: boolean): void {
   }
 }
 
+// Per-fleet isolation for the teardown loop, and the seam its test needs. downOne throws
+// whenever killSession does (a tmux kill-session that exits nonzero), and the bare `for` this
+// replaces let ONE bad fleet abort the teardown of every fleet after it — under `--all`,
+// silently: the throw surfaced as a generic CLI error naming no fleet, so the ones still
+// running looked like they had been asked to stay. Returns the failure count; each is reported
+// with its fleet so a human knows exactly what is still up.
+//
+// Separated from `down` because the failure it must survive cannot be provoked in a test
+// without a real tmux server — the loop, not the tmux call, is what is being asserted.
+export function downEach(fleets: string[], run: (fleet: string) => void): number {
+  let failed = 0;
+  for (const fleet of fleets) {
+    try {
+      run(fleet);
+    } catch (e) {
+      failed++;
+      console.error(`patrol down: fleet "${fleet}" failed to tear down: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  return failed;
+}
+
 export default async function down(args: string[]): Promise<number> {
   const force = args.includes("--force");
   const all = args.includes("--all");
@@ -129,6 +151,5 @@ export default async function down(args: string[]): Promise<number> {
     return 1;
   }
 
-  for (const fleet of selection.fleets) downOne(fleet, force);
-  return 0;
+  return downEach(selection.fleets, (fleet) => downOne(fleet, force)) > 0 ? 1 : 0;
 }

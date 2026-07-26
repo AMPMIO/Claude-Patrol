@@ -34,6 +34,23 @@ export function checkSecretPerms(path: string): void {
   }
 }
 
+// v0.3. Every seat backend does exactly this at the same moment — the third concrete use, so
+// it lands here rather than being written out three times and drifting.
+//
+// The credential a seat presents after /register is its capability token, NOT the shared
+// secret: the secret resolves to `full` scope, which is the operator's, and a seat holding it
+// bypasses the entire per-seat boundary. Returning null means the broker minted none — a
+// version skew, since token and enforcement ship together. That DEGRADES to the shared secret
+// (the caller keeps its bootstrap credential) rather than refusing to run: a seat that hard-
+// failed here would take the fleet down on a mixed-version install, which is a worse outcome
+// than the pre-v0.3 trust model it falls back to. It is logged loudly because a silent
+// degrade is precisely how the boundary came to be dead code in the first place.
+export function adoptCapability(reg: { capability_token?: string }, log: (msg: string) => void): string | null {
+  if (reg.capability_token) return reg.capability_token;
+  log("WARNING: broker returned no capability_token — falling back to the shared secret. This seat runs at OPERATOR scope: the per-seat route allowlist and fleet boundary do NOT apply to it. Upgrade the broker.");
+  return null;
+}
+
 export function getSecret(): string {
   let existing: string | null = null;
   try {

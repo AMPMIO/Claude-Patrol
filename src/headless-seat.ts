@@ -16,11 +16,12 @@
  * maps to billing_source="agent-sdk" (verified against real `claude -p` output).
  */
 import { mkdirSync, writeFileSync } from "node:fs";
-import { getSecret, TOKEN_HEADER } from "../shared/auth.ts";
+import { getSecret, TOKEN_HEADER, adoptCapability } from "../shared/auth.ts";
 import {
   type BrokerClient,
   budgetFieldsFromEnv,
   fenceBody,
+  fleetFieldsFromEnv,
   genFenceBoundary,
   MAX_SEND_BYTES,
   MAX_TURN_ATTEMPTS,
@@ -315,10 +316,17 @@ export async function deliverTurnResult(
   return { settled: true };
 }
 
+// v0.3: the credential this seat presents. The machine-wide secret authenticates the BOOTSTRAP
+// /register only — a seat has no capability until it has registered — and leaves this process's
+// request path the moment /register answers with one. The shared secret resolves to `full`
+// scope, so a seat that kept using it would never be measured against the broker's per-seat
+// route allowlist, subject check, or fleet boundary.
+let credential: string | null = null;
+
 async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", [TOKEN_HEADER]: getSecret() },
+    headers: { "Content-Type": "application/json", [TOKEN_HEADER]: credential ?? getSecret() },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(2500),
   });
@@ -387,8 +395,12 @@ async function main() {
     // Because that spend IS indexed, this is the adapter where the cap actually bites —
     // omitting it left headless seats burning the Agent-SDK pool uncapped.
     ...budgetFieldsFromEnv(),
+    ...fleetFieldsFromEnv(),
   });
   myId = reg.id;
+  // Before the poll/heartbeat timers below exist: any of them firing on the shared secret
+  // would put a `full`-scope request back on the wire.
+  credential = adoptCapability(reg, log);
   log(`Registered as seat ${myId} (cwd: ${config.cwd})`);
 
   const session = new ClaudeSession(config);

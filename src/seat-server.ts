@@ -21,8 +21,8 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { accessSync, existsSync, mkdirSync, constants as FS } from "node:fs";
 import { dirname, isAbsolute } from "node:path";
-import { getSecret, TOKEN_HEADER } from "../shared/auth.ts";
-import { CHECKPOINT_GUARD } from "./launcher/compose.ts";
+import { getSecret, TOKEN_HEADER, adoptCapability } from "../shared/auth.ts";
+import { CHECKPOINT_GUARD, FLEET_ENV, STABLE_KEY_ENV } from "./launcher/compose.ts";
 import { SEAT_TOKEN_ENV, SEAT_TOKEN_RE, LEASE_FILE_ENV } from "../shared/types.ts";
 import type {
   SeatId,
@@ -42,10 +42,18 @@ function log(msg: string) {
   console.error(`[claude-patrol] ${msg}`);
 }
 
+// v0.3: the credential this seat presents. The machine-wide secret authenticates the BOOTSTRAP
+// /register only — a seat has no capability until it has registered — and leaves this process's
+// request path the moment /register answers with one. That handover is what makes the broker's
+// enforcement real: the shared secret resolves to `full` scope, so a seat that kept using it
+// would never be measured against the per-seat route allowlist, the subject check, or the fleet
+// boundary. Every one of those was dead code for exactly this reason.
+let credential: string | null = null;
+
 async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", [TOKEN_HEADER]: getSecret() },
+    headers: { "Content-Type": "application/json", [TOKEN_HEADER]: credential ?? getSecret() },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(2500), // a wedged broker must not hang a poll forever
   });
@@ -432,8 +440,18 @@ async function main() {
     budget_alert_to: budgetAlertTo,
     guarded,
     lease_file: leaseFile,
+    // v0.3: the launcher exports both (compose.ts FLEET_ENV/STABLE_KEY_ENV); only the seat can
+    // read its own env, so only the seat can forward them. Without `fleet` every real seat was
+    // stored NULL — handles collided across projects and a null-fleet seat resolved into every
+    // fleet. Without `stable_key` endSeat purged unacked mail on the crash it exists to survive.
+    fleet: process.env[FLEET_ENV] || null,
+    stable_key: process.env[STABLE_KEY_ENV] || null,
   });
   myId = reg.id;
+  // Take up the capability BEFORE anything else runs: the poll/heartbeat timers below and the
+  // MCP tool handlers all go through brokerFetch, and any of them firing on the shared secret
+  // would put a `full`-scope request back on the wire.
+  credential = adoptCapability(reg, log);
   log(`Registered as seat ${myId} (cwd: ${cwd})`);
   if (reg.session_id_rejected) {
     log("session_id claim rejected (another live seat holds it) — this seat's costs will be unattributed");
