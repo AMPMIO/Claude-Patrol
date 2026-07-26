@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.3.0 — 2026-07-26
+
+Identity. Three separate pressures converged on one missing concept: multiple
+projects could not run side by side, three consecutive adversarial reviews kept
+returning the same "routes trust `body.id`" finding, and crash redelivery was
+blocked on a seat identity that survived a restart. 505 tests.
+
+### Added
+- **Fleets.** `TMUX_SESSION` was the constant `"patrol"`, so `patrol down` in ANY
+  project killed EVERY project's seats — silent data loss the moment a second fleet
+  existed. A fleet (optional `fleet:` in patrol.yaml, defaulting to the git-root
+  basename) is now the isolation unit: its own tmux session, its own handle
+  namespace, its own teardown. `patrol down` refuses to reach beyond the fleet
+  inferred from cwd without `--all`. A single-fleet machine still answers to
+  `tmux attach -t patrol`. Ports stay machine-global on purpose — they are a real OS
+  resource, and per-fleet ranges would hand two projects the same 9000.
+- **Per-seat capability tokens.** Minted at `/register`, stored hashed, presented on
+  every seat-owned route thereafter. `body.id` stops being a self-certifying claim.
+  Seat scope is deny-by-default (a route in neither table is closed), and a genuine
+  token acting on another seat gets 403, distinct from an invalid one's 401. Fleet
+  confinement is enforced SERVER-side from the caller's token — the CLI's fleet
+  filter was only ever a convenience.
+- **Crash redelivery.** A restarted seat presenting the same `stable_key` re-claims
+  its prior identity, and its unacked mail is redelivered rather than swept. Guarded:
+  never from a live seat, never across fleets, bounded by a retention window.
+- **`patrol send --brief <path>`.** Hands over a pointer instead of pasting a brief,
+  so a multi-KB brief stops being re-billed on every later turn of that session.
+- **Cache re-encode tax.** A prompt cache expires while a seat sits idle — an
+  orchestrator waiting on a worker is the classic case — and the next turn re-encodes
+  an unchanged history at the write rate. `patrol status` now measures it. Heuristic
+  and directional by construction; a genuinely new prefix also writes cache.
+
+### Fixed (from three adversarial review rounds)
+- The capability boundary initially shipped **complete and unreachable**: every client
+  authenticated with the machine-wide secret, so the allowlist and subject checks were
+  dead code. Clients now retain and present their capability; the secret is confined to
+  the bootstrap `/register`.
+- A missing `capability_token` used to degrade to the operator secret with a log line.
+  It now **fails closed** with an actionable error — that silent downgrade is how the
+  boundary became dead code in the first place.
+- `patrol send` hardcoded `from_id:"cli"`, which the boundary would have 403'd — the
+  one command seats are instructed to use. A seat now speaks as itself, and `send`
+  prints which identity spoke when it is not the operator's.
+- A live replacement blocked its own crash-mail adoption (the seat row was inserted
+  before the live-holder lookup). The passing test masked it by using a dead pid.
+- Seat-scoped shared routes (`/list-seats`, `/send-message`, `/log`, `/diff`, …) had no
+  server-side fleet check.
+- `--brief` silently dropped extra arguments; `--all` teardown aborted on the first
+  failing fleet.
+- **Two test suites that passed without testing anything**: cross-fleet confinement
+  asserted against rows the broker had rejected, and the redelivery test only worked
+  because it called `sweep()` first. Both found by a second reviewer reading tests
+  rather than code.
+
+### Known limit (stated plainly, not softened)
+- The capability boundary constrains accidental cross-fleet action, adapter seats, and
+  non-Bash callers. It does **not** contain a compromised seat: any seat with shell
+  access can read the 0600 operator secret directly. Real containment needs that secret
+  to be unreadable by seats — per-seat OS users, or a unix socket with peer-credential
+  auth — and is roadmapped, not shipped.
+
 ## 0.2.9 — 2026-07-25
 
 Checkpoint stops racing the seat. Three adversarial reviews each found a way

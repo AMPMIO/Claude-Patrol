@@ -520,7 +520,7 @@ per-task cost tags; a Warp launch backend.
 
 ## Status and caveats
 
-**v0.3-dev, 505 tests.** Cost attribution survives the case that broke it in v0.1:
+**v0.3.0, 505 tests.** Cost attribution survives the case that broke it in v0.1:
 several seats working in the same repo, split across three billing wallets, with a
 per-seat budget alert when one crosses its cap. History survives seat teardown and
 broker restarts. `/costs` reads from an incrementally indexed ledger instead of
