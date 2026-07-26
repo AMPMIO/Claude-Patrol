@@ -251,6 +251,11 @@ for (const col of ["bound_via TEXT", "fleet TEXT", "stable_key TEXT"]) {
   }
 }
 db.run(`CREATE INDEX IF NOT EXISTS idx_seat_runs_stable ON seat_runs(stable_key, ended_at)`);
+// The fleet-confinement lookup (fleetSeatIds) resolves a seat-scope caller's visible ids on
+// every shared-route request. seat_runs is the append-only table here — it outlives every
+// dereg — so an unindexed `WHERE fleet IS ?` degrades into a growing full scan on the request
+// path of a long-lived broker.
+db.run(`CREATE INDEX IF NOT EXISTS idx_seat_runs_fleet ON seat_runs(fleet)`);
 
 // v0.3 capability tokens. The credential a seat presents to prove it IS the seat it claims to
 // be in `body.id`. STORED HASHED, never in the clear: this db is a file on disk that several
@@ -871,9 +876,17 @@ function hashToken(token: string): string {
 //      in fleet `api`.
 // Ordered by ended_at DESC so a seat that crashed and restarted several times adopts its most
 // recent incarnation, not an ancient one.
-function findAdoptableSeat(stableKey: string, fleet: string | null, nowMs: number): string | null {
+//
+// `selfId` is the row this lookup runs on behalf of and MUST be excluded from guard 1. It is
+// inserted before this runs (see handleRegister), carries the same stable_key and a genuinely
+// live pid, and so answered the live-holder query as its own blocker — adoption returned null
+// for every legitimate restart. Passing the id rather than reordering the insert keeps the
+// documented invariant that adopted mail is never momentarily addressed to an id with no row.
+function findAdoptableSeat(stableKey: string, fleet: string | null, nowMs: number, selfId: string): string | null {
   const liveHolder = (
-    db.query("SELECT pid FROM seats WHERE stable_key = ? AND fleet IS ?").all(stableKey, fleet) as { pid: number }[]
+    db.query("SELECT pid FROM seats WHERE stable_key = ? AND fleet IS ? AND id != ?").all(stableKey, fleet, selfId) as {
+      pid: number;
+    }[]
   ).some((r) => pidAlive(r.pid));
   if (liveHolder) return null; // guard 1: the key's owner is still running
 
@@ -937,6 +950,25 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   const fleet = body.fleet ?? null;
   const stableKey = body.stable_key ?? null;
 
+  // v0.3 crash redelivery, THE UN-SWEPT RESTART. A seat that died without a sweep having
+  // noticed still has a `seats` row and an OPEN `seat_runs` row, which hides it from adoption
+  // twice over: its dead pid still answers the live-holder guard, and a run with no ended_at is
+  // not a candidate. Restarts race the 30s sweep constantly — a relaunch is faster than the
+  // timer — so this was the ordinary case, not the edge one.
+  //
+  // Retiring it HERE, through endSeat (the one removal path), is what makes an immediate
+  // restart behave exactly like one that happened to follow a sweep: the run is bounded, the
+  // stale row goes, and the unacked mail is RETAINED because the seat had a stable_key. Only
+  // dead pids: a genuinely live holder is left alone and findAdoptableSeat's guard 1 then
+  // refuses the adoption, so this is not a way to displace a running seat.
+  if (stableKey) {
+    const holders = db.query("SELECT id, pid FROM seats WHERE stable_key = ? AND fleet IS ?").all(stableKey, fleet) as {
+      id: string;
+      pid: number;
+    }[];
+    for (const h of holders) if (!pidAlive(h.pid)) endSeat(h.id);
+  }
+
   // Readable handle, deduped among live seats IN THIS FLEET. Base is the requested name, else
   // the role, else "seat". Computed AFTER the same-pid endSeat above, so a re-register doesn't
   // collide with the row it just retired.
@@ -971,7 +1003,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   // orphan). The seat row this adopts from is already gone — endSeat retired it, here or on an
   // earlier sweep — so nothing is taken from a running seat; see findAdoptableSeat's guards.
   if (stableKey) {
-    const prior = findAdoptableSeat(stableKey, fleet, Date.parse(now));
+    const prior = findAdoptableSeat(stableKey, fleet, Date.parse(now), id);
     if (prior) {
       const n = adoptMail(prior, id);
       if (n > 0) log(`seat ${id} adopted ${n} unacked message(s) from ${prior} via stable_key ${stableKey}`);
@@ -1248,13 +1280,13 @@ function handleReleaseClaims(body: ReleaseClaimsRequest): { ok: true } {
 // Advisory read of current path claims. git_root scopes to claims on paths under
 // that repo root (prefix match); omitted => all claims. Raw rows — the caller
 // coordinates. (Port claims are lifecycle-only, reaped in endSeat, no read route.)
-function handleListClaims(body: ListClaimsRequest): PathClaim[] {
+function handleListClaims(body: ListClaimsRequest, visible: Set<string> | null): PathClaim[] {
   const rows = body.git_root
     ? (db.query(
         "SELECT path, owner_id, owner_role, claimed_at FROM path_claims WHERE path = ? OR path LIKE ? ORDER BY path"
       ).all(body.git_root, `${body.git_root}/%`) as PathClaim[])
     : (db.query("SELECT path, owner_id, owner_role, claimed_at FROM path_claims ORDER BY path").all() as PathClaim[]);
-  return rows;
+  return visible ? rows.filter((r) => visible.has(r.owner_id)) : rows;
 }
 
 // v0.2 Layer 2 (exact; any seat incl. manual): a plugin SessionStart hook posts
@@ -1566,10 +1598,17 @@ function handleStats(body: StatsRequest): StatsResponse {
 // Message history for the `patrol watch` TUI. Reads the whole messages table
 // (delivered rows are retained 7 days), newest cursor via MAX(id). Sender +
 // recipient role/model resolve from seat_runs so dead seats still render.
-function handleLog(body: LogRequest): LogResponse {
+// `visible` (v0.3 finding 4) is the seat-id set a `seat`-scope caller may see; null for the
+// operator, who reads every fleet. Filtered AFTER the limit rather than in SQL: latest_id must
+// stay the global cursor or pagination stalls on a page whose rows were all filtered out, so a
+// constrained caller may receive fewer than `limit` rows per page and simply pages again.
+function handleLog(body: LogRequest, visible: Set<string> | null): LogResponse {
   const after = body.after_id ?? 0;
   const limit = Math.min(body.limit ?? 200, 500);
-  const rows = selectLog.all(after, limit) as (Omit<LogMessage, "delivered"> & { delivered: number })[];
+  let rows = selectLog.all(after, limit) as (Omit<LogMessage, "delivered"> & { delivered: number })[];
+  // A message belongs to the fleet if either end does. The reserved senders ("cli", "human",
+  // "patrol") are in no fleet, so a CLI message stays visible through its recipient.
+  if (visible) rows = rows.filter((m) => visible.has(m.to_id) || visible.has(m.from_id));
   const messages: LogMessage[] = rows.map((m) => ({ ...m, delivered: !!m.delivered }));
   const latestId = (selectMaxMsgId.get() as { mx: number | null }).mx ?? 0;
   return { messages, latest_id: latestId };
@@ -1588,11 +1627,12 @@ function handleAsk(body: AskRequest): AskResponse | { ok: false; error: string }
   return { ok: true, question_id: Number(res.lastInsertRowid) };
 }
 
-function handleQuestions(body: QuestionsRequest): Question[] {
+function handleQuestions(body: QuestionsRequest, visible: Set<string> | null): Question[] {
   const openOnly = body.open_only ?? true; // default true — only unanswered
-  const rows = (openOnly ? selectOpenQuestions.all() : selectAllQuestions.all()) as (Omit<Question, "answered"> & {
+  let rows = (openOnly ? selectOpenQuestions.all() : selectAllQuestions.all()) as (Omit<Question, "answered"> & {
     answered: number;
   })[];
+  if (visible) rows = rows.filter((r) => visible.has(r.from_id));
   return rows.map((r) => ({ ...r, answered: !!r.answered }));
 }
 
@@ -1686,8 +1726,9 @@ function handleWorktreeAdd(body: WorktreeAddRequest): { ok: true } | { ok: false
 
 // id given => that seat's worktrees; omitted => all seats' (raw array, like
 // /list-claims — the caller coordinates).
-function handleWorktreeList(body: WorktreeListRequest): Worktree[] {
-  return (body.id ? selectWorktreesBySeat.all(body.id) : selectAllWorktrees.all()) as Worktree[];
+function handleWorktreeList(body: WorktreeListRequest, visible: Set<string> | null): Worktree[] {
+  const rows = (body.id ? selectWorktreesBySeat.all(body.id) : selectAllWorktrees.all()) as Worktree[];
+  return visible ? rows.filter((w) => visible.has(w.seat_id)) : rows;
 }
 
 // Drop ONE association, owner-scoped by seat_id+path (a seat can only de-register its
@@ -2605,6 +2646,29 @@ function resolveScope(presented: string | null): { scope: Scope; seatId?: string
   return { scope: "none" };
 }
 
+// The SEAT_SHARED routes that name ONE seat to act on or read. Value = the body field carrying
+// that target. Unlike SEAT_OWNED the target is another seat by design (you message a teammate,
+// you diff a teammate's tree) — so the constraint is not "must be me" but "must be in my
+// fleet", enforced below. /worktree-list's id is optional; absent, the result filter covers it.
+const SHARED_TARGET: Record<string, string> = {
+  "/send-message": "to_id",
+  "/wait-for": "target",
+  "/diff": "id",
+  "/worktree-list": "id",
+};
+
+// Every seat id belonging to one fleet — the visibility set a `seat`-scope caller gets on the
+// shared routes. seat_runs is read alongside seats because /log renders history: a teammate
+// that has since died still has messages in the log and must stay visible to its own fleet
+// (and, just as importantly, stay INVISIBLE to another one).
+function fleetSeatIds(fleet: string | null): Set<string> {
+  const ids = new Set<string>();
+  for (const r of db.query("SELECT id FROM seats WHERE fleet IS ?").all(fleet) as { id: string }[]) ids.add(r.id);
+  for (const r of db.query("SELECT seat_id FROM seat_runs WHERE fleet IS ?").all(fleet) as { seat_id: string }[])
+    ids.add(r.seat_id);
+  return ids;
+}
+
 function mintDashToken(): string {
   const now = Date.now();
   for (const [tok, exp] of dashTokens) if (exp <= now) dashTokens.delete(tok); // lazy prune
@@ -2712,6 +2776,29 @@ Bun.serve({
           return Response.json({ error: "seat token does not authorize this seat" }, { status: 403 });
         }
       }
+      // The FLEET boundary on the shared routes (the seat-owned ones are already pinned to one
+      // seat above). Without it a capability token reads and writes across every fleet on the
+      // machine: enumerate them all through /list-seats, then message, diff, or read the log of
+      // any id that turned up. The caller's fleet is resolved SERVER-SIDE from its own row —
+      // the `fleet` the CLI puts in a /list-seats body is a convenience, never the control, and
+      // is overwritten here. Null for `full`/`dash`, which see every fleet as they always have.
+      let visible: Set<string> | null = null;
+      if (auth.scope === "seat" && SEAT_SHARED.has(path)) {
+        const me = db.query("SELECT fleet FROM seats WHERE id = ?").get(auth.seatId!) as { fleet: string | null } | null;
+        // A token whose seat row is gone (reaped between resolveScope and here) speaks for
+        // nothing. Denied rather than defaulted to the null fleet, which would hand it every
+        // unfleeted seat on the machine.
+        if (!me) return Response.json({ error: "seat token does not authorize this seat" }, { status: 403 });
+        visible = fleetSeatIds(me.fleet ?? null);
+        const targetField = SHARED_TARGET[path];
+        const target = targetField === undefined ? undefined : (body as Record<string, unknown>)[targetField];
+        // 403, not an empty result: a cross-fleet target is a refusal, and reporting it as
+        // "not found" would still confirm which ids do not exist in the caller's own fleet.
+        if (typeof target === "string" && !visible.has(target)) {
+          return Response.json({ error: "seat token does not authorize this fleet" }, { status: 403 });
+        }
+        if (path === "/list-seats") (body as ListSeatsRequest).fleet = me.fleet ?? null;
+      }
       switch (path) {
         case "/dash-token":
           // Mint a scoped dashboard nonce. Reachable only at scope `full` — a dash nonce
@@ -2754,7 +2841,7 @@ Bun.serve({
         case "/observe-session":
           return Response.json(handleObserveSession(body as ObserveSessionRequest));
         case "/log":
-          return Response.json(handleLog(body as LogRequest));
+          return Response.json(handleLog(body as LogRequest, visible));
         case "/unregister":
           handleUnregister(body as UnregisterRequest);
           return Response.json({ ok: true });
@@ -2773,11 +2860,11 @@ Bun.serve({
         case "/release-claims":
           return Response.json(handleReleaseClaims(body as ReleaseClaimsRequest));
         case "/list-claims":
-          return Response.json(handleListClaims(body as ListClaimsRequest));
+          return Response.json(handleListClaims(body as ListClaimsRequest, visible));
         case "/ask":
           return Response.json(handleAsk(body as AskRequest));
         case "/questions":
-          return Response.json(handleQuestions(body as QuestionsRequest));
+          return Response.json(handleQuestions(body as QuestionsRequest, visible));
         case "/answer": {
           const a = handleAnswer(body as AnswerRequest);
           return Response.json(a.body, { status: a.status });
@@ -2785,7 +2872,7 @@ Bun.serve({
         case "/worktree-add":
           return Response.json(handleWorktreeAdd(body as WorktreeAddRequest));
         case "/worktree-list":
-          return Response.json(handleWorktreeList(body as WorktreeListRequest));
+          return Response.json(handleWorktreeList(body as WorktreeListRequest, visible));
         case "/worktree-remove":
           return Response.json(handleWorktreeRemove(body as WorktreeRemoveRequest));
         case "/lease-worktree":

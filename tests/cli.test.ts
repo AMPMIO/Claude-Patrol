@@ -5,9 +5,12 @@ import send, { briefMessage } from "../src/commands/send.ts";
 import rename from "../src/commands/rename.ts";
 import wait from "../src/commands/wait.ts";
 import stats from "../src/commands/stats.ts";
-import { bgPidState } from "../src/commands/down.ts";
+import { bgPidState, downEach } from "../src/commands/down.ts";
 import { relTime, truncate, usd, renderTable, secretPermsOk, parseClaudeHelp, pidAlive, resolveSeatTarget, seatLabel, BrokerError } from "../src/commands/_client.ts";
 import type { Seat, CostsResponse, StatsResponse } from "../shared/types.ts";
+import { writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const TOKEN = "test-token";
 let server: ReturnType<typeof Bun.serve>;
@@ -411,4 +414,66 @@ test("send --brief refuses a missing file before anything is queued", async () =
   const r = await capture(() => send(["someseat", "--brief", "/no/such/brief.md"]));
   expect(r.code).toBe(1);
   expect(r.err).toContain("brief not found");
+});
+
+// The brief form is <target> --brief <path> and nothing else. Taking [0] of the remainder
+// SILENTLY DROPPED everything after it, so a caller who typed a trailing note watched
+// "sent brief pointer" print for a message that never carried the note.
+test("send --brief rejects extra args instead of dropping them", async () => {
+  lastSend = null;
+  const briefPath = join(tmpdir(), `patrol-cli-brief-${process.pid}.md`);
+  writeFileSync(briefPath, "the brief");
+  try {
+    // The exact reported case: an extra word after the path.
+    const extra = await capture(() => send(["someseat", "--brief", briefPath, "urgent"]));
+    expect(extra.code).toBe(2);
+    expect(extra.err).toContain("usage:");
+    // ...and it must not have been queued as a brief anyway.
+    expect(lastSend).toBeNull();
+
+    // A second target is the same mistake with worse consequences (wrong recipient).
+    const twoTargets = await capture(() => send(["seatone", "seattwo", "--brief", briefPath]));
+    expect(twoTargets.code).toBe(2);
+
+    // A duplicated flag: which path wins is not something the caller should have to guess.
+    const dupe = await capture(() => send(["someseat", "--brief", briefPath, "--brief", briefPath]));
+    expect(dupe.code).toBe(2);
+
+    // No target at all.
+    expect((await capture(() => send(["--brief", briefPath]))).code).toBe(2);
+
+    // The documented form still works — the guard rejects extras, not the feature.
+    const ok = await capture(() => send(["aaaa1111", "--brief", briefPath]));
+    expect(ok.code).toBe(0);
+    expect(lastSend.text).toContain(briefPath);
+  } finally {
+    rmSync(briefPath, { force: true });
+  }
+});
+
+// --- patrol down --all (v0.3): one bad fleet must not strand the rest ---------
+
+test("down --all continues past a failing fleet and reports a nonzero exit", async () => {
+  const attempted: string[] = [];
+  const r = await capture(async () =>
+    downEach(["alpha", "beta", "gamma"], (fleet) => {
+      attempted.push(fleet);
+      // beta's tmux kill-session errors — exactly what killSession throws on.
+      if (fleet === "beta") throw new Error("tmux kill-session failed: server not found");
+    })
+  );
+  // The regression: gamma used to never be attempted at all.
+  expect(attempted).toEqual(["alpha", "beta", "gamma"]);
+  expect(r.code).toBe(1); // one failure -> the caller maps this to a nonzero exit
+  // And the failure is attributed, not swallowed into a generic CLI error.
+  expect(r.err).toContain('fleet "beta" failed to tear down');
+  expect(r.err).toContain("tmux kill-session failed");
+  expect(r.err).not.toContain("alpha");
+  expect(r.err).not.toContain("gamma");
+});
+
+test("down --all over healthy fleets reports no failures", async () => {
+  const r = await capture(async () => downEach(["alpha", "beta"], () => {}));
+  expect(r.code).toBe(0);
+  expect(r.err).toBe("");
 });

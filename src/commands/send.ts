@@ -40,8 +40,14 @@ export default async function send(args: string[]): Promise<number> {
 
   if (briefAt !== -1) {
     const raw = args[briefAt + 1];
-    to = args.filter((_, i) => i !== briefAt && i !== briefAt + 1)[0];
-    if (!raw || !to) {
+    // The brief form takes EXACTLY one target and one --brief <path>. Taking [0] of the
+    // remainder and ignoring the rest meant `patrol send seat --brief task.md urgent` printed
+    // "sent brief pointer" while "urgent" — which the caller believed it had just sent — was
+    // dropped on the floor. A message you think you sent and did not is worse than an error.
+    const rest = args.filter((_, i) => i !== briefAt && i !== briefAt + 1);
+    const duplicated = args.lastIndexOf("--brief") !== briefAt;
+    to = rest[0];
+    if (!raw || !to || rest.length !== 1 || duplicated) {
       console.error("usage: patrol send <handle-or-id> --brief <path-to-brief-file>");
       return 2;
     }

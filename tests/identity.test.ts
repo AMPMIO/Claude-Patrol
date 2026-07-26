@@ -412,3 +412,145 @@ describe("crash redelivery", () => {
     expect(left.c).toBe(0);
   });
 });
+
+// --- v0.3 wiring wave: the two boundaries the enforcement above was never actually measured
+//     against, because no production seat presented a capability token and no restart ever
+//     reached the adoption path. ---
+
+describe("crash redelivery: the un-swept restart", () => {
+  // The case that actually happens. `a restarted seat adopts…` above passes only because it
+  // sweeps first AND registers the replacement on a pid nothing holds — two conditions a real
+  // relaunch meets neither of. Production: the seat dies, the operator relaunches within
+  // seconds, and the 30s sweep has not run. The dead seat therefore still has a `seats` row
+  // (dead pid) and an OPEN seat_runs row, so it was invisible to adoption twice over — the
+  // live-holder guard saw the REPLACEMENT's own live pid, and a run with no ended_at is not a
+  // candidate. The mail was then purged by the sweep that eventually arrived.
+  test("a relaunch that beats the sweep, on a REAL live pid, still adopts its unacked mail", async () => {
+    // A genuine process to crash, not a fabricated pid: the guards are pid-liveness checks,
+    // so a fake pid tests the wrong branch.
+    const crashing = Bun.spawn(["sleep", "120"], { stdio: ["ignore", "ignore", "ignore"] });
+    const first = (await (await post("/register", {
+      pid: crashing.pid, cwd: "/tmp/unswept", git_root: null, tty: null, summary: "w",
+      role: null, model: null, fleet: "unswept", stable_key: "unswept/worker",
+    })).json()) as Reg;
+
+    await post("/send-message", { from_id: "cli", to_id: first.id, text: "survive the crash" });
+    // Leased and in flight when the process dies — unacked, so it is owed redelivery.
+    const inFlight = (await (await post("/poll-messages", { id: first.id }, first.capability_token!)).json()) as {
+      messages: Array<{ text: string }>;
+    };
+    expect(inFlight.messages.map((m) => m.text)).toContain("survive the crash");
+
+    crashing.kill();
+    await crashing.exited;
+
+    // NO sweep(). That is the whole test: the broker has not yet noticed the crash.
+    const second = (await (await post("/register", {
+      pid: livePid(), cwd: "/tmp/unswept", git_root: null, tty: null, summary: "w",
+      role: null, model: null, fleet: "unswept", stable_key: "unswept/worker",
+    })).json()) as Reg;
+    expect(second.id).not.toBe(first.id);
+
+    const redelivered = (await (await post("/poll-messages", { id: second.id }, second.capability_token!)).json()) as {
+      messages: Array<{ text: string }>;
+    };
+    expect(redelivered.messages.map((m) => m.text)).toContain("survive the crash");
+  });
+
+  // The abuse guard must survive the fix that made the above work: excluding the registering
+  // seat from the live-holder query must not also excuse a holder that is genuinely running.
+  test("an un-swept LIVE holder is still not adoptable", async () => {
+    const victim = await register({ fleet: "unswept2", stable_key: "unswept2/worker" });
+    await post("/send-message", { from_id: "cli", to_id: victim.id, text: "still mine" });
+    const attacker = await register({ fleet: "unswept2", stable_key: "unswept2/worker" });
+    const stolen = (await (await post("/poll-messages", { id: attacker.id }, attacker.capability_token!)).json()) as {
+      messages: Array<{ text: string }>;
+    };
+    expect(stolen.messages).toHaveLength(0);
+    const kept = (await (await post("/poll-messages", { id: victim.id }, victim.capability_token!)).json()) as {
+      messages: Array<{ text: string }>;
+    };
+    expect(kept.messages.map((m) => m.text)).toContain("still mine");
+  });
+});
+
+describe("fleet confinement at seat scope", () => {
+  // SEAT_OWNED routes were pinned to one seat, but the SHARED ones were not pinned to anything:
+  // a capability token could enumerate every fleet on the machine through /list-seats and then
+  // message, diff, or read the log of any id it found. Client-side filtering (the fleet the CLI
+  // puts in a /list-seats body) is a convenience, not an authorization boundary.
+  let north: Reg;
+  let south: Reg;
+
+  beforeAll(async () => {
+    north = await register({ fleet: "north", stable_key: "north/w", name: "northw", cwd: "/tmp/north" });
+    south = await register({ fleet: "south", stable_key: "south/w", name: "southw", cwd: "/tmp/south" });
+    // State in the SOUTH fleet for north to fail to reach.
+    await post("/send-message", { from_id: "cli", to_id: south.id, text: "south-only traffic" });
+    await post("/worktree-add", { id: south.id, path: "/tmp/south/wt", branch: "s", base_commit: "abc" }, south.capability_token!);
+    await post("/claim-path", { id: south.id, paths: ["/tmp/south/secret.ts"] }, south.capability_token!);
+    await post("/ask", { id: south.id, text: "south question" }, south.capability_token!);
+  });
+
+  test("/list-seats cannot enumerate another fleet, whatever fleet the body asks for", async () => {
+    // Asking for south explicitly is the direct attempt...
+    const asked = (await (await post("/list-seats", { scope: "machine", cwd: "/", git_root: null, fleet: "south" }, north.capability_token!)).json()) as Array<{ id: string }>;
+    expect(asked.some((s) => s.id === south.id)).toBe(false);
+    expect(asked.some((s) => s.id === north.id)).toBe(true);
+    // ...and omitting the key entirely used to mean "every fleet".
+    const omitted = (await (await post("/list-seats", { scope: "machine", cwd: "/", git_root: null }, north.capability_token!)).json()) as Array<{ id: string }>;
+    expect(omitted.some((s) => s.id === south.id)).toBe(false);
+    expect(omitted.some((s) => s.id === north.id)).toBe(true);
+  });
+
+  test("/send-message cannot reach a seat in another fleet", async () => {
+    const res = await post("/send-message", { from_id: north.id, to_id: south.id, text: "cross-fleet" }, north.capability_token!);
+    expect(res.status).toBe(403);
+    // ...and nothing was queued: south's next poll sees only its own traffic.
+    const inbox = (await (await post("/poll-messages", { id: south.id }, south.capability_token!)).json()) as {
+      messages: Array<{ text: string }>;
+    };
+    expect(inbox.messages.map((m) => m.text)).not.toContain("cross-fleet");
+  });
+
+  test("/log cannot read another fleet's messages", async () => {
+    const seen = (await (await post("/log", {}, north.capability_token!)).json()) as {
+      messages: Array<{ to_id: string; text: string }>;
+    };
+    expect(seen.messages.some((m) => m.to_id === south.id)).toBe(false);
+    expect(seen.messages.some((m) => m.text === "south-only traffic")).toBe(false);
+  });
+
+  test("/diff cannot read another fleet's working tree", async () => {
+    expect((await post("/diff", { id: south.id }, north.capability_token!)).status).toBe(403);
+  });
+
+  test("/worktree-list, /list-claims and /questions are confined to the caller's fleet", async () => {
+    // Explicit foreign target: refused outright.
+    expect((await post("/worktree-list", { id: south.id }, north.capability_token!)).status).toBe(403);
+    // Unfiltered: the foreign rows are simply not there.
+    const trees = (await (await post("/worktree-list", {}, north.capability_token!)).json()) as Array<{ seat_id: string }>;
+    expect(trees.some((w) => w.seat_id === south.id)).toBe(false);
+
+    const claims = (await (await post("/list-claims", {}, north.capability_token!)).json()) as Array<{ owner_id: string; path: string }>;
+    expect(claims.some((c) => c.owner_id === south.id)).toBe(false);
+    expect(claims.some((c) => c.path.includes("south/secret.ts"))).toBe(false);
+
+    const questions = (await (await post("/questions", {}, north.capability_token!)).json()) as Array<{ from_id: string }>;
+    expect(questions.some((q) => q.from_id === south.id)).toBe(false);
+  });
+
+  test("/wait-for cannot observe a seat in another fleet", async () => {
+    const res = await post("/wait-for", { id: north.id, target: south.id, until: ["done"], timeout_ms: 0 }, north.capability_token!);
+    expect(res.status).toBe(403);
+  });
+
+  test("the OPERATOR still crosses fleets — this is a seat-scope boundary, not a global one", async () => {
+    const all = (await (await post("/list-seats", { scope: "machine", cwd: "/", git_root: null })).json()) as Array<{ id: string }>;
+    expect(all.some((s) => s.id === north.id)).toBe(true);
+    expect(all.some((s) => s.id === south.id)).toBe(true);
+    const claims = (await (await post("/list-claims", {})).json()) as Array<{ owner_id: string }>;
+    expect(claims.some((c) => c.owner_id === south.id)).toBe(true);
+    expect((await post("/diff", { id: south.id })).status).toBe(200);
+  });
+});
