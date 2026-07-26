@@ -24,7 +24,8 @@ import {
   findSessionIdByHeuristic,
   billingSourceFromEntrypoint,
 } from "./costs.ts";
-import { SEAT_TOKEN_RE, LEASE_TTL_SECONDS } from "../shared/types.ts";
+import { randomBytes } from "node:crypto";
+import { SEAT_TOKEN_RE, LEASE_TTL_SECONDS, LEASE_TOKEN_RE } from "../shared/types.ts";
 import type {
   RegisterRequest,
   RegisterResponse,
@@ -386,6 +387,19 @@ db.run(`
 `);
 db.run(`CREATE INDEX IF NOT EXISTS idx_leases_seat ON checkpoint_leases(seat_id)`);
 
+// v0.2.9.1: the per-CHECKPOINT token (shared/types.ts LEASE_TOKEN_RE). Additive, same
+// try/catch idiom as the other column adds. PRIMARY KEY (path) was the whole exclusion,
+// but leaseWorktreeTxn treated a same-seat_id acquire as a RENEWAL — so `patrol
+// checkpoint` twice on one seat gave BOTH processes a live lease, and either could
+// release it out from under the other. The token is what makes the holder a specific RUN
+// rather than a seat. A pre-0.2.9.1 row reads NULL and is treated as unrenewable and
+// unreleasable-by-token; it still expires on its own, which is the safe direction.
+try {
+  db.run(`ALTER TABLE checkpoint_leases ADD COLUMN token TEXT`);
+} catch {
+  /* already present */
+}
+
 // v0.2.9 path aliasing fix. worktreeAddTxn compared raw path TEXT, so `/p/wt`, `/p/wt/`,
 // `/p/x/../wt` and a symlink to it were four DIFFERENT paths — which restores the
 // two-seats-one-worktree bug 0.2.8 closed for a single spelling. Canonicalize at the
@@ -626,14 +640,18 @@ const selectWorktreeOwnersByPath = db.prepare(
 // below refuses first). Delete is owner-scoped by seat_id AND matches either spelling —
 // the caller may release after the tree is gone, when realpath can no longer canonicalize.
 const upsertLease = db.prepare(
-  `INSERT INTO checkpoint_leases (seat_id, path, expires_at, created_at) VALUES (?, ?, ?, ?)
-   ON CONFLICT(path) DO UPDATE SET seat_id = excluded.seat_id, expires_at = excluded.expires_at`
+  `INSERT INTO checkpoint_leases (seat_id, path, expires_at, created_at, token) VALUES (?, ?, ?, ?, ?)
+   ON CONFLICT(path) DO UPDATE SET seat_id = excluded.seat_id, expires_at = excluded.expires_at, token = excluded.token`
 );
 const selectLeaseByPath = db.prepare(
-  `SELECT l.seat_id AS seat_id, l.expires_at AS expires_at, s.handle AS handle
+  `SELECT l.seat_id AS seat_id, l.expires_at AS expires_at, l.token AS token, s.handle AS handle
    FROM checkpoint_leases l LEFT JOIN seats s ON s.id = l.seat_id WHERE l.path = ?`
 );
-const deleteLease = db.prepare(`DELETE FROM checkpoint_leases WHERE seat_id = ? AND path IN (?, ?)`);
+// v0.2.9.1: release is scoped by TOKEN, not seat_id. Scoping by seat let a second
+// checkpoint of the same seat delete the first one's lease mid-merge. Still matches
+// either path spelling — the caller may release after the tree is gone, when realpath
+// can no longer canonicalize.
+const deleteLease = db.prepare(`DELETE FROM checkpoint_leases WHERE token = ? AND path IN (?, ?)`);
 
 // --- Seat ID ---
 
@@ -1427,21 +1445,46 @@ function handleWorktreeRemove(body: WorktreeRemoveRequest): { ok: true } {
 // claimBatch/worktreeAddTxn): two checkpoints racing the same tree must never both read
 // "unheld" before either writes, or both would merge against a seat that only one of them
 // quiesced — the exact failure this replaces.
+// v0.2.9.1: ownership is the TOKEN, not the seat. `reqToken` null means "fresh acquire" —
+// any unexpired lease refuses it, INCLUDING one held by the same seat, because a second
+// checkpoint of one seat is a second holder, not a renewal. A non-null reqToken is a RENEW
+// and must match the stored token exactly; a renewal that no longer matches means our
+// lease was reaped or taken over, and the caller must abort rather than keep merging.
 const leaseWorktreeTxn = db.transaction(
-  (id: string, path: string, now: string, expiresAt: string): LeaseWorktreeResponse => {
-    const held = selectLeaseByPath.get(path) as { seat_id: string; expires_at: string; handle: string | null } | null;
+  (id: string, path: string, now: string, expiresAt: string, reqToken: string | null, newToken: string): LeaseWorktreeResponse => {
+    const held = selectLeaseByPath.get(path) as
+      | { seat_id: string; expires_at: string; token: string | null; handle: string | null }
+      | null;
     // An EXPIRED lease blocks nobody: a checkpoint killed between acquire and release must
     // not wedge the tree forever, and the guard hook already fails open past expiry.
-    if (held && held.seat_id !== id && held.expires_at > now) {
-      return {
-        ok: false,
-        error: `${path} is leased until ${held.expires_at} by ${held.handle ? `${held.handle} (${held.seat_id})` : held.seat_id}`,
-      };
+    const live = held !== null && held.expires_at > now;
+    if (reqToken === null) {
+      if (live) {
+        const who = held!.handle ? `${held!.handle} (${held!.seat_id})` : held!.seat_id;
+        return { ok: false, error: `${path} is leased until ${held!.expires_at} by ${who}` };
+      }
+      upsertLease.run(id, path, expiresAt, now, newToken);
+      return { ok: true, expires_at: expiresAt, token: newToken };
     }
-    upsertLease.run(id, path, expiresAt, now); // the holder re-leasing: renews expiry in place
-    return { ok: true, expires_at: expiresAt };
+    // RENEW. Refuse on anything other than a live lease still carrying our exact token —
+    // an expired one has already let the seat resume writing, so silently re-taking it
+    // would hand the caller a "renewed" lease across a window it never actually held.
+    if (!live || held!.token !== reqToken) {
+      return { ok: false, error: `the lease on ${path} is no longer ours (expired, released, or taken over)` };
+    }
+    upsertLease.run(id, path, expiresAt, now, reqToken);
+    return { ok: true, expires_at: expiresAt, token: reqToken };
   }
 );
+
+// "cpl-" + 32 lowercase hex. Verified against the frozen LEASE_TOKEN_RE before it leaves
+// the broker, so a drift can never ship a token the clients won't match (same discipline
+// as genSeatToken/SEAT_TOKEN_RE in up.ts).
+function genLeaseToken(): string {
+  const token = "cpl-" + randomBytes(16).toString("hex");
+  if (!LEASE_TOKEN_RE.test(token)) throw new Error(`bug: generated malformed lease token "${token}"`);
+  return token;
+}
 
 function handleLeaseWorktree(body: LeaseWorktreeRequest): LeaseWorktreeResponse {
   if (!liveSeat(body.id)) return { ok: false, error: `${body.id} is not a live seat` };
@@ -1451,15 +1494,30 @@ function handleLeaseWorktree(body: LeaseWorktreeRequest): LeaseWorktreeResponse 
   } catch {
     return { ok: false, error: `${body.path} is not an existing absolute path` };
   }
+  // A malformed token is never treated as "no token" — that would silently downgrade a
+  // renewal into a fresh acquire and hand out a lease the caller's own file doesn't match.
+  const reqToken = body.token ?? null;
+  if (reqToken !== null && !LEASE_TOKEN_RE.test(reqToken)) {
+    return { ok: false, error: `malformed lease token` };
+  }
   const now = Date.now();
-  return leaseWorktreeTxn(body.id, path, new Date(now).toISOString(), new Date(now + LEASE_TTL_SECONDS * 1000).toISOString());
+  return leaseWorktreeTxn(
+    body.id, path,
+    new Date(now).toISOString(),
+    new Date(now + LEASE_TTL_SECONDS * 1000).toISOString(),
+    reqToken, genLeaseToken()
+  );
 }
 
-// Owner-scoped by seat_id+path and idempotent (releasing a lease nobody holds matches
-// nothing), because checkpoint releases from a `finally` on every exit path — including
-// ones where the acquire never succeeded.
+// Owner-scoped by TOKEN+path and idempotent (releasing a lease nobody holds matches
+// nothing), because checkpoint releases from a `finally` on every exit path.
+//
+// v0.2.9.1: scoping by seat_id was the release half of the same-seat double-checkpoint
+// hole — the second run's release deleted the first run's row while it was still merging.
+// A token that doesn't match the stored one deletes NOTHING, so a stale or hostile release
+// is a no-op rather than an un-quiesced seat.
 function handleReleaseWorktree(body: ReleaseWorktreeRequest): { ok: true } {
-  deleteLease.run(body.id, body.path, canonicalPathOrRaw(body.path));
+  deleteLease.run(body.token, body.path, canonicalPathOrRaw(body.path));
   return { ok: true };
 }
 
@@ -2098,9 +2156,18 @@ export function validate(path: string, body: unknown): string | null {
     // v0.2.9: same shape as /worktree-remove — a slug id and a bounded path. Existence and
     // canonicalization are the HANDLER's job (they need the filesystem, validate() is pure).
     case "/lease-worktree":
+      if (!isSlug(b.id)) return "id must be an 8-char [a-z0-9] slug";
+      if (!isStr(b.path, MAX_PATH, 1)) return `path must be a non-empty string ≤${MAX_PATH} chars`;
+      // v0.2.9.1: optional — absent is a fresh acquire, present is a renewal. Shape is
+      // re-checked in the handler; here it only bounds what reaches the db.
+      if (b.token != null && !(isStr(b.token, 36, 36) && LEASE_TOKEN_RE.test(b.token))) return "token must match cpl-<32 hex>";
+      return null;
     case "/release-worktree":
       if (!isSlug(b.id)) return "id must be an 8-char [a-z0-9] slug";
       if (!isStr(b.path, MAX_PATH, 1)) return `path must be a non-empty string ≤${MAX_PATH} chars`;
+      // REQUIRED here, unlike the acquire: a release is only ever a claim of ownership,
+      // and one that can't present the token must delete nothing.
+      if (!(isStr(b.token, 36, 36) && LEASE_TOKEN_RE.test(b.token))) return "token must match cpl-<32 hex>";
       return null;
     case "/diff":
       return isSlug(b.id) ? null : "id must be an 8-char [a-z0-9] slug";

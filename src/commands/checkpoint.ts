@@ -17,20 +17,34 @@
 // a way this reported success while a commit went unmerged, and the third proved the last
 // fence cannot even read the seat's HEAD (the worktree is already gone by then). Detection
 // cannot win a race against a still-working agent, so the seat is QUIESCED first: acquire a
-// lease, write the lease FILE the seat's PreToolUse guard hook stats (it denies every
-// mutating tool while that file is live), verify the branch tip has stopped moving, and only
-// THEN merge. FENCES 1/2/3 are kept exactly as they were — with a lease they should never
-// trip, so a trip is now a real signal (the guard hook failed) rather than the primary defense.
+// lease, write the lease FILE the seat's PreToolUse guard hook stats (it denies the seat's
+// tool calls while that file is live), verify the branch tip has stopped moving, and only
+// THEN merge. FENCES 1/2/3 are kept exactly as they were — they are now the detector for
+// what a lease CANNOT cover, not the primary defense.
+//
+// WHAT THE LEASE IS AND IS NOT (v0.2.9.1 — say this plainly, it was overclaimed before).
+// The lease quiesces the seat's TOOL CALLS. It is not a freeze of the worktree:
+//   * a background process the seat spawned BEFORE the lease landed keeps writing, and no
+//     PreToolUse hook can see it (process-level quiescence is deliberately out of scope);
+//   * a tool call already in flight completes (QUIESCE_SETTLE_MS covers that one);
+//   * `guarded` proves the hook is INSTALLABLE, never that Claude loaded it (see
+//     checkGuardable in seat-server.ts).
+// So this is the strongest thing a hook-based mechanism can be, and the fences stay.
+//
+// v0.2.9.1 also fixes the lease outliving nothing: the lease is RENEWED on a timer for the
+// whole run (LEASE_RENEW_MS), because a `--gate` or a large-repo merge easily outlives the
+// 120s TTL — past which the hook fails open and the seat silently resumes writing while
+// this process merges on. A renewal failure ABORTS; nothing proceeds on a lapsed lease.
 //
 // The lease is ALWAYS released in a `finally`, on every exit path including an exception. A
 // leaked lease outliving its TTL is survivable (the hook fails open on expiry) but must not
 // be the normal case — that is a seat that mysteriously cannot write for two minutes.
-import { spawnSync } from "bun";
-import { mkdtempSync, rmSync, realpathSync, writeFileSync, unlinkSync } from "node:fs";
+import { spawnSync, spawn, type Subprocess } from "bun";
+import { mkdtempSync, mkdirSync, rmSync, realpathSync, writeFileSync, readFileSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { brokerPost, BrokerError, resolveSeatTarget, gitRoot } from "./_client.ts";
-import { LEASE_FILE_ENV } from "../../shared/types.ts";
+import { LEASE_FILE_ENV, LEASE_TTL_SECONDS } from "../../shared/types.ts";
 import type { Worktree, Seat, LeaseWorktreeResponse } from "../../shared/types.ts";
 
 // A worktree row plus the lease column /worktree-list now joins in (v0.2.9, additive).
@@ -41,6 +55,34 @@ type LeasedWorktree = Worktree & { lease_expires_at?: string | null };
 // call, not the one already running — so the tip can move once AFTER acquisition. Two equal
 // reads either side of this pause is the evidence that it has stopped.
 const QUIESCE_SETTLE_MS = 300;
+
+// v0.2.9.1 — HOW OFTEN THE LEASE IS RENEWED, and why this exists at all.
+//
+// Through v0.2.9 the lease file was written ONCE and then a `--gate` ran to completion
+// synchronously. LEASE_TTL_SECONDS is 120 and the guard hook FAILS OPEN past expiry, so
+// any gate longer than two minutes — an ordinary test suite — silently un-quiesced the
+// seat MID-CHECKPOINT while checkpoint carried on to merge and remove. That is exactly
+// the race the lease exists to remove, restored by the lease's own timeout.
+//
+// So the lease is renewed on a timer at a THIRD of the TTL: two consecutive renewals can
+// fail and the seat is still quiesced when the third is attempted. A renewal that DOES
+// fail is fatal — see the abort path in checkpoint(); nothing proceeds on a lapsed lease.
+// The env override exists so the renewal can be exercised without a 120-second test (same
+// idiom as the broker's CLAUDE_PATROL_LEASE_TTL_MS). It changes the CADENCE only — never
+// the TTL the hook enforces — so a bad value can make renewals more frequent, never later.
+const LEASE_RENEW_MS = Math.min(
+  (LEASE_TTL_SECONDS * 1000) / 3,
+  parseInt(process.env.CLAUDE_PATROL_CHECKPOINT_RENEW_MS ?? "") || (LEASE_TTL_SECONDS * 1000) / 3
+);
+
+// Is `child` the same directory as `parent`, or nested under it? Deliberately a COPY of
+// the same helper in plugin/hooks/checkpoint-guard.ts: that hook is self-contained so it
+// survives packaging, and the two must agree on what "the lease covers this session"
+// means. A drift makes checkpoint accept a seat whose hook will never deny.
+function within(child: string, parent: string): boolean {
+  if (child === parent) return true;
+  return child.startsWith(parent.endsWith("/") ? parent : parent + "/");
+}
 
 // The integration target. The v0.2.6 contract and the fleet discipline integrate
 // task branches into "main"; a fleet on a different trunk would parameterize this.
@@ -124,23 +166,48 @@ function seatDrift(seatPath: string, branch: string, branchSha: string, headAtSn
 
 // The seat's half of the lease: the guard hook's fast path is a FILE stat, not a broker
 // round-trip (PreToolUse fires on every tool call — a request per call would tax the fleet).
-// Contents are what the hook needs to decide: when this lease dies, and which tree it covers.
-function writeLeaseFile(leaseFile: string, expiresAt: string, path: string) {
-  writeFileSync(leaseFile, JSON.stringify({ expires_at: expiresAt, path }));
+// Contents are what the hook needs to decide: when this lease dies, which tree it covers,
+// and (v0.2.9.1) the per-checkpoint token that says WHOSE lease this is.
+//
+// mkdir is defensive, not decorative: `patrol up` creates the lease dir at launch, but a
+// seat installed by hand (or a clean install whose fleet was never `patrol up`ed) has no
+// such directory, and this used to throw ENOENT AFTER the broker lease was taken — a seat
+// recorded as quiesced with nothing on disk actually guarding it.
+// `version` is what lets this format change later without a stale hook misreading a new
+// file: an old hook that doesn't recognize the version FAILS OPEN rather than guessing at
+// fields that have moved. Bump it on any change to the meaning of the fields below.
+const LEASE_FILE_VERSION = 1;
+
+function writeLeaseFile(leaseFile: string, expiresAt: string, path: string, token: string) {
+  mkdirSync(dirname(leaseFile), { recursive: true, mode: 0o700 });
+  writeFileSync(leaseFile, JSON.stringify({ version: LEASE_FILE_VERSION, token, expires_at: expiresAt, path }));
+}
+
+// Unlink the lease file ONLY if it is still ours. Through v0.2.9 release unlinked
+// unconditionally, so a second checkpoint on the same seat (which the broker also let
+// through — leases were keyed on seat_id alone) could delete the file the first one was
+// still running behind, un-quiescing the seat mid-merge. Reading the token back before
+// unlinking is the check that makes release owner-scoped on the filesystem too.
+function unlinkOwnLeaseFile(leaseFile: string, token: string) {
+  try {
+    const on_disk = JSON.parse(readFileSync(leaseFile, "utf8"))?.token;
+    if (on_disk !== token) return; // someone else's lease (or a stale file) — leave it alone
+    unlinkSync(leaseFile);
+  } catch {
+    /* never written, already gone, or unreadable — nothing safe to remove */
+  }
 }
 
 // Best-effort by design: this runs from a `finally` where the interesting failure has
 // already happened and must not be masked by a cleanup throw. An unremoved file still
 // expires (the hook fails open past expires_at), so the worst case is bounded.
-function releaseLease(id: string, path: string, leaseFile: string | null) {
-  if (leaseFile) {
-    try {
-      unlinkSync(leaseFile);
-    } catch {
-      /* never written, or already gone */
-    }
-  }
-  return brokerPost<{ ok: true }>("/release-worktree", { id, path }).catch(() => {});
+//
+// A null token means the acquire never succeeded (the `--force`-without-a-lease path), so
+// there is nothing of ours to release and releasing anyway would drop somebody else's.
+function releaseLease(id: string, path: string, leaseFile: string | null, token: string | null) {
+  if (token === null) return Promise.resolve();
+  if (leaseFile) unlinkOwnLeaseFile(leaseFile, token);
+  return brokerPost<{ ok: true }>("/release-worktree", { id, path, token }).catch(() => {});
 }
 
 export default async function checkpoint(args: string[]): Promise<number> {
@@ -224,19 +291,78 @@ export default async function checkpoint(args: string[]): Promise<number> {
         console.error(`  relaunch the seat so it registers its ${LEASE_FILE_ENV} path, or pass --force to accept fences-only behavior.`);
         return 1;
       }
+      // CWD BINDING. v0.2.9.1 binds the guard hook's deny to the worktree the lease
+      // names, so a stale or foreign lease file cannot freeze an unrelated seat. The cost
+      // is that a seat whose session cwd is disjoint from the tree being checkpointed
+      // gets NO deny — and because the hook fails open, that would be silent. Refuse here
+      // instead: a loud "cannot bind" beats merging behind a guard that never fires.
+      const seatCwd = (() => { try { return realpathSync(seat.cwd); } catch { return seat.cwd; } })();
+      if (!within(seatCwd, seatPath) && !within(seatPath, seatCwd)) {
+        console.error(`patrol checkpoint: ${target} is working in ${seatCwd}, which is outside the worktree being checked in (${seatPath}).`);
+        console.error(`  its guard hook binds a lease to the tree the seat is sitting in, so this lease could not deny anything — the seat would keep writing.`);
+        console.error(`  check in the worktree the seat actually occupies, or pass --force to accept fences-only behavior.`);
+        return 1;
+      }
     }
 
     // ACQUIRE. --force skips only the GUARD requirement above — it must still take the lease
     // when it can, so a forced checkpoint still excludes a second concurrent checkpoint.
     const lease = await brokerPost<LeaseWorktreeResponse>("/lease-worktree", { id, path: seatPath });
+    // The per-CHECKPOINT token, minted by the broker at acquire. null == we hold nothing.
+    const token = lease.ok ? lease.token! : null;
     if (!lease.ok) {
       console.error(`patrol checkpoint: could not lease ${seatPath} — ${lease.error ?? "unknown"}`);
       if (!force) return 1;
       console.error(`  --force: proceeding WITHOUT the lease; the seat is not quiesced and the fences are the only protection.`);
     }
     // Everything past acquisition releases in the `finally` below — including a throw.
+    //
+    // RENEWAL. A held lease must outlive whatever runs under it — a gate, a slow merge on
+    // a large repo — or it expires, the hook fails open, and the seat resumes writing
+    // while checkpoint carries on believing it is quiesced. So renew on a timer for as
+    // long as we hold it, and treat a renewal FAILURE as fatal: the abort path below
+    // kills the gate and refuses to merge rather than continue on a lapsed lease.
+    //
+    // `lost` is an object, not a bare `let`: TypeScript keeps the narrowing from the
+    // initializer across the closure assignment, so a plain string|null would read as
+    // never-set at the checks below.
+    const lost: { why: string | null } = { why: null };
+    let gateChild: Subprocess | null = null;
+    let renewTimer: ReturnType<typeof setInterval> | null = null;
+    const renew = async () => {
+      try {
+        const r = await brokerPost<LeaseWorktreeResponse>("/lease-worktree", { id, path: seatPath, token: token! });
+        if (!r.ok) throw new Error(r.error ?? "broker refused the renewal");
+        if (leaseFilePath) writeLeaseFile(leaseFilePath, r.expires_at!, seatPath, token!);
+      } catch (e) {
+        lost.why = e instanceof Error ? e.message : String(e);
+        if (renewTimer) clearInterval(renewTimer);
+        renewTimer = null;
+        // Kill the gate NOW — from here on it is running against an unquiesced seat, and
+        // every second it keeps running is a second the seat can commit underneath it.
+        // NOTE: this signals the `sh -c` child, not its whole process group, so a gate
+        // that backgrounded work of its own can leave grandchildren running.
+        gateChild?.kill();
+      }
+    };
+    // Reports the abort and returns true when the lease has lapsed. Called before every
+    // step that mutates anything, so a renewal failure can never be overtaken by a merge.
+    const leaseLapsed = (): boolean => {
+      if (lost.why === null) return false;
+      console.error(`patrol checkpoint: ABORTED — the lease on ${seatPath} could not be renewed (${lost.why}).`);
+      console.error(`  the seat is no longer quiesced, so nothing was merged and the worktree is left intact and still tracked.`);
+      return true;
+    };
+
+    // QUIESCED means the seat's guard hook can actually see this lease — a broker row plus
+    // the FILE that hook stats. A row on its own excludes other checkpoints and nothing
+    // else, so it must never be reported as if the seat had been paused.
+    const quiesced = token !== null && leaseFilePath !== null;
     try {
-      if (lease.ok && leaseFilePath) writeLeaseFile(leaseFilePath, lease.expires_at!, seatPath);
+      if (token) {
+        if (leaseFilePath) writeLeaseFile(leaseFilePath, lease.expires_at!, seatPath, token);
+        renewTimer = setInterval(renew, LEASE_RENEW_MS);
+      }
 
       // VERIFY QUIESCENCE. A tool call already in flight when the lease landed still
       // completes, so the tip may move once more after acquisition. Read it, pause, read
@@ -262,13 +388,25 @@ export default async function checkpoint(args: string[]): Promise<number> {
       const headAtSnapshot = symbolicHead(seatPath);
 
       // 1. Gate — run IN THE WORKTREE. A failing gate must never reach the merge.
+      //
+      // ASYNCHRONOUS as of v0.2.9.1. spawnSync blocked this whole process, which meant the
+      // renewal timer above could never fire: the lease expired under any gate longer than
+      // LEASE_TTL_SECONDS (an ordinary test suite), the hook failed open, and the seat went
+      // back to writing while checkpoint went on to merge and remove. Awaiting the child
+      // instead keeps the event loop — and therefore the renewal — alive for the duration.
       if (gate) {
-        const g = spawnSync(["sh", "-c", gate], { cwd: seatPath, stdout: "inherit", stderr: "inherit" });
-        if ((g.exitCode ?? 1) !== 0) {
-          console.error(`patrol checkpoint: gate failed (exit ${g.exitCode}) — not merging; worktree left intact at ${seatPath}`);
+        gateChild = spawn(["sh", "-c", gate], { cwd: seatPath, stdout: "inherit", stderr: "inherit" });
+        const code = await gateChild.exited;
+        gateChild = null;
+        // Order matters: a lapsed lease is why the gate died, so report THAT, not "gate
+        // failed (exit 143)" — which would read as the user's tests failing.
+        if (leaseLapsed()) return 1;
+        if (code !== 0) {
+          console.error(`patrol checkpoint: gate failed (exit ${code}) — not merging; worktree left intact at ${seatPath}`);
           return 1;
         }
       }
+      if (leaseLapsed()) return 1;
 
       // FENCE 1 (post-gate, pre-merge). The seat may have committed or switched branches
       // during the gate. STOP before merging a stale tip — nothing was integrated, so
@@ -297,6 +435,10 @@ export default async function checkpoint(args: string[]): Promise<number> {
           return 1;
         }
 
+        // Last check before the only irreversible step. `git worktree add` can be slow on
+        // a large repo, so the lease may have lapsed since the fence above.
+        if (leaseLapsed()) return 1;
+
         const merge = git(plan.merge);
         if (!merge.ok) {
           // Conflict (or an unmet merge precondition, e.g. missing committer identity):
@@ -321,6 +463,15 @@ export default async function checkpoint(args: string[]): Promise<number> {
             `patrol checkpoint: ${target} ${mergeDrift}; merged ${head.slice(0, 12)} into ${TRUNK}, but the seat is no longer on the pinned snapshot. Re-run to integrate the newer work.`
           );
           console.error(`  the worktree at ${seatPath} is left intact and still tracked.`);
+          return 1;
+        }
+
+        // The merge has landed on TRUNK and cannot be un-done here, but removing the
+        // seat's tree still can be withheld: on a lapsed lease, stop and keep the tree.
+        if (lost.why !== null) {
+          console.error(`patrol checkpoint: INCOMPLETE — merged ${head.slice(0, 12)} into ${TRUNK}, but the lease lapsed (${lost.why}) before the worktree could be removed.`);
+          console.error(`  ${TRUNK} KEEPS the merge — an abort stops and reports state, it never unwinds an integration that already landed.`);
+          console.error(`  the worktree at ${seatPath} is left intact and still tracked; nothing is lost. Re-run once the seat is idle to finish the removal.`);
           return 1;
         }
 
@@ -357,7 +508,20 @@ export default async function checkpoint(args: string[]): Promise<number> {
         // never disagree.
         await brokerPost<{ ok: boolean }>("/worktree-remove", { id, path: seatPath });
 
+        // Say exactly what was and was not guaranteed — three genuinely different states,
+        // because a broker lease alone quiesces NOTHING. Holding the row without a lease
+        // FILE (a --force'd unguarded seat) only excluded a competing checkpoint; the seat
+        // itself kept its hands free the whole time. And even a full lease pauses the
+        // seat's TOOL CALLS, not a process it had already spawned. Overclaiming here is
+        // what would make the next reader trust this more than they should.
         console.log(`checkpoint: merged ${branch} into ${TRUNK} → ${head}`);
+        console.log(
+          quiesced
+            ? `  (lease held throughout; the seat's tool calls were paused — background processes it had already started are not covered)`
+            : token
+              ? `  (--force: ran WITHOUT a lease on the seat — it was NOT paused; the lease only kept other checkpoints out, and the fences alone checked for drift)`
+              : `  (--force: ran WITHOUT a lease at all — the seat was NOT paused and only the fences checked for drift)`
+        );
         console.log(`removed worktree ${seatPath} (branch ${branch} left in place)`);
         return 0;
       } finally {
@@ -370,8 +534,11 @@ export default async function checkpoint(args: string[]): Promise<number> {
       // RELEASE on EVERY exit path — success, refusal, and exception alike. A seat left
       // holding a lease it cannot see the end of is one that silently refuses to work until
       // the TTL expires, which is the failure that would make this feature worse than the
-      // fences it replaces.
-      await releaseLease(id, seatPath, leaseFilePath);
+      // fences it replaces. Stop renewing FIRST, or the timer keeps the process alive and
+      // can re-create the very file the release just removed.
+      if (renewTimer) clearInterval(renewTimer);
+      gateChild?.kill();
+      await releaseLease(id, seatPath, leaseFilePath, token);
     }
   } catch (e) {
     console.error(e instanceof BrokerError ? e.message : String(e));

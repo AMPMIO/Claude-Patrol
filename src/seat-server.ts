@@ -19,7 +19,10 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { accessSync, existsSync, mkdirSync, constants as FS } from "node:fs";
+import { dirname, isAbsolute } from "node:path";
 import { getSecret, TOKEN_HEADER } from "../shared/auth.ts";
+import { CHECKPOINT_GUARD } from "./launcher/compose.ts";
 import { SEAT_TOKEN_ENV, SEAT_TOKEN_RE, LEASE_FILE_ENV } from "../shared/types.ts";
 import type {
   SeatId,
@@ -339,6 +342,49 @@ async function pollAndPushMessages() {
   }
 }
 
+// v0.2.9.1 — what `guarded` is allowed to claim.
+//
+// Through v0.2.9 `guarded` was set from `LEASE_FILE_ENV !== null` alone: a non-empty
+// env var certified itself. `patrol checkpoint` then REFUSED to run without it and
+// otherwise trusted it completely, so an env var pointing at a relative path, a missing
+// hook script, or an unwritable directory bought a checkpoint that merged behind a guard
+// which could never deny anything (the hook fails open on every error).
+//
+// These three checks are the affordable ones — all locally verifiable at register:
+//   1. the lease path is ABSOLUTE (the hook reads it from an arbitrary seat cwd);
+//   2. the guard hook script actually exists on disk (a settings overlay naming a
+//      missing file installs nothing);
+//   3. the lease DIRECTORY is writable (checkpoint must be able to create the file;
+//      mkdir first so the manual/plugin install path isn't penalised for a dir
+//      `patrol up` would have made).
+//
+// WHAT THIS STILL DOES NOT PROVE, and cannot from inside this process:
+//   * that Claude actually LOADED the --settings overlay carrying the hook;
+//   * that Claude will INVOKE the hook on a tool call, or honour its deny;
+//   * that the hook's matcher covers the tool the seat is about to use.
+// Only the seat's Claude session knows those, and it has no channel to tell us. Closing
+// it needs a seat-side ack handshake (the hook itself reporting "I ran") — deliberately
+// out of scope for v0.2.9.1 and the largest remaining gap in the lease story.
+export function checkGuardable(leaseFile: string): boolean {
+  if (!isAbsolute(leaseFile)) {
+    log(`guard: ${LEASE_FILE_ENV} is not an absolute path (${leaseFile}) — registering UNGUARDED`);
+    return false;
+  }
+  if (!existsSync(CHECKPOINT_GUARD)) {
+    log(`guard: checkpoint hook missing at ${CHECKPOINT_GUARD} — registering UNGUARDED`);
+    return false;
+  }
+  const dir = dirname(leaseFile);
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    accessSync(dir, FS.W_OK);
+  } catch (e) {
+    log(`guard: lease dir ${dir} is not writable (${e instanceof Error ? e.message : String(e)}) — registering UNGUARDED`);
+    return false;
+  }
+  return true;
+}
+
 async function main() {
   await ensureBroker();
 
@@ -364,14 +410,12 @@ async function main() {
   // default. Empty/absent degrades to null (broker falls back to its default).
   const budgetAlertTo = process.env.CLAUDE_PATROL_BUDGET_ALERT_TO || null;
   // v0.2.9: the launcher sets LEASE_FILE_ENV only on seats it installed the
-  // checkpoint-guard hook into, so its presence IS this seat's guard bit. A seat
-  // that reports false cannot be quiesced, and `patrol checkpoint` refuses it
-  // rather than pretend a fence is a lease. The PATH goes with it because only the
-  // seat can read its own env: checkpoint runs in another process and must write
-  // the exact file this seat's hook stats, not a re-derived convention (a drift
-  // there would fail silently — hook watching one path, checkpoint writing another).
+  // checkpoint-guard hook into. The PATH goes with it because only the seat can read
+  // its own env: checkpoint runs in another process and must write the exact file this
+  // seat's hook stats, not a re-derived convention (a drift there would fail silently —
+  // hook watching one path, checkpoint writing another).
   const leaseFile = process.env[LEASE_FILE_ENV] || null;
-  const guarded = leaseFile !== null;
+  const guarded = leaseFile !== null && checkGuardable(leaseFile);
 
   const reg = await brokerFetch<RegisterResponse>("/register", {
     pid: claudePid,
