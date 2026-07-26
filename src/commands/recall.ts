@@ -14,14 +14,20 @@ export default async function recall(args: string[]): Promise<number> {
     return 2;
   }
 
-  const sessions = priorSessions(seat);
-  if (sessions.length === 0) {
+  const res = priorSessions(seat);
+  // Exit 3, not 1: "I could not read the history" is a different answer from "this
+  // seat has none", and a script that retries on one must not retry on the other.
+  if (!res.ok) {
+    console.error(`patrol recall: ${res.reason}`);
+    return 3;
+  }
+  if (res.sessions.length === 0) {
     // Nonzero: a script asking "does this seat have history" gets an answer it can
     // branch on, and the human gets the reason rather than a blank success.
-    console.error(recallBrief(seat, sessions, ctxAvailable()));
+    console.error(recallBrief(seat, res.sessions, ctxAvailable()));
     return 1;
   }
 
-  console.log(recallBrief(seat, sessions, ctxAvailable()));
+  console.log(recallBrief(seat, res.sessions, ctxAvailable()));
   return 0;
 }
