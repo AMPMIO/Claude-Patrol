@@ -1,7 +1,7 @@
 import { test, expect, beforeAll, afterAll } from "bun:test";
 import status from "../src/commands/status.ts";
 import list from "../src/commands/list.ts";
-import send from "../src/commands/send.ts";
+import send, { briefMessage } from "../src/commands/send.ts";
 import rename from "../src/commands/rename.ts";
 import wait from "../src/commands/wait.ts";
 import stats from "../src/commands/stats.ts";
@@ -395,4 +395,20 @@ test("parseClaudeHelp detects flags", () => {
 test("pidAlive: self alive, absurd pid dead", () => {
   expect(pidAlive(process.pid)).toBe(true);
   expect(pidAlive(2 ** 30)).toBe(false);
+});
+
+// --- patrol send --brief (v0.3): pointer, not paste --------------------------
+
+test("briefMessage points at the path and never inlines the brief's bytes", () => {
+  const msg = briefMessage("/abs/path/to/wp-brief.md");
+  expect(msg).toContain("/abs/path/to/wp-brief.md");
+  expect(msg.toLowerCase()).toContain("read this file first");
+  // The whole point: the message stays small regardless of how long the brief is.
+  expect(msg.length).toBeLessThan(500);
+});
+
+test("send --brief refuses a missing file before anything is queued", async () => {
+  const r = await capture(() => send(["someseat", "--brief", "/no/such/brief.md"]));
+  expect(r.code).toBe(1);
+  expect(r.err).toContain("brief not found");
 });

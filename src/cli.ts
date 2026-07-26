@@ -15,6 +15,7 @@ Usage:
   patrol down            tear the fleet down
   patrol status          fleet board: seats, roles, models, spend
   patrol send <handle> <msg>  message a seat (handle or id)
+  patrol send <handle> --brief <path>  hand over a brief by POINTER, not pasted
   patrol rename <h> <name>    rename a seat's handle
   patrol wait <h> --until done[,blocked] [--timeout 300]  block until a seat's state
   patrol list            list seats (compact)

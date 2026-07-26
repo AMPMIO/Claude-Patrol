@@ -494,6 +494,25 @@ this for real:
   subagents on real ongoing work, not just the one benchmark. Needs a defined schema up
   front so the data is still minable months later.
 
+**v0.3.1, continuity across a restart.** A standing seat's value is accumulated
+judgment, and today that dies with the process. Crash redelivery (v0.3) restores a
+restarted seat's *mail*; these restore its *reasoning*:
+- **`patrol recall <seat>`** — Patrol already binds seat → session id in `seat_runs`
+  for cost attribution, and that row outlives the seat. So it can hand a returning
+  seat its own prior session ids, and — if [ctx](https://github.com/ctxrs/ctx) is
+  installed — the commands to search that history. Pointers only: prior transcripts
+  are never injected into a fresh prompt, because that is both a token bomb and an
+  injection surface. ctx stays an optional dependency; Patrol degrades silently
+  without it.
+- **Handoff receipts (evaluation).** `patrol send --brief <path>` (v0.3) hands over a
+  pointer instead of pasting a brief, which stops a multi-KB brief being re-billed
+  every turn. What a path *cannot* do is prove the seat read it, or propagate a
+  correction when a brief is amended mid-wave — both cost real rework during the
+  0.2.x waves. A reference layer like [waggle](https://github.com/modiqo/waggle)
+  closes exactly that (receipts with coverage, `supersede` with lineage). Evaluating
+  it for those two properties only; the token-saving argument is already handled by
+  the pointer, and their own benchmark puts a plain path within six points of it.
+
 **v0.4, after it has proven itself.** A Rust CLI; SSE or long-poll replacing the 1s
 poll; codex cost parsing, so non-Claude seats get their own per-seat spend (v0.2.4
 tags *which pool*, not codex's own dollar figure); a retention sweep for the ledger;
