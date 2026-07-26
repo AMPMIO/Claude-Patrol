@@ -124,6 +124,69 @@ export function parseUsageLine(line: string): UsageDelta | null {
   };
 }
 
+// --- v0.3 cache re-encode tax ("cache tax") ---------------------------------
+//
+// A prompt cache prefix expires after a few minutes without a request on it. When a
+// seat then speaks again, its byte-identical append-only history is re-encoded at the
+// cache-WRITE rate (1.25x input) instead of read back at 0.1x. A standing orchestrator
+// blocked on a 20-minute worker is exactly the exposure, and nothing in the bill names
+// it — the money shows up as ordinary cache_write.
+//
+// THIS IS A HEURISTIC OVER TRANSCRIPTS, NOT GROUND TRUTH. The logs record how many
+// tokens took the write path; they do NOT record WHY. A large write that follows an
+// established read looks the same whether the cache expired on an idle seat or the
+// prefix genuinely changed — a model switch, a different tool set, a resumed session
+// with different context, or a compaction all write a fresh prefix legitimately. Every
+// one of those counts here. Read the number as "spend that took the write path after a
+// prefix was already established", never as "money you lost". It is also not universal:
+// on a configuration using the 1-hour cache TTL an idle seat mostly keeps its prefix,
+// and the tax reads near zero. Understating is fine; overclaiming is not.
+//
+// The floor is what separates a real prefix re-encode from ordinary incremental writes
+// (a turn's own new tokens are cached too, a few hundred to a few thousand at a time).
+export const CACHE_REBUILD_FLOOR_TOKENS = 10_000;
+
+// Classify ONE record against the session's history so far. `maxCacheReadSoFar` is the
+// largest cache_read seen EARLIER in this session — the evidence that a prefix was
+// established and being read back cheaply. Both halves are required: without (b) the
+// first-time creation of a prefix (normal, not a tax) would count as a rebuild.
+//
+// Pure by construction: no files, no clock, no db. The caller threads the returned
+// state into the next record, which is what makes this testable AND usable from the
+// broker's incremental indexer, where a session's records arrive across many ticks.
+export function classifyCacheRebuild(
+  cacheWrite: number,
+  cacheRead: number,
+  maxCacheReadSoFar: number,
+  floor: number = CACHE_REBUILD_FLOOR_TOKENS
+): { rebuild: boolean; maxCacheRead: number } {
+  // The current record's own read is folded in AFTER the decision: condition (b) is
+  // about what the session showed EARLIER, not about this record.
+  const rebuild = cacheWrite >= floor && maxCacheReadSoFar >= floor;
+  return { rebuild, maxCacheRead: Math.max(maxCacheReadSoFar, cacheRead) };
+}
+
+// Whole-sequence convenience over the same rule, for a caller that holds a session's
+// records in order (tests, and the full-walk computeCosts path).
+export function classifyCacheRebuilds(
+  records: { cache_write: number; cache_read: number }[],
+  maxCacheReadSoFar = 0,
+  floor: number = CACHE_REBUILD_FLOOR_TOKENS
+): { rebuilds: number; rebuild_tokens: number; maxCacheRead: number } {
+  let rebuilds = 0;
+  let rebuild_tokens = 0;
+  let max = maxCacheReadSoFar;
+  for (const r of records) {
+    const c = classifyCacheRebuild(r.cache_write, r.cache_read, max, floor);
+    if (c.rebuild) {
+      rebuilds += 1;
+      rebuild_tokens += r.cache_write;
+    }
+    max = c.maxCacheRead;
+  }
+  return { rebuilds, rebuild_tokens, maxCacheRead: max };
+}
+
 interface Tally {
   session_id: string; // the record's OWN session (kept for display: subagent rows stay visible)
   attr_session_id: string; // parent for subagents, else own; drives seat_id lookup + scoping
@@ -132,6 +195,8 @@ interface Tally {
   output: number;
   cache_write: number;
   cache_read: number;
+  cache_rebuilds: number;
+  cache_rebuild_tokens: number;
   billing_source: BillingSource; // from the record entrypoint; all records in a session share it
 }
 
@@ -151,6 +216,11 @@ export function computeCosts(opts: ComputeCostsOptions = {}): CostsResponse {
 
   const tally = new Map<string, Tally>(); // key: sessionId\0model
   const seen = new Set<string>(); // (sessionId, message id) — resume-rewrite guard
+  // Rebuild detection is per SESSION (the prefix belongs to the session, not to one
+  // model), while the counters land per (session, model) like every other tally. A
+  // model switch mid-session therefore reads as a rebuild — that is the documented
+  // false positive, not an oversight.
+  const maxCacheRead = new Map<string, number>();
 
   for (const [file, proj, parentSessionId] of sessionFiles(root)) {
     let text: string;
@@ -187,8 +257,14 @@ export function computeCosts(opts: ComputeCostsOptions = {}): CostsResponse {
       const key = `${ownSessionId}\0${rec.model}`;
       let t = tally.get(key);
       if (!t) {
-        t = { session_id: ownSessionId, attr_session_id: attrSessionId, model: rec.model, input: 0, output: 0, cache_write: 0, cache_read: 0, billing_source: billingSourceFromEntrypoint(rec.entrypoint) };
+        t = { session_id: ownSessionId, attr_session_id: attrSessionId, model: rec.model, input: 0, output: 0, cache_write: 0, cache_read: 0, cache_rebuilds: 0, cache_rebuild_tokens: 0, billing_source: billingSourceFromEntrypoint(rec.entrypoint) };
         tally.set(key, t);
+      }
+      const cls = classifyCacheRebuild(rec.cache_write, rec.cache_read, maxCacheRead.get(ownSessionId) ?? 0);
+      maxCacheRead.set(ownSessionId, cls.maxCacheRead);
+      if (cls.rebuild) {
+        t.cache_rebuilds += 1;
+        t.cache_rebuild_tokens += rec.cache_write;
       }
       // L5: a session has ONE launch lineage, but `entrypoint` may be absent on
       // some records. Do NOT freeze billing_source from the first-seen line —
@@ -208,6 +284,9 @@ export function computeCosts(opts: ComputeCostsOptions = {}): CostsResponse {
   // Per-wallet running totals. These MUST stay separate — they bill different
   // accounts — so `patrol status` renders three columns, never one sum.
   const bySource: Partial<Record<BillingSource, number>> = {};
+  let rebuilds = 0;
+  let rebuildTokens = 0;
+  let taxUsd = 0;
   for (const t of [...tally.values()].sort((a, b) => a.session_id.localeCompare(b.session_id))) {
     const [pi, po, pcw, pcr] = priceFor(t.model);
     const cost = (t.input * pi + t.output * po + t.cache_write * pcw + t.cache_read * pcr) / 1e6;
@@ -222,7 +301,14 @@ export function computeCosts(opts: ComputeCostsOptions = {}): CostsResponse {
       cache_read: t.cache_read,
       cost_usd: Math.round(cost * 1e4) / 1e4,
       billing_source: t.billing_source,
+      cache_rebuilds: t.cache_rebuilds,
+      cache_rebuild_tokens: t.cache_rebuild_tokens,
     });
+    rebuilds += t.cache_rebuilds;
+    rebuildTokens += t.cache_rebuild_tokens;
+    // Priced at THIS model's cache-write rate and summed — never an average across
+    // models, whose rates differ by 5x between haiku and fable.
+    taxUsd += (t.cache_rebuild_tokens * pcw) / 1e6;
   }
   // L4: round each wallet bucket, then derive total_usd as the SUM OF THE ROUNDED
   // buckets — so the displayed per-wallet columns always add up to the displayed
@@ -233,7 +319,12 @@ export function computeCosts(opts: ComputeCostsOptions = {}): CostsResponse {
     bySource[k] = Math.round(bySource[k]! * 1e4) / 1e4;
     roundedTotal += bySource[k]!;
   }
-  return { rows, total_usd: Math.round(roundedTotal * 1e4) / 1e4, by_source: bySource };
+  return {
+    rows,
+    total_usd: Math.round(roundedTotal * 1e4) / 1e4,
+    by_source: bySource,
+    cache_tax: { rebuilds, rebuild_tokens: rebuildTokens, tax_usd: Math.round(taxUsd * 1e4) / 1e4 },
+  };
 }
 
 // Incremental single-file parser for the broker's background indexer. Reads the
