@@ -28,7 +28,9 @@ Usage:
   patrol claims [git-root]       list current path claims
   patrol release <id> [path...]  release a seat's path claims
   patrol worktree <seat> <branch> [--base <ref>]  create a task worktree for a seat
-  patrol checkpoint <seat> [--gate "<cmd>"]        merge the seat's branch back, remove the worktree`);
+  patrol checkpoint <seat> [--gate "<cmd>"] [--force]
+                                 merge the seat's branch back, remove the worktree
+                                 (--force allows an unguarded seat: no lease, fences only)`);
     return cmd ? 1 : 0;
   }
   const mod = await import(`./commands/${cmd}.ts`);

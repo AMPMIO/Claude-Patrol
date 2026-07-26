@@ -13,7 +13,7 @@
  */
 import { Database } from "bun:sqlite";
 import { statSync, openSync, readSync, closeSync, realpathSync } from "node:fs";
-import { basename, resolve as resolvePath } from "node:path";
+import { basename, resolve as resolvePath, isAbsolute } from "node:path";
 import { getSecret, TOKEN_HEADER } from "../shared/auth.ts";
 import {
   priceFor,
@@ -24,7 +24,7 @@ import {
   findSessionIdByHeuristic,
   billingSourceFromEntrypoint,
 } from "./costs.ts";
-import { SEAT_TOKEN_RE } from "../shared/types.ts";
+import { SEAT_TOKEN_RE, LEASE_TTL_SECONDS } from "../shared/types.ts";
 import type {
   RegisterRequest,
   RegisterResponse,
@@ -71,6 +71,9 @@ import type {
   WorktreeAddRequest,
   WorktreeListRequest,
   WorktreeRemoveRequest,
+  LeaseWorktreeRequest,
+  LeaseWorktreeResponse,
+  ReleaseWorktreeRequest,
 } from "../shared/types.ts";
 
 const PORT = parseInt(process.env.CLAUDE_PATROL_PORT ?? "7900", 10);
@@ -151,7 +154,18 @@ db.run(`
 // (0/1 latch so a crossing pings the recipient ONCE, not every index tick).
 // v0.2.7 adds `budget_alert_to` (fleet PatrolConfig.budget_alert_to handle/role, NULL
 // => the orchestrator default) so a crossing can page a configured recipient.
-for (const col of ["role TEXT", "model TEXT", "profile TEXT", "session_id TEXT", "state TEXT", "handle TEXT", "budget_usd REAL", "budget_alerted INTEGER NOT NULL DEFAULT 0", "budget_alert_to TEXT"]) {
+// v0.2.9 adds `guarded` (1 when the launcher installed the checkpoint-guard PreToolUse
+// hook, so this seat's writes can actually be paused). NULL on pre-0.2.9 rows and on
+// hand-launched seats, which reads as NOT guarded — `patrol checkpoint` refuses those
+// rather than pretending a fence is a lease.
+//
+// `lease_file` is the LEASE_FILE_ENV path the SEAT reports at register, stored verbatim and
+// echoed back by /list-seats. checkpoint cannot read the seat's env, so this relay is the
+// only way it can write the file the guard hook stats. It is a PASS-THROUGH of the seat's
+// own value, never a path derived here: a convention this broker invents that disagrees with
+// the hook's means the hook never fires and the lease buys nothing. NULL => checkpoint
+// treats the seat as unguarded rather than claim it is quiesced when it isn't.
+for (const col of ["role TEXT", "model TEXT", "profile TEXT", "session_id TEXT", "state TEXT", "handle TEXT", "budget_usd REAL", "budget_alerted INTEGER NOT NULL DEFAULT 0", "budget_alert_to TEXT", "guarded INTEGER", "lease_file TEXT"]) {
   try {
     db.run(`ALTER TABLE seats ADD COLUMN ${col}`);
   } catch {
@@ -352,6 +366,53 @@ db.run(`
 `);
 db.run(`CREATE INDEX IF NOT EXISTS idx_worktrees_seat ON worktrees(seat_id)`);
 
+// v0.2.9 checkpoint lease. Additive (same CREATE-IF-NOT-EXISTS idiom). This is MUTUAL
+// EXCLUSION, not detection: while a lease is held the seat's PreToolUse guard hook denies
+// its mutating tools, so `patrol checkpoint` merges against a quiesced tree instead of
+// racing a standing writer. PRIMARY KEY (path) IS the exclusion — one lease per worktree,
+// whoever holds it — so a renew by the holder is an upsert and a grab by anyone else hits
+// the check in leaseWorktreeTxn. expires_at is load-bearing: a checkpoint killed between
+// acquire and release must not wedge a seat forever, so an EXPIRED row blocks nobody (the
+// hook fails open on staleness too). Reaped by seat_id in endSeat and by expiry in the
+// stale sweep — a lease outliving its holder is the failure that makes locking worse than none.
+db.run(`
+  CREATE TABLE IF NOT EXISTS checkpoint_leases (
+    seat_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (path)
+  )
+`);
+db.run(`CREATE INDEX IF NOT EXISTS idx_leases_seat ON checkpoint_leases(seat_id)`);
+
+// v0.2.9 path aliasing fix. worktreeAddTxn compared raw path TEXT, so `/p/wt`, `/p/wt/`,
+// `/p/x/../wt` and a symlink to it were four DIFFERENT paths — which restores the
+// two-seats-one-worktree bug 0.2.8 closed for a single spelling. Canonicalize at the
+// broker boundary instead, so the ownership check and the stored row always speak one name.
+//
+// realpathSync is the ONLY correct normalization here, and the reason existence is
+// REQUIRED: lexically deleting a ".." segment resolves through a symlink to the WRONG
+// directory (`/p/link/../wt` is not `/p/wt` when `link` points elsewhere), so a
+// string-only fallback would quietly reintroduce the aliasing it is meant to close. A path
+// that does not exist is not a worktree anyone can share, so refusing it costs nothing —
+// every real caller records the association only after `git worktree add` created the tree.
+function canonicalPath(p: string): string {
+  if (!isAbsolute(p)) throw new Error(`path must be absolute: ${p}`);
+  return realpathSync(p);
+}
+
+// The release/forget half. Those run AFTER the tree is gone (checkpoint removes the tree,
+// then deregisters and drops its lease), so existence must NOT be required — falling back
+// to the raw string keeps them idempotent instead of throwing on the happy path.
+function canonicalPathOrRaw(p: string): string {
+  try {
+    return canonicalPath(p);
+  } catch {
+    return p;
+  }
+}
+
 // Liveness probe: signal 0 doesn't kill, just checks existence. EPERM means the
 // process EXISTS but is owned by another user, so it counts as alive (matches
 // the CLI's pidAlive; moot for same-user seats but correct either way).
@@ -394,6 +455,9 @@ function endSeat(seatId: string) {
   // here (only `patrol checkpoint` removes a tree, and only after a clean merge). This
   // is exactly the frozen contract: endSeat forgets the association, never the tree.
   db.run("DELETE FROM worktrees WHERE seat_id = ?", [seatId]);
+  // v0.2.9: drop this seat's checkpoint leases. A lease exists to quiesce a LIVE seat;
+  // held by a dead one it only blocks the next checkpoint until the TTL burns down.
+  db.run("DELETE FROM checkpoint_leases WHERE seat_id = ?", [seatId]);
   db.run("DELETE FROM seats WHERE id = ?", [seatId]);
 }
 
@@ -414,6 +478,10 @@ function cleanStaleSeats() {
   db.run("UPDATE messages SET leased_at = NULL WHERE delivered = 0 AND leased_at IS NOT NULL AND leased_at <= ?", [
     new Date(Date.now() - LEASE_TTL_MS).toISOString(),
   ]);
+  // v0.2.9 checkpoint leases: an EXPIRED row blocks nobody (leaseWorktreeTxn ignores it,
+  // and the seat's guard hook fails open past expiry), so this only stops the table from
+  // accumulating dead rows. DISJOINT from the message lease above despite the shared verb.
+  db.run("DELETE FROM checkpoint_leases WHERE expires_at <= ?", [new Date().toISOString()]);
 }
 
 cleanStaleSeats();
@@ -422,8 +490,8 @@ setInterval(cleanStaleSeats, 30_000);
 // --- Prepared statements ---
 
 const insertSeat = db.prepare(`
-  INSERT INTO seats (id, pid, cwd, git_root, tty, summary, role, model, profile, session_id, registered_at, last_seen, handle, budget_usd, budget_alert_to)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO seats (id, pid, cwd, git_root, tty, summary, role, model, profile, session_id, registered_at, last_seen, handle, budget_usd, budget_alert_to, guarded, lease_file)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 const updateLastSeen = db.prepare(`UPDATE seats SET last_seen = ? WHERE id = ?`);
 const updateSummary = db.prepare(`UPDATE seats SET summary = ? WHERE id = ?`);
@@ -525,20 +593,47 @@ const upsertWorktree = db.prepare(
   `INSERT INTO worktrees (seat_id, path, branch, base_commit, created_at) VALUES (?, ?, ?, ?, ?)
    ON CONFLICT(seat_id, path) DO UPDATE SET branch = excluded.branch, base_commit = excluded.base_commit, created_at = excluded.created_at`
 );
+// v0.2.9: lease_expires_at rides along (additive — the frozen Worktree contract predates
+// it, so clients read it off a widened view, same as status.ts does for budget_usd). It is
+// what makes a held lease VISIBLE: a checkpoint that died before releasing is otherwise a
+// seat that mysteriously refuses to write until the TTL burns down.
 const selectWorktreesBySeat = db.prepare(
-  `SELECT seat_id, path, branch, base_commit, created_at FROM worktrees WHERE seat_id = ? ORDER BY created_at`
+  `SELECT w.seat_id, w.path, w.branch, w.base_commit, w.created_at, l.expires_at AS lease_expires_at
+   FROM worktrees w LEFT JOIN checkpoint_leases l ON l.path = w.path
+   WHERE w.seat_id = ? ORDER BY w.created_at`
 );
 const selectAllWorktrees = db.prepare(
-  `SELECT seat_id, path, branch, base_commit, created_at FROM worktrees ORDER BY created_at`
+  `SELECT w.seat_id, w.path, w.branch, w.base_commit, w.created_at, l.expires_at AS lease_expires_at
+   FROM worktrees w LEFT JOIN checkpoint_leases l ON l.path = w.path ORDER BY w.created_at`
 );
 const deleteWorktree = db.prepare(`DELETE FROM worktrees WHERE seat_id = ? AND path = ?`);
 // v0.2.7.1: who (if anyone) already holds this PATH, regardless of seat. The handle is
 // joined in so the rejection can name a human-readable owner; LEFT JOIN because the
 // seat row may have been reaped while the association lingers.
-const selectWorktreeOwnerByPath = db.prepare(
+//
+// v0.2.9 drops the LIMIT 1: a db written before path canonicalization may hold SEVERAL
+// rows for one tree under different spellings, and a lookup that reports only the first
+// owner is how that state stays invisible. Those legacy rows are deliberately NOT migrated
+// or de-duplicated — `CREATE UNIQUE INDEX` would fail at startup for exactly the users the
+// bug hit — so callers detect the multi-owner case and stop for a human instead.
+const selectWorktreeOwnersByPath = db.prepare(
   `SELECT w.seat_id AS seat_id, s.handle AS handle FROM worktrees w
-   LEFT JOIN seats s ON s.id = w.seat_id WHERE w.path = ? LIMIT 1`
+   LEFT JOIN seats s ON s.id = w.seat_id WHERE w.path = ?`
 );
+
+// v0.2.9 checkpoint lease statements. The upsert is keyed on PATH (the table's PK), so the
+// HOLDER renewing refreshes expiry in place; a different seat never reaches it (the txn
+// below refuses first). Delete is owner-scoped by seat_id AND matches either spelling —
+// the caller may release after the tree is gone, when realpath can no longer canonicalize.
+const upsertLease = db.prepare(
+  `INSERT INTO checkpoint_leases (seat_id, path, expires_at, created_at) VALUES (?, ?, ?, ?)
+   ON CONFLICT(path) DO UPDATE SET seat_id = excluded.seat_id, expires_at = excluded.expires_at`
+);
+const selectLeaseByPath = db.prepare(
+  `SELECT l.seat_id AS seat_id, l.expires_at AS expires_at, s.handle AS handle
+   FROM checkpoint_leases l LEFT JOIN seats s ON s.id = l.seat_id WHERE l.path = ?`
+);
+const deleteLease = db.prepare(`DELETE FROM checkpoint_leases WHERE seat_id = ? AND path IN (?, ?)`);
 
 // --- Seat ID ---
 
@@ -627,7 +722,12 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   insertSeat.run(
     id, body.pid, body.cwd, body.git_root, body.tty, body.summary,
     body.role ?? null, body.model ?? null, body.profile ?? null, sessionId,
-    now, now, handle, body.budget_usd ?? null, body.budget_alert_to ?? null
+    now, now, handle, body.budget_usd ?? null, body.budget_alert_to ?? null,
+    // v0.2.9: SQLite has no bool. Absent/null => 0 (NOT guarded) — the safe read, since
+    // checkpoint refuses an unguarded seat rather than assume it can be quiesced.
+    body.guarded ? 1 : 0,
+    // Stored verbatim — the SEAT owns this path (it is what it was handed in LEASE_FILE_ENV).
+    body.lease_file ?? null
   );
 
   // Durable run row (survives dereg). session_id is the env-override/guarded
@@ -663,11 +763,16 @@ function handleListSeats(body: ListSeatsRequest): Seat[] {
   // Drop seats whose process has died since last cleanup tick. Full retirement
   // (endSeat), not a bare row delete: `patrol status` right after a seat dies
   // must not leave the run unbounded or its undelivered mail behind.
-  return seats.filter((s) => {
-    if (pidAlive(s.pid)) return true;
-    endSeat(s.id);
-    return false;
-  });
+  // v0.2.9: SQLite stores `guarded` as 0/1, but Seat.guarded is a BOOLEAN — normalize here so
+  // no client has to remember that a raw 0 from the driver is truthy. `lease_file` passes
+  // through as the TEXT/NULL it already is.
+  return seats
+    .filter((s) => {
+      if (pidAlive(s.pid)) return true;
+      endSeat(s.id);
+      return false;
+    })
+    .map((s) => ({ ...s, guarded: !!s.guarded }));
 }
 
 function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
@@ -1257,11 +1362,22 @@ function handleAnswer(body: AnswerRequest): { body: { ok: true } | { ok: false; 
 // are left readable (visible in /worktree-list) for the operator to resolve.
 // Check-then-write runs inside ONE db.transaction (same idiom as claimBatch/answerTxn):
 // no await between reading the owner and writing the row.
+//
+// v0.2.9: `path` arrives CANONICAL (see canonicalPath) — the comparison below is raw TEXT,
+// so without that every alternate spelling of one tree read as a different path and the
+// ownership check waved it through.
+type Owner = { seat_id: string; handle: string | null };
+const nameOwner = (o: Owner) => (o.handle ? `${o.handle} (${o.seat_id})` : o.seat_id);
+
 const worktreeAddTxn = db.transaction(
   (id: string, path: string, branch: string, baseCommit: string, now: string): { ok: true } | { ok: false; error: string } => {
-    const owner = selectWorktreeOwnerByPath.get(path) as { seat_id: string; handle: string | null } | null;
-    if (owner && owner.seat_id !== id) {
-      return { ok: false, error: `${path} is already owned by ${owner.handle ? `${owner.handle} (${owner.seat_id})` : owner.seat_id}` };
+    const owners = selectWorktreeOwnersByPath.all(path) as Owner[];
+    // Legacy duplicates (rows written before canonicalization, under one spelling) can put
+    // TWO seats on one tree. Report every holder rather than the first — a rejection naming
+    // one owner while a second lurks is how the operator "fixes" it and hits it again.
+    const foreign = owners.filter((o) => o.seat_id !== id);
+    if (foreign.length > 0) {
+      return { ok: false, error: `${path} is already owned by ${foreign.map(nameOwner).join(", ")}` };
     }
     upsertWorktree.run(id, path, branch, baseCommit, now); // same seat re-adding: idempotent upsert
     return { ok: true };
@@ -1270,7 +1386,13 @@ const worktreeAddTxn = db.transaction(
 
 function handleWorktreeAdd(body: WorktreeAddRequest): { ok: true } | { ok: false; error: string } {
   if (!liveSeat(body.id)) return { ok: false, error: `${body.id} is not a live seat` };
-  return worktreeAddTxn(body.id, body.path, body.branch, body.base_commit, new Date().toISOString());
+  let path: string;
+  try {
+    path = canonicalPath(body.path);
+  } catch {
+    return { ok: false, error: `${body.path} is not an existing absolute path — record the association after the worktree exists` };
+  }
+  return worktreeAddTxn(body.id, path, body.branch, body.base_commit, new Date().toISOString());
 }
 
 // id given => that seat's worktrees; omitted => all seats' (raw array, like
@@ -1283,8 +1405,61 @@ function handleWorktreeList(body: WorktreeListRequest): Worktree[] {
 // OWN worktree). Idempotent: removing one that isn't there matches nothing. NEVER
 // touches the git tree — the CLI removes the tree after a clean merge; this only
 // forgets the association.
+// v0.2.9: rows are stored canonical, but this runs AFTER `git worktree remove` — realpath
+// can no longer resolve a tree that is gone, so canonicalPathOrRaw falls back to the raw
+// string and the delete matches EITHER spelling. Requiring existence here would strand the
+// association permanently on the one path that matters.
 function handleWorktreeRemove(body: WorktreeRemoveRequest): { ok: true } {
   deleteWorktree.run(body.id, body.path);
+  const canonical = canonicalPathOrRaw(body.path);
+  if (canonical !== body.path) deleteWorktree.run(body.id, canonical);
+  return { ok: true };
+}
+
+// --- v0.2.9 checkpoint lease ---
+// The point of the whole feature: `patrol checkpoint` cannot win a race against a standing
+// writer by DETECTING drift (three rounds of fences each lost it), so it takes a lease that
+// QUIESCES the seat first. The seat's PreToolUse guard hook denies its mutating tools while
+// the lease FILE exists; these routes are the broker's record of who holds what, which is
+// what makes a stuck lease visible and sweepable.
+//
+// Check-then-write in ONE db.transaction and a SYNCHRONOUS handler (same idiom as
+// claimBatch/worktreeAddTxn): two checkpoints racing the same tree must never both read
+// "unheld" before either writes, or both would merge against a seat that only one of them
+// quiesced — the exact failure this replaces.
+const leaseWorktreeTxn = db.transaction(
+  (id: string, path: string, now: string, expiresAt: string): LeaseWorktreeResponse => {
+    const held = selectLeaseByPath.get(path) as { seat_id: string; expires_at: string; handle: string | null } | null;
+    // An EXPIRED lease blocks nobody: a checkpoint killed between acquire and release must
+    // not wedge the tree forever, and the guard hook already fails open past expiry.
+    if (held && held.seat_id !== id && held.expires_at > now) {
+      return {
+        ok: false,
+        error: `${path} is leased until ${held.expires_at} by ${held.handle ? `${held.handle} (${held.seat_id})` : held.seat_id}`,
+      };
+    }
+    upsertLease.run(id, path, expiresAt, now); // the holder re-leasing: renews expiry in place
+    return { ok: true, expires_at: expiresAt };
+  }
+);
+
+function handleLeaseWorktree(body: LeaseWorktreeRequest): LeaseWorktreeResponse {
+  if (!liveSeat(body.id)) return { ok: false, error: `${body.id} is not a live seat` };
+  let path: string;
+  try {
+    path = canonicalPath(body.path);
+  } catch {
+    return { ok: false, error: `${body.path} is not an existing absolute path` };
+  }
+  const now = Date.now();
+  return leaseWorktreeTxn(body.id, path, new Date(now).toISOString(), new Date(now + LEASE_TTL_SECONDS * 1000).toISOString());
+}
+
+// Owner-scoped by seat_id+path and idempotent (releasing a lease nobody holds matches
+// nothing), because checkpoint releases from a `finally` on every exit path — including
+// ones where the acquire never succeeded.
+function handleReleaseWorktree(body: ReleaseWorktreeRequest): { ok: true } {
+  deleteLease.run(body.id, body.path, canonicalPathOrRaw(body.path));
   return { ok: true };
 }
 
@@ -1803,6 +1978,8 @@ export function validate(path: string, body: unknown): string | null {
       if (b.budget_usd != null && !(typeof b.budget_usd === "number" && Number.isFinite(b.budget_usd) && b.budget_usd > 0))
         return "budget_usd must be a positive number";
       if (!isOptStr(b.budget_alert_to, MAX_LABEL)) return "budget_alert_to too long or not a string";
+      if (b.guarded != null && typeof b.guarded !== "boolean") return "guarded must be a boolean";
+      if (!isOptStr(b.lease_file, MAX_PATH)) return "lease_file too long or not a string";
       return null;
     case "/heartbeat":
     case "/poll-messages":
@@ -1918,6 +2095,10 @@ export function validate(path: string, body: unknown): string | null {
       if (b.id != null && !isSlug(b.id)) return "id must be an 8-char [a-z0-9] slug";
       return null;
     case "/worktree-remove":
+    // v0.2.9: same shape as /worktree-remove — a slug id and a bounded path. Existence and
+    // canonicalization are the HANDLER's job (they need the filesystem, validate() is pure).
+    case "/lease-worktree":
+    case "/release-worktree":
       if (!isSlug(b.id)) return "id must be an 8-char [a-z0-9] slug";
       if (!isStr(b.path, MAX_PATH, 1)) return `path must be a non-empty string ≤${MAX_PATH} chars`;
       return null;
@@ -2115,6 +2296,10 @@ Bun.serve({
           return Response.json(handleWorktreeList(body as WorktreeListRequest));
         case "/worktree-remove":
           return Response.json(handleWorktreeRemove(body as WorktreeRemoveRequest));
+        case "/lease-worktree":
+          return Response.json(handleLeaseWorktree(body as LeaseWorktreeRequest));
+        case "/release-worktree":
+          return Response.json(handleReleaseWorktree(body as ReleaseWorktreeRequest));
         case "/diff":
           return Response.json(await handleDiff(body as DiffRequest));
         default:

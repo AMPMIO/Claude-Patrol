@@ -14,7 +14,7 @@
  */
 import { test, expect, beforeAll, afterAll, describe } from "bun:test";
 import { spawnSync } from "bun";
-import { mkdtempSync, rmSync, existsSync, realpathSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, existsSync, realpathSync, readFileSync, writeFileSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -23,6 +23,8 @@ import {
   classifyExistingWorktree,
 } from "../src/commands/worktree.ts";
 import { checkpointPlan, TRUNK } from "../src/commands/checkpoint.ts";
+import { Database } from "bun:sqlite";
+import type { Seat } from "../shared/types.ts";
 
 const PORT = 17909;
 const URL_BASE = `http://127.0.0.1:${PORT}`;
@@ -66,6 +68,63 @@ async function registerSeat(fields: Record<string, unknown> = {}): Promise<strin
     ...fields,
   });
   return ((await res.json()) as { id: string }).id;
+}
+
+// v0.2.9: the broker canonicalizes association paths with realpathSync, so a path can only
+// be recorded once it EXISTS — association tests need real directories, not fake strings.
+// (Lexical normalization was rejected: deleting a ".." segment resolves through a symlink to
+// the wrong directory, which is the aliasing hole this closes.)
+const WT_ROOT = realpathSync(mkdtempSync(join(tmpdir(), "patrol-wtpaths-")));
+function wtDir(name: string): string {
+  const p = join(WT_ROOT, name);
+  mkdirSync(p, { recursive: true });
+  return p;
+}
+
+// v0.2.9: `patrol checkpoint` REFUSES an unguarded seat (it cannot be quiesced, so a merge
+// could race it), so the end-to-end tests register seats the way a v0.2.9 launcher does —
+// guarded, with the LEASE_FILE_ENV path it handed the seat. No guard hook actually runs in
+// these tests, which is what keeps the FENCE coverage below honest: the fake seat really can
+// still commit mid-checkpoint, and the fences must still catch it.
+let leaseFileSeq = 0;
+async function registerGuardedSeat(fields: Record<string, unknown> = {}): Promise<string> {
+  return registerSeat({ guarded: true, lease_file: join(WT_ROOT, `lease-${leaseFileSeq++}.json`), ...fields });
+}
+
+// The lease table has no read route (the frozen contract exposes acquire + release only),
+// and expiry is a frozen 120s constant with no env override — so these two read and age a
+// lease through the broker's own SQLite file. A second WAL connection is safe here, and it
+// keeps the assertions on the broker's real state rather than on what a handler echoed back.
+function leaseDb(): Database {
+  return new Database(DB_FILE);
+}
+// Falls back to the raw string when the tree is already gone — a checkpoint removes the
+// worktree before releasing, so the most important assertions run against a path realpath
+// can no longer resolve (the broker's canonicalPathOrRaw does the same, for the same reason).
+function canonicalOrRaw(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+function leaseRow(path: string): { seat_id: string; expires_at: string } | null {
+  const db = leaseDb();
+  try {
+    return db.query("SELECT seat_id, expires_at FROM checkpoint_leases WHERE path = ?").get(canonicalOrRaw(path)) as
+      | { seat_id: string; expires_at: string }
+      | null;
+  } finally {
+    db.close();
+  }
+}
+function expireLease(path: string) {
+  const db = leaseDb();
+  try {
+    db.run("UPDATE checkpoint_leases SET expires_at = ? WHERE path = ?", [new Date(Date.now() - 1000).toISOString(), realpathSync(path)]);
+  } finally {
+    db.close();
+  }
 }
 
 type Wt = { seat_id: string; path: string; branch: string; base_commit: string; created_at: string };
@@ -126,26 +185,28 @@ afterAll(() => {
   broker.kill();
   for (const s of sleepers) s.kill();
   rmSync(dir, { recursive: true, force: true });
+  rmSync(WT_ROOT, { recursive: true, force: true });
 });
 
 // --- broker route tests ------------------------------------------------------
 
 test("/worktree-add records the association; /worktree-list returns it", async () => {
   const seat = await registerSeat();
-  const add = await post("/worktree-add", { id: seat, path: "/repo/.claude/worktrees/feat", branch: "feat", base_commit: "abc123" });
+  const p = wtDir("feat");
+  const add = await post("/worktree-add", { id: seat, path: p, branch: "feat", base_commit: "abc123" });
   expect(add.status).toBe(200);
   expect(((await add.json()) as { ok: boolean }).ok).toBe(true);
 
   const mine = (await listWorktrees(seat)).find((w) => w.seat_id === seat)!;
   expect(mine).toBeDefined();
-  expect(mine.path).toBe("/repo/.claude/worktrees/feat");
+  expect(mine.path).toBe(p);
   expect(mine.branch).toBe("feat");
   expect(mine.base_commit).toBe("abc123");
 });
 
 test("/worktree-add upserts on (seat_id, path): re-recording refreshes, never duplicates", async () => {
   const seat = await registerSeat();
-  const p = "/repo/.claude/worktrees/dup";
+  const p = wtDir("dup");
   await post("/worktree-add", { id: seat, path: p, branch: "dup", base_commit: "sha1" });
   await post("/worktree-add", { id: seat, path: p, branch: "dup", base_commit: "sha2" });
   const rows = (await listWorktrees(seat)).filter((w) => w.path === p);
@@ -156,25 +217,27 @@ test("/worktree-add upserts on (seat_id, path): re-recording refreshes, never du
 test("/worktree-list by id returns only that seat's; omitted returns all", async () => {
   const a = await registerSeat();
   const b = await registerSeat();
-  await post("/worktree-add", { id: a, path: "/wt/a", branch: "a", base_commit: "x" });
-  await post("/worktree-add", { id: b, path: "/wt/b", branch: "b", base_commit: "y" });
+  const pa = wtDir("list-a");
+  const pb = wtDir("list-b");
+  await post("/worktree-add", { id: a, path: pa, branch: "a", base_commit: "x" });
+  await post("/worktree-add", { id: b, path: pb, branch: "b", base_commit: "y" });
 
   const onlyA = await listWorktrees(a);
   expect(onlyA.every((w) => w.seat_id === a)).toBe(true);
-  expect(onlyA.some((w) => w.path === "/wt/a")).toBe(true);
-  expect(onlyA.some((w) => w.path === "/wt/b")).toBe(false);
+  expect(onlyA.some((w) => w.path === pa)).toBe(true);
+  expect(onlyA.some((w) => w.path === pb)).toBe(false);
 
   const all = await listWorktrees();
-  expect(all.some((w) => w.seat_id === a && w.path === "/wt/a")).toBe(true);
-  expect(all.some((w) => w.seat_id === b && w.path === "/wt/b")).toBe(true);
+  expect(all.some((w) => w.seat_id === a && w.path === pa)).toBe(true);
+  expect(all.some((w) => w.seat_id === b && w.path === pb)).toBe(true);
 });
 
 test("/worktree-remove drops the association and is idempotent; owner-scoped by seat_id+path", async () => {
   const a = await registerSeat();
   const b = await registerSeat();
-  const p = "/wt/owned-by-a";
+  const p = wtDir("owned-by-a");
   await post("/worktree-add", { id: a, path: p, branch: "a", base_commit: "x" });
-  await post("/worktree-add", { id: b, path: "/wt/owned-by-b", branch: "b", base_commit: "y" });
+  await post("/worktree-add", { id: b, path: wtDir("owned-by-b"), branch: "b", base_commit: "y" });
 
   // b calling remove on a's path must NOT drop a's row (the delete is seat_id-scoped).
   expect(((await (await post("/worktree-remove", { id: b, path: p })).json()) as { ok: boolean }).ok).toBe(true);
@@ -195,7 +258,7 @@ test("/worktree-remove drops the association and is idempotent; owner-scoped by 
 test("/worktree-add REJECTS a path already owned by a DIFFERENT seat; the owner's row is untouched", async () => {
   const a = await registerSeat({ name: "owner-a" });
   const b = await registerSeat({ name: "intruder-b" });
-  const p = "/wt/contested";
+  const p = wtDir("contested");
   expect(((await (await post("/worktree-add", { id: a, path: p, branch: "a", base_commit: "x" })).json()) as { ok: boolean }).ok).toBe(true);
 
   const stolen = await post("/worktree-add", { id: b, path: p, branch: "b", base_commit: "y" });
@@ -212,7 +275,7 @@ test("/worktree-add REJECTS a path already owned by a DIFFERENT seat; the owner'
 
 test("/worktree-add stays an idempotent upsert for the SAME seat re-adding its own path", async () => {
   const a = await registerSeat();
-  const p = "/wt/self-readd";
+  const p = wtDir("self-readd");
   await post("/worktree-add", { id: a, path: p, branch: "s", base_commit: "sha1" });
   const again = await post("/worktree-add", { id: a, path: p, branch: "s", base_commit: "sha2" });
   expect(((await again.json()) as { ok: boolean }).ok).toBe(true);
@@ -225,8 +288,8 @@ test("endSeat drops a seat's worktree ASSOCIATIONS (git tree never touched)", as
   // Register LIVE, record two worktrees, then /unregister → endSeat reaps the rows.
   const reg = await post("/register", { pid: alivePid(), cwd: "/tmp/wt-dead", git_root: null, tty: null, summary: "dying", role: "ghost", model: null });
   const dead = ((await reg.json()) as { id: string }).id;
-  await post("/worktree-add", { id: dead, path: "/wt/dead-1", branch: "d1", base_commit: "x" });
-  await post("/worktree-add", { id: dead, path: "/wt/dead-2", branch: "d2", base_commit: "y" });
+  await post("/worktree-add", { id: dead, path: wtDir("dead-1"), branch: "d1", base_commit: "x" });
+  await post("/worktree-add", { id: dead, path: wtDir("dead-2"), branch: "d2", base_commit: "y" });
   expect(await listWorktrees(dead)).toHaveLength(2);
 
   await post("/unregister", { id: dead });
@@ -243,6 +306,188 @@ test("/worktree-add for a non-live seat is refused cleanly; malformed input is 4
   expect((await post("/worktree-add", { id: seat, path: "", branch: "b", base_commit: "s" })).status).toBe(400);
   expect((await post("/worktree-add", { id: seat, path: "/p", branch: "", base_commit: "s" })).status).toBe(400);
   expect((await post("/worktree-remove", { id: "bad", path: "/p" })).status).toBe(400);
+});
+
+// --- v0.2.9 path aliasing: one tree, one owner, whatever you call it -----------
+// The 3rd-review finding. worktreeAddTxn compared raw path TEXT, so four spellings of one
+// directory registered as four different paths — which restores the two-seats-one-worktree
+// bug 0.2.8 closed for a single spelling. Every alias below must resolve to ONE owner.
+
+describe("path canonicalization (v0.2.9)", () => {
+  // `${base}/wt` plus three aliases of it: a trailing slash, a ".." hop through a sibling,
+  // and a symlink. `x` must exist for the ".." form to resolve.
+  function aliasSet(name: string): { canonical: string; aliases: string[] } {
+    const base = wtDir(name);
+    const canonical = realpathSync(join(base, "wt"));
+    mkdirSync(join(base, "x"), { recursive: true });
+    symlinkSync(canonical, join(base, "link"));
+    return { canonical, aliases: [canonical, `${canonical}/`, join(base, "x", "..", "wt"), join(base, "link")] };
+  }
+  // mkdirSync the nested dir the helper above assumes.
+  function makeAliasBase(name: string): { canonical: string; aliases: string[] } {
+    mkdirSync(join(WT_ROOT, name, "wt"), { recursive: true });
+    return aliasSet(name);
+  }
+
+  test("every alias of one directory records ONE association under the canonical path", async () => {
+    const seat = await registerSeat();
+    const { canonical, aliases } = makeAliasBase("alias-one");
+    for (const [i, a] of aliases.entries()) {
+      const res = await post("/worktree-add", { id: seat, path: a, branch: "aliased", base_commit: `sha${i}` });
+      expect(((await res.json()) as { ok: boolean }).ok).toBe(true);
+    }
+    // Four adds, four spellings, ONE row — and it is stored canonically.
+    const rows = (await listWorktrees(seat)).filter((w) => w.path === canonical);
+    expect(rows).toHaveLength(1);
+    expect((await listWorktrees(seat)).filter((w) => w.branch === "aliased")).toHaveLength(1);
+  });
+
+  test("a second seat is REFUSED through EVERY alias of a path the first seat owns", async () => {
+    const a = await registerSeat({ name: "alias-owner" });
+    const b = await registerSeat({ name: "alias-intruder" });
+    const { canonical, aliases } = makeAliasBase("alias-contested");
+    expect(((await (await post("/worktree-add", { id: a, path: canonical, branch: "a", base_commit: "x" })).json()) as { ok: boolean }).ok).toBe(true);
+
+    for (const alias of aliases) {
+      const body = (await (await post("/worktree-add", { id: b, path: alias, branch: "b", base_commit: "y" })).json()) as {
+        ok: boolean;
+        error?: string;
+      };
+      expect(body.ok).toBe(false); // pre-0.2.9 every alias but the first slipped through
+      expect(body.error).toContain("alias-owner");
+    }
+    expect((await listWorktrees(b)).some((w) => w.path === canonical)).toBe(false);
+    expect((await listWorktrees(a)).find((w) => w.path === canonical)!.branch).toBe("a"); // untouched
+  });
+
+  test("a path that does not exist is refused (realpath is the only safe normalization)", async () => {
+    const seat = await registerSeat();
+    const body = (await (await post("/worktree-add", { id: seat, path: join(WT_ROOT, "no-such-tree"), branch: "n", base_commit: "x" })).json()) as {
+      ok: boolean;
+      error?: string;
+    };
+    expect(body.ok).toBe(false);
+    expect(body.error).toContain("not an existing absolute path");
+  });
+
+  test("a lease and a worktree row agree on the canonical path across aliases", async () => {
+    const seat = await registerSeat({ guarded: true });
+    const { canonical, aliases } = makeAliasBase("alias-lease");
+    await post("/worktree-add", { id: seat, path: aliases[2]!, branch: "l", base_commit: "x" }); // recorded via the ".." alias
+    const lease = (await (await post("/lease-worktree", { id: seat, path: aliases[3]! })).json()) as { ok: boolean }; // leased via the symlink
+    expect(lease.ok).toBe(true);
+    // The lease joins onto the worktree row only if BOTH canonicalized to the same string.
+    const row = (await listWorktrees(seat)).find((w) => w.path === canonical)!;
+    expect((row as Wt & { lease_expires_at?: string | null }).lease_expires_at).toBeTruthy();
+  });
+});
+
+// --- v0.2.9 checkpoint lease --------------------------------------------------
+
+describe("/lease-worktree + /release-worktree", () => {
+  async function lease(id: string, path: string) {
+    return (await (await post("/lease-worktree", { id, path })).json()) as { ok: boolean; expires_at?: string; error?: string };
+  }
+
+  test("acquire → renew → release round-trips; the row is visible while held", async () => {
+    const seat = await registerSeat();
+    const p = wtDir("lease-round-trip");
+    await post("/worktree-add", { id: seat, path: p, branch: "r", base_commit: "x" });
+
+    const first = await lease(seat, p);
+    expect(first.ok).toBe(true);
+    expect(first.expires_at).toBeTruthy();
+    expect(Date.parse(first.expires_at!)).toBeGreaterThan(Date.now()); // TTL is in the future
+    expect(leaseRow(p)).not.toBeNull();
+
+    // Re-leasing by the HOLDER renews rather than refusing — a checkpoint that re-acquires
+    // must not deadlock against itself.
+    const renew = await lease(seat, p);
+    expect(renew.ok).toBe(true);
+    expect(Date.parse(renew.expires_at!)).toBeGreaterThanOrEqual(Date.parse(first.expires_at!));
+    expect(leaseRow(p)!.seat_id).toBe(seat);
+
+    expect(((await (await post("/release-worktree", { id: seat, path: p })).json()) as { ok: boolean }).ok).toBe(true);
+    expect(leaseRow(p)).toBeNull();
+    // Idempotent: releasing a lease nobody holds is a clean no-op (checkpoint releases
+    // from a `finally`, including paths where the acquire never succeeded).
+    expect(((await (await post("/release-worktree", { id: seat, path: p })).json()) as { ok: boolean }).ok).toBe(true);
+  });
+
+  test("a SECOND seat is refused while the lease is held, and the holder is named", async () => {
+    const a = await registerSeat({ name: "lease-holder" });
+    const b = await registerSeat({ name: "lease-rival" });
+    const p = wtDir("lease-contested");
+    expect((await lease(a, p)).ok).toBe(true);
+
+    const denied = await lease(b, p);
+    expect(denied.ok).toBe(false);
+    expect(denied.expires_at).toBeUndefined();
+    expect(denied.error).toContain("lease-holder");
+    expect(leaseRow(p)!.seat_id).toBe(a); // the holder's row is untouched
+
+    // Released by the owner → the rival can take it.
+    await post("/release-worktree", { id: a, path: p });
+    expect((await lease(b, p)).ok).toBe(true);
+    expect(leaseRow(p)!.seat_id).toBe(b);
+  });
+
+  test("release is owner-scoped: a non-holder cannot release someone else's lease", async () => {
+    const a = await registerSeat();
+    const b = await registerSeat();
+    const p = wtDir("lease-owner-scope");
+    await lease(a, p);
+    await post("/release-worktree", { id: b, path: p }); // b is not the holder
+    expect(leaseRow(p)!.seat_id).toBe(a); // still held
+  });
+
+  test("an EXPIRED lease blocks nobody (a killed checkpoint must not wedge a seat)", async () => {
+    const a = await registerSeat();
+    const b = await registerSeat();
+    const p = wtDir("lease-expired");
+    expect((await lease(a, p)).ok).toBe(true);
+    expireLease(p); // simulate the TTL burning down without waiting 120s
+
+    const takeover = await lease(b, p);
+    expect(takeover.ok).toBe(true);
+    expect(leaseRow(p)!.seat_id).toBe(b); // ownership moved to the live claimant
+  });
+
+  test("endSeat drops the seat's leases (a lease must never outlive its holder)", async () => {
+    const reg = await post("/register", { pid: alivePid(), cwd: "/tmp/wt-lease-dead", git_root: null, tty: null, summary: "dying", role: null, model: null });
+    const dead = ((await reg.json()) as { id: string }).id;
+    const p = wtDir("lease-dead-seat");
+    expect((await lease(dead, p)).ok).toBe(true);
+    expect(leaseRow(p)).not.toBeNull();
+
+    await post("/unregister", { id: dead });
+    expect(leaseRow(p)).toBeNull();
+  });
+
+  test("a non-live seat cannot lease; malformed input is 400", async () => {
+    const p = wtDir("lease-validate");
+    const unknown = await lease("zzzzzzzz", p);
+    expect(unknown.ok).toBe(false);
+    expect((await post("/lease-worktree", { id: "bad", path: p })).status).toBe(400);
+    expect((await post("/lease-worktree", { id: "zzzzzzzz", path: "" })).status).toBe(400);
+    expect((await post("/release-worktree", { id: "bad", path: p })).status).toBe(400);
+  });
+});
+
+// --- v0.2.9 `guarded` round-trip ----------------------------------------------
+
+test("guarded round-trips register → /list-seats; absent reads as NOT guarded", async () => {
+  const on = await registerSeat({ guarded: true });
+  const off = await registerSeat({ guarded: false });
+  const silent = await registerSeat(); // pre-0.2.9 launcher: no field at all
+
+  const seats = (await (await post("/list-seats", { scope: "machine", cwd: "/tmp", git_root: null })).json()) as (Seat & {
+    guarded?: boolean;
+  })[];
+  const find = (id: string) => seats.find((s) => s.id === id)!;
+  expect(find(on).guarded).toBe(true);
+  expect(find(off).guarded).toBe(false);
+  expect(find(silent).guarded).toBe(false); // never undefined — checkpoint branches on it
 });
 
 // --- /diff route (real git, byte-bounded) ------------------------------------
@@ -435,7 +680,7 @@ describe("end-to-end (real git repo, real CLI subprocess)", () => {
   test("worktree creates + records, gate-false aborts, gate-true merges + removes", async () => {
     const repo = makeRepo(true); // primary detached → trunk free (the correct fleet layout)
     const env = { CLAUDE_PATROL_PORT: String(PORT), CLAUDE_PATROL_SECRET_FILE: SECRET_FILE };
-    const seat = await registerSeat({ cwd: repo, git_root: repo, handle: "e2e-builder" });
+    const seat = await registerGuardedSeat({ cwd: repo, git_root: repo, handle: "e2e-builder" });
     const mainBefore = git(repo, "rev-parse", "main").out.trim();
 
     try {
@@ -499,7 +744,7 @@ describe("end-to-end (real git repo, real CLI subprocess)", () => {
     git(repo, "commit", "-qam", "main edit");
     git(repo, "checkout", "-q", "--detach"); // free the trunk so the interlock isn't what stops us
 
-    const seat = await registerSeat({ cwd: repo, git_root: repo, handle: "e2e-conflict" });
+    const seat = await registerGuardedSeat({ cwd: repo, git_root: repo, handle: "e2e-conflict" });
     await post("/worktree-add", { id: seat, path: wtPath, branch: "feat", base_commit: c0 });
     const mainBefore = git(repo, "rev-parse", "main").out.trim();
 
@@ -518,7 +763,7 @@ describe("end-to-end (real git repo, real CLI subprocess)", () => {
   test("checkpoint REFUSES to merge when the trunk is a live checkout (never mutates a tree it doesn't own)", async () => {
     const repo = makeRepo(false); // primary STAYS on main → trunk is a live checkout
     const env = { CLAUDE_PATROL_PORT: String(PORT), CLAUDE_PATROL_SECRET_FILE: SECRET_FILE };
-    const seat = await registerSeat({ cwd: repo, git_root: repo, handle: "e2e-guard" });
+    const seat = await registerGuardedSeat({ cwd: repo, git_root: repo, handle: "e2e-guard" });
     const mainBefore = git(repo, "rev-parse", "main").out.trim();
 
     try {
@@ -546,7 +791,7 @@ describe("end-to-end (real git repo, real CLI subprocess)", () => {
     // STOP — not remove the tree, not deregister, not falsely advance main past the snapshot.
     const repo = makeRepo(true); // detached primary → trunk free (rules out the live-checkout STOP)
     const env = { CLAUDE_PATROL_PORT: String(PORT), CLAUDE_PATROL_SECRET_FILE: SECRET_FILE };
-    const seat = await registerSeat({ cwd: repo, git_root: repo, handle: "e2e-advance" });
+    const seat = await registerGuardedSeat({ cwd: repo, git_root: repo, handle: "e2e-advance" });
     const mainBefore = git(repo, "rev-parse", "main").out.trim();
     try {
       const wt = sh(["bun", CLI, "worktree", seat, "adv", "--base", "main"], repo, env);
@@ -584,7 +829,7 @@ describe("end-to-end (real git repo, real CLI subprocess)", () => {
     // detect the matching existing worktree and still run the broker upsert.
     const repo = makeRepo(true); // detached primary so `worktree add ... main` isn't blocked
     const env = { CLAUDE_PATROL_PORT: String(PORT), CLAUDE_PATROL_SECRET_FILE: SECRET_FILE };
-    const seat = await registerSeat({ cwd: repo, git_root: repo, handle: "e2e-recover" });
+    const seat = await registerGuardedSeat({ cwd: repo, git_root: repo, handle: "e2e-recover" });
     try {
       // Pre-create the EXACT worktree the CLI would create, with NO broker record — this is
       // the post-failure state. The CLI's own `git worktree add` will then fail on it.
@@ -612,7 +857,7 @@ describe("end-to-end (real git repo, real CLI subprocess)", () => {
     // deterministic stand-in for the switch (it runs in the seat's tree, after the snapshot).
     const repo = makeRepo(true);
     const env = { CLAUDE_PATROL_PORT: String(PORT), CLAUDE_PATROL_SECRET_FILE: SECRET_FILE };
-    const seat = await registerSeat({ cwd: repo, git_root: repo, handle: "e2e-switch" });
+    const seat = await registerGuardedSeat({ cwd: repo, git_root: repo, handle: "e2e-switch" });
     const mainBefore = git(repo, "rev-parse", "main").out.trim();
     try {
       const wtPath = sh(["bun", CLI, "worktree", seat, "swit", "--base", "main"], repo, env).out.trim();
@@ -660,7 +905,7 @@ describe("end-to-end (real git repo, real CLI subprocess)", () => {
       { mode: 0o755 }
     );
     const env = { CLAUDE_PATROL_PORT: String(PORT), CLAUDE_PATROL_SECRET_FILE: SECRET_FILE, PATH: `${shimDir}:${process.env.PATH}` };
-    const seat = await registerSeat({ cwd: repo, git_root: repo, handle: "e2e-late" });
+    const seat = await registerGuardedSeat({ cwd: repo, git_root: repo, handle: "e2e-late" });
     try {
       const wtPath = sh(["bun", CLI, "worktree", seat, "late", "--base", "main"], repo, env).out.trim();
       expect(wtPath).toBe(seatWt);
@@ -698,8 +943,8 @@ describe("end-to-end (real git repo, real CLI subprocess)", () => {
     // the broker rejects the write even if a client bypasses the CLI.
     const repo = makeRepo(true);
     const env = { CLAUDE_PATROL_PORT: String(PORT), CLAUDE_PATROL_SECRET_FILE: SECRET_FILE };
-    const a = await registerSeat({ cwd: repo, git_root: repo, handle: "e2e-own-a" });
-    const b = await registerSeat({ cwd: repo, git_root: repo, handle: "e2e-own-b" });
+    const a = await registerGuardedSeat({ cwd: repo, git_root: repo, handle: "e2e-own-a" });
+    const b = await registerGuardedSeat({ cwd: repo, git_root: repo, handle: "e2e-own-b" });
     try {
       const first = sh(["bun", CLI, "worktree", a, "shared", "--base", "main"], repo, env);
       expect(first.code).toBe(0);
@@ -732,7 +977,7 @@ describe("end-to-end (real git repo, real CLI subprocess)", () => {
     // branch already checked out at the target path is a real conflict — reject, don't clobber.
     const repo = makeRepo(true);
     const env = { CLAUDE_PATROL_PORT: String(PORT), CLAUDE_PATROL_SECRET_FILE: SECRET_FILE };
-    const seat = await registerSeat({ cwd: repo, git_root: repo, handle: "e2e-mismatch" });
+    const seat = await registerGuardedSeat({ cwd: repo, git_root: repo, handle: "e2e-mismatch" });
     try {
       // Occupy the path the CLI derives for branch "wanted" with a DIFFERENT branch.
       const wtPath = join(repo, ".claude/worktrees/wanted");
@@ -741,6 +986,119 @@ describe("end-to-end (real git repo, real CLI subprocess)", () => {
       const r = sh(["bun", CLI, "worktree", seat, "wanted", "--base", "main"], repo, env);
       expect(r.code).not.toBe(0); // rejected — the path holds a different branch
       expect(await listWorktrees(seat)).toHaveLength(0); // no association recorded
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  // --- v0.2.9: the lease is what makes the merge safe, so assert it is real ---------
+
+  test("checkpoint REFUSES an UNGUARDED seat; --force proceeds", async () => {
+    const repo = makeRepo(true);
+    const env = { CLAUDE_PATROL_PORT: String(PORT), CLAUDE_PATROL_SECRET_FILE: SECRET_FILE };
+    const seat = await registerSeat({ cwd: repo, git_root: repo }); // NO guard hook installed
+    const mainBefore = git(repo, "rev-parse", "main").out.trim();
+    try {
+      const wtPath = sh(["bun", CLI, "worktree", seat, "unguarded", "--base", "main"], repo, env).out.trim();
+      sh(["sh", "-c", `echo work > "${wtPath}/f.txt"`]);
+      git(wtPath, "commit", "-qam", "seat work");
+      const tip = git(wtPath, "rev-parse", "HEAD").out.trim();
+
+      // An unguarded seat cannot be quiesced, so a checkpoint would be back to racing it.
+      const refused = sh(["bun", CLI, "checkpoint", seat, "--gate", "true"], repo, env);
+      expect(refused.code).not.toBe(0);
+      expect(refused.err).toContain("not a guarded seat");
+      expect(git(repo, "rev-parse", "main").out.trim()).toBe(mainBefore); // nothing merged
+      expect(existsSync(wtPath)).toBe(true);
+      expect(await listWorktrees(seat)).toHaveLength(1); // still tracked
+
+      // --force is the documented escape hatch: it waives ONLY the guard requirement.
+      const forced = sh(["bun", CLI, "checkpoint", seat, "--gate", "true", "--force"], repo, env);
+      expect(forced.code).toBe(0);
+      expect(git(repo, "rev-parse", "main").out.trim()).toBe(tip);
+      expect(await listWorktrees(seat)).toHaveLength(0);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test("a guarded seat with NO lease_file is treated as unguarded (never guess the path)", async () => {
+    const repo = makeRepo(true);
+    const env = { CLAUDE_PATROL_PORT: String(PORT), CLAUDE_PATROL_SECRET_FILE: SECRET_FILE };
+    // The half-wired case: the hook is installed but the seat never reported where its lease
+    // file lives. Writing a guessed path would leave the hook watching a different file — the
+    // lease would look taken while quiescing nothing, which is worse than refusing outright.
+    const seat = await registerSeat({ cwd: repo, git_root: repo, guarded: true });
+    const mainBefore = git(repo, "rev-parse", "main").out.trim();
+    try {
+      const wtPath = sh(["bun", CLI, "worktree", seat, "nofile", "--base", "main"], repo, env).out.trim();
+      sh(["sh", "-c", `echo work > "${wtPath}/f.txt"`]);
+      git(wtPath, "commit", "-qam", "seat work");
+
+      const cp = sh(["bun", CLI, "checkpoint", seat, "--gate", "true"], repo, env);
+      expect(cp.code).not.toBe(0);
+      expect(cp.err).toContain("no lease-file path");
+      expect(git(repo, "rev-parse", "main").out.trim()).toBe(mainBefore); // nothing merged
+      expect(await listWorktrees(seat)).toHaveLength(1); // still tracked
+      expect(leaseRow(wtPath)).toBeNull(); // refused BEFORE acquiring
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test("a guarded checkpoint HOLDS the lease across the merge and releases it after", async () => {
+    const repo = makeRepo(true);
+    const env = { CLAUDE_PATROL_PORT: String(PORT), CLAUDE_PATROL_SECRET_FILE: SECRET_FILE };
+    const leaseFile = join(WT_ROOT, "held-lease.json");
+    const seat = await registerSeat({ cwd: repo, git_root: repo, guarded: true, lease_file: leaseFile });
+    try {
+      const wtPath = sh(["bun", CLI, "worktree", seat, "leased", "--base", "main"], repo, env).out.trim();
+      // Resolve NOW: a successful checkpoint removes this tree, after which realpath cannot.
+      const canonical = realpathSync(wtPath);
+      sh(["sh", "-c", `echo work > "${wtPath}/f.txt"`]);
+      git(wtPath, "commit", "-qam", "seat work");
+
+      // The gate runs INSIDE the leased window, so it is the observation point: copy the
+      // lease file the guard hook would be stat-ing right now.
+      const witness = join(WT_ROOT, "lease-witness.json");
+      const cp = sh(["bun", CLI, "checkpoint", seat, "--gate", `cp "${leaseFile}" "${witness}"`], repo, env);
+      expect(cp.code).toBe(0);
+
+      // Mid-run: the file existed and named this tree + an expiry (what the hook reads).
+      const seen = JSON.parse(readFileSync(witness, "utf8")) as { expires_at: string; path: string };
+      expect(seen.path).toBe(canonical);
+      expect(Date.parse(seen.expires_at)).toBeGreaterThan(0);
+
+      // After: both halves of the lease are gone — the broker row AND the seat's file.
+      expect(leaseRow(canonical)).toBeNull();
+      expect(existsSync(leaseFile)).toBe(false);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test("a checkpoint that THROWS after acquiring still releases the lease (the finally)", async () => {
+    const repo = makeRepo(true);
+    const env = { CLAUDE_PATROL_PORT: String(PORT), CLAUDE_PATROL_SECRET_FILE: SECRET_FILE };
+    // An unwritable lease-file path makes writeLeaseFile throw AFTER the broker lease is
+    // taken — a real exception on a real path, which is exactly what the `finally` is for.
+    const seat = await registerSeat({
+      cwd: repo,
+      git_root: repo,
+      guarded: true,
+      lease_file: join(WT_ROOT, "no-such-dir", "lease.json"),
+    });
+    try {
+      const wtPath = sh(["bun", CLI, "worktree", seat, "throws", "--base", "main"], repo, env).out.trim();
+      sh(["sh", "-c", `echo work > "${wtPath}/f.txt"`]);
+      git(wtPath, "commit", "-qam", "seat work");
+
+      const cp = sh(["bun", CLI, "checkpoint", seat, "--gate", "true"], repo, env);
+      expect(cp.code).not.toBe(0); // it threw
+      // The lease must NOT survive the crash: a seat left holding one silently refuses to
+      // write until the TTL burns down.
+      expect(leaseRow(wtPath)).toBeNull();
+      expect(await listWorktrees(seat)).toHaveLength(1); // nothing was deregistered
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }
