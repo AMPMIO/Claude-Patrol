@@ -9,7 +9,7 @@
 [Why](#why-standing-seats) · [Features](#what-patrol-does-that-raw-terminals-dont) · [Quickstart](#quickstart) · [Architecture](#architecture) · [Roadmap](#roadmap) · [Contributing](#contributing)
 
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square)](LICENSE)
-[![tests](https://img.shields.io/badge/tests-356%20passing-brightgreen?style=flat-square)](tests)
+[![tests](https://img.shields.io/badge/tests-378%20passing-brightgreen?style=flat-square)](tests)
 [![bun](https://img.shields.io/badge/Bun-1.2+-black?style=flat-square&logo=bun)](https://bun.sh)
 [![typescript](https://img.shields.io/badge/TypeScript-strict-3178C6?style=flat-square&logo=typescript&logoColor=white)](tsconfig.json)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-orange?style=flat-square)](#contributing)
@@ -47,8 +47,19 @@ patrol down        # tear it all down
 
 ## Why standing seats
 
-Spawning a subagent per task is the default way to run multiple agents. It is
-also the expensive way, and we measured how expensive.
+A seat that has been reviewing the same codebase for six waves is better at it than a
+subagent spawned thirty seconds ago. It knows what was already ruled out, which
+failure modes this repo actually has, and what "done" looks like here. That
+continuity is the reason to run standing seats, and no pricing change can erode it —
+a fresh agent starts from nothing regardless of what a token costs.
+
+The second reason is that you can see what each one costs. Patrol reads Claude Code's
+own session logs and attributes spend per seat, across the three billing wallets that
+are actually separate accounts. No other terminal fleet manager does this.
+
+Cost is the third reason, not the first — and it is the one most exposed to a vendor
+changing the substrate underneath it. Here is the measurement anyway, with its limits
+attached.
 
 <div align="center">
 <img src="assets/why-standing-seats.png" alt="Subagents $6.22 vs standing seats $2.16, a 65% cost cut" width="620" />
@@ -71,11 +82,20 @@ about 80% of the heavy run's cost was config weight being repurchased per spawn
 and re-read per turn, not the task itself. A standing seat buys its context once
 and reads it back at 1/12.5 the write price, amortizing after roughly one task.
 
-Two honest caveats: sample sizes are 1–2 runs per cell, and dollar totals are
-sensitive to the exact subagent mix. The robust, repeatable number is the
-per-spawn cache-write re-buy. So the cost driver is config weight × spawn count,
-and Patrol attacks both ends: standing seats amortize the buy, and per-seat
-profiles (`peer`, `lite`) shrink what gets bought at all.
+Three honest caveats. Sample sizes are 1–2 runs per cell, and dollar totals are
+sensitive to the exact subagent mix — the robust, repeatable finding is the per-spawn
+cache-write re-buy, not the headline percentage. Second, this is a fact about *config
+weight*, and the vendor's lever on it differs from ours: cheaper cache reuse across
+spawns would shrink this gap without anyone changing Patrol. Third, standing seats
+have a cost of their own that this benchmark did not isolate — an orchestrator idle
+while a seat works can let its own prompt cache expire, and the next turn re-encodes
+an unchanged history at the write rate. Measuring that is on the roadmap rather than
+assumed away; until it lands, treat the comparison as untested in that direction.
+
+So the cost driver is config weight × spawn count, and Patrol attacks both ends:
+standing seats amortize the buy, and per-seat profiles (`peer`, `lite`) shrink what
+gets bought at all. Treat the dollar figure as directional and the continuity as the
+durable part.
 
 ## What Patrol does that raw terminals don't
 
@@ -254,7 +274,7 @@ patching it. Several Patrol features were prototyped there first.
 | Boot latency | LLM auto-summary API call (up to 3s, external dep) | opt-in only; seats self-describe |
 | Message table | grows forever | delivered messages purged after 7 days |
 | Packaging | manual clone + .mcp.json | Claude Code plugin (commands, skill, hook, MCP) + CLI/daemon |
-| Tests | none | 356 across broker, costs, launcher, CLI, codex adapter, integration |
+| Tests | none | 378 across broker, costs, launcher, CLI, codex adapter, integration |
 
 ## Quickstart
 
@@ -480,7 +500,7 @@ per-task cost tags; a Warp launch backend.
 
 ## Status and caveats
 
-**v0.2.9, 356 tests.** Cost attribution survives the case that broke it in v0.1:
+**v0.2.9.1, 378 tests.** Cost attribution survives the case that broke it in v0.1:
 several seats working in the same repo, split across three billing wallets, with a
 per-seat budget alert when one crosses its cap. History survives seat teardown and
 broker restarts. `/costs` reads from an incrementally indexed ledger instead of
@@ -504,6 +524,16 @@ one person on one machine, so expect sharp edges outside that path.
   write. A seat with no guard hook cannot be quiesced at all, which is why
   `checkpoint` refuses an adapter seat (`codex`, `headless`) unless you pass
   `--force` and accept the older fences-only behavior.
+- **`guarded` proves a hook is installed, not that it fired.** At registration a seat
+  verifies what it can see locally: the lease path is absolute, the guard script
+  exists, the lease directory is writable. It cannot verify that Claude loaded the
+  settings overlay, that it will invoke the hook, or that it will honor the deny —
+  only the seat's own session knows that, and it has no channel to say so. Closing
+  this needs the hook itself reporting back that it ran. That handshake is the
+  largest remaining gap in the lease, and it is not built. `checkpoint`'s three
+  fences stay in place precisely as the detector for everything the lease cannot
+  cover: if a fence trips, the lease failed, and you get `INCOMPLETE` rather than a
+  false success.
 - **The dashboard is loopback-only, and its token is scoped.** `patrol dash` mints
   a short-lived nonce that authenticates the read routes and `/answer`; every write
   route still requires the full broker secret, and the page is refused without a
@@ -531,7 +561,7 @@ the coverage I cannot give it myself.
 
 ```bash
 bun install
-bun test              # 356 tests
+bun test              # 378 tests
 bunx tsc --noEmit     # strict, must stay clean
 ```
 
