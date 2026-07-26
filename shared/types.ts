@@ -241,18 +241,32 @@ export interface WorktreeRemoveRequest {
 export const LEASE_FILE_ENV = "CLAUDE_PATROL_LEASE_FILE";
 export const LEASE_TTL_SECONDS = 120; // >> a checkpoint, << a work session
 
+// v0.2.9.1: an opaque per-CHECKPOINT token. Keying ownership on seat_id ALONE made a
+// second checkpoint of the same seat read as a renewal, so either process could release
+// the row and file the other was still running under — un-quiescing the seat mid-merge.
+// The token is minted per acquire, so "the same seat again" is a DIFFERENT holder and is
+// refused. Minted BROKER-side: the broker is the arbiter, and a client-minted token would
+// let a racing client present one it was never issued.
+export const LEASE_TOKEN_RE = /^cpl-[0-9a-f]{32}$/;
+
 export interface LeaseWorktreeRequest {
   id: SeatId;
   path: string; // the worktree being checkpointed (canonical)
+  token?: string; // absent = fresh acquire (broker mints one); present = RENEW, and must match the stored token
 }
 export interface LeaseWorktreeResponse {
   ok: boolean;
   expires_at?: string; // ISO; absent when ok:false
+  token?: string; // the holder's proof, required for renew AND release; absent when ok:false
   error?: string; // e.g. the seat is not guarded, or someone else holds the lease
 }
 export interface ReleaseWorktreeRequest {
   id: SeatId;
   path: string;
+  // REQUIRED, not optional: an optional token re-opens the hole, since any caller could
+  // then release by simply omitting it. A checkpoint that never acquired (the --force
+  // path) therefore must NOT call release at all — it holds nothing.
+  token: string;
 }
 
 export interface ClaimPortRequest {
