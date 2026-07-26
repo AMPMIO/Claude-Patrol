@@ -33,6 +33,10 @@ export interface Seat {
   // seat with no lease_file reads as unguarded — never guess the path.
   guarded?: boolean;
   lease_file?: string | null;
+  // v0.3: which fleet this seat belongs to. Handles are unique PER FLEET, so two
+  // projects may each run a `builder`; message resolution and teardown are
+  // fleet-scoped. Absent on pre-0.3 rows, which read as the default fleet.
+  fleet?: string | null;
   registered_at: string; // ISO
   last_seen: string; // ISO
 }
@@ -347,6 +351,14 @@ export interface RegisterRequest {
   // hook would watch one path while checkpoint wrote another, and the lease would never
   // fire while appearing to work.
   lease_file?: string | null;
+  fleet?: string | null; // v0.3: the fleet this seat launched into
+  // v0.3 stable identity across restarts: fleet + seat name, unchanged by a crash or a
+  // relaunch. The broker's stale sweep deletes a dead seat's undelivered mail and a
+  // restarted seat used to return under a NEW id, so nothing could be resurfaced —
+  // consumer-crash redelivery was blocked on exactly this. A returning seat presenting
+  // the same stable_key re-claims its prior identity and its unacked mail is redelivered
+  // rather than purged.
+  stable_key?: string | null;
 }
 
 // v0.2 Layer 2 (exact attribution for manual seats): a plugin SessionStart
@@ -364,7 +376,22 @@ export interface RegisterResponse {
   // set when the broker's uniqueness guard nulled a session_id claim already
   // held by a live seat (the claimant's costs stay unattributed)
   session_id_rejected?: boolean;
+  // v0.3 capability token: the seat's PROOF of identity, minted here and presented
+  // on every seat-owned route thereafter. Until now those routes trusted `body.id`,
+  // so any holder of the machine-wide secret could set another seat's state, release
+  // its claims, ack its mail, or burn ports charged to it — the finding three
+  // consecutive adversarial reviews kept returning. `body.id` becomes a claim the
+  // token must match. The human's shared secret keeps full scope: the threat model
+  // is seat-spoofs-seat, not the operator who owns the 0600 file.
+  seat_token?: string;
 }
+
+// v0.3 auth scopes, generalizing the v0.2.7 dash-nonce gate (which already resolved a
+// presented token to full|dash|none once and gated each route by it).
+//   full     — the shared secret: the operator, every route
+//   seat     — a capability token: only routes that seat owns, and only for itself
+//   dash     — the dashboard nonce: read routes + /answer, loopback origin only
+export type Scope = "full" | "seat" | "dash" | "none";
 
 export interface HeartbeatRequest {
   id: SeatId;
@@ -378,6 +405,10 @@ export interface ListSeatsRequest {
   cwd: string;
   git_root: string | null;
   exclude_id?: SeatId;
+  // v0.3: restrict to one fleet. Omitted = every fleet (what the dashboard wants);
+  // the CLI passes the caller's own fleet so `patrol send builder` can never reach
+  // another project's builder by accident.
+  fleet?: string | null;
 }
 export interface SendMessageRequest {
   from_id: SeatId | "cli";
@@ -541,6 +572,12 @@ export interface ProfileSpec {
 
 export interface PatrolConfig {
   seats: SeatSpec[];
+  // v0.3: the fleet this config launches. Optional — defaults to the git-root
+  // basename — so an existing patrol.yaml keeps working unchanged. A fleet is the
+  // isolation unit: its own tmux session (`patrol-<fleet>`), its own handle
+  // namespace, its own teardown. Before this, TMUX_SESSION was the constant
+  // "patrol", so `patrol down` in ANY project killed EVERY project's seats.
+  fleet?: string;
   // v0.2.6: fleet-wide spend cap + who hears a crossing. budget_alert_to is a handle
   // or role (default: the seat whose role is "orchestrator"). A per-seat
   // SeatSpec.budget_usd overrides this for that seat.
