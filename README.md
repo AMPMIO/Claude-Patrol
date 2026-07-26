@@ -9,7 +9,7 @@
 [Why](#why-standing-seats) · [Features](#what-patrol-does-that-raw-terminals-dont) · [Quickstart](#quickstart) · [Architecture](#architecture) · [Roadmap](#roadmap) · [Contributing](#contributing)
 
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square)](LICENSE)
-[![tests](https://img.shields.io/badge/tests-326%20passing-brightgreen?style=flat-square)](tests)
+[![tests](https://img.shields.io/badge/tests-356%20passing-brightgreen?style=flat-square)](tests)
 [![bun](https://img.shields.io/badge/Bun-1.2+-black?style=flat-square&logo=bun)](https://bun.sh)
 [![typescript](https://img.shields.io/badge/TypeScript-strict-3178C6?style=flat-square&logo=typescript&logoColor=white)](tsconfig.json)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-orange?style=flat-square)](#contributing)
@@ -37,6 +37,7 @@ patrol down        # tear it all down
 - [What Patrol does that raw terminals don't](#what-patrol-does-that-raw-terminals-dont)
 - [Comparison: Claude-Patrol vs claude-peers-mcp](#comparison-claude-patrol-vs-claude-peers-mcp)
 - [Quickstart](#quickstart)
+- [Commands](#commands)
 - [Architecture](#architecture)
 - [Roadmap](#roadmap)
 - [Status and caveats](#status-and-caveats)
@@ -139,6 +140,57 @@ Claude Code session log, so a codex seat shows no spend in `patrol status` (abse
 not misattributed), and a reply over the broker's 8KiB cap arrives truncated with a
 path to the full text on disk.
 
+**9. A command center in the browser.**
+`patrol dash` opens a broker-served page with four panes: a **question inbox** (a
+seat asks with `/ask`, every open question surfaces in one place, you answer, the
+broker routes the answer back to the asking seat as a message), the fleet board
+with live seat state, a comms audit log of every message that crossed the broker,
+and a per-seat working-diff pane (tracked and untracked, capped at 256 KiB) plus
+the three-wallet billing strip. It is served on loopback only, and `patrol dash`
+mints a short-lived nonce for it: that nonce authenticates the read routes and
+`/answer` and nothing else. Every write route still requires the full secret, so a
+leaked nonce cannot spoof a seat, send messages, or destroy another seat's mail.
+
+**10. One window instead of six.**
+`patrol cockpit` folds the fleet into a single tmux window: a big focus pane over
+tiled live previews of every other seat, `Ctrl-b z` to zoom one fullscreen, `Ctrl-b
+P` to promote a preview into the focus pane, key hints in the status bar. These are
+the real terminals joined in, not a summary of them, and each seat's live process is
+preserved.
+
+**11. A wizard for the config.**
+`patrol init` walks you through a fleet and writes a validated, gitignored
+`patrol.yaml`. `patrol init --ai` runs a one-shot `claude -p` over the repo and your
+stated goal and recommends the seats. That run is isolated on purpose: empty MCP
+config, no tools, a temp cwd so no project `CLAUDE.md`, settings, or hooks load, and
+repo signals fenced as untrusted data, so a hostile repo cannot steer it.
+
+**12. Budget alerts on the ledger you already have.**
+Give a seat (or the whole fleet) a `budget_usd`, and the seat that crosses it pings
+`budget_alert_to` (by default the `orchestrator`-role seat) exactly once. It is
+observe-only: Patrol reports spend, it never gates the model or stops a seat.
+`patrol status` grows a `BUDGET` column and an `OVER` marker. The check runs in an
+isolated try inside the cost tick, so a bug in it cannot break cost indexing.
+
+**13. A worktree per task, not per seat.**
+`patrol worktree <seat> <branch>` cuts a tracked git worktree under
+`.claude/worktrees/` and tells the seat where it is; `patrol checkpoint <seat>
+[--gate "<cmd>"]` runs the gate there, merges the branch back to trunk, and removes
+the worktree. The seat itself is never pinned to a tree; it is a standing seat that
+picks up a task tree and puts it down. The merge-back runs inside a throwaway
+integration worktree, so it never mutates a checkout another seat may be mid-build
+in; git's one-branch-one-worktree rule refuses if trunk is live, a conflict STOPs
+with the trunk ref untouched, and the seat's tree is removed without `--force` so
+uncommitted work is preserved rather than destroyed. See
+[the checkpoint caveat](#status-and-caveats) for what a lease does and does not
+cover.
+
+**14. Seats that say what they are doing, and a way to wait on it.**
+A seat self-reports `idle | working | blocked | done`, so `patrol wait builder
+--until done --timeout 300` replaces hand-polling in a script. Seats also carry
+readable handles assigned at register (`patrol send builder`, `patrol rename <old>
+<new>`); the immutable id stays the internal key and a fallback.
+
 ### Why a codex seat is set up the way it is (v0.2.3)
 
 <div align="center">
@@ -202,7 +254,7 @@ patching it. Several Patrol features were prototyped there first.
 | Boot latency | LLM auto-summary API call (up to 3s, external dep) | opt-in only; seats self-describe |
 | Message table | grows forever | delivered messages purged after 7 days |
 | Packaging | manual clone + .mcp.json | Claude Code plugin (commands, skill, hook, MCP) + CLI/daemon |
-| Tests | none | 326 across broker, costs, launcher, CLI, codex adapter, integration |
+| Tests | none | 356 across broker, costs, launcher, CLI, codex adapter, integration |
 
 ## Quickstart
 
@@ -256,6 +308,37 @@ seats:
       plugins: [codex, superpowers]   # just these two
       mcp: patrol
 ```
+
+`patrol init` writes a validated `patrol.yaml` for you (and gitignores it);
+`patrol init --ai` reads the repo and your stated goal and recommends the seats.
+
+## Commands
+
+Nineteen verbs, and the number is published so it can be watched. See
+[Command surface](#roadmap) for why. `patrol` with no arguments prints the same
+list.
+
+| verb | what it does |
+|---|---|
+| `patrol init [--ai]` | wizard: write a `patrol.yaml` here (`--ai` for AI-suggested defaults) |
+| `patrol up [config]` | launch the fleet from `patrol.yaml` |
+| `patrol down` | tear the fleet down |
+| `patrol status` | fleet board: seats, roles, models, state, spend, budget |
+| `patrol send <handle> <msg>` | message a seat (handle or id) |
+| `patrol list` | list seats, compact |
+| `patrol rename <handle> <name>` | rename a seat's handle |
+| `patrol wait <handle> --until done[,blocked]` | block until a seat reaches a state (`--timeout 300`) |
+| `patrol doctor` | check broker/daemon health |
+| `patrol stats` | telemetry: wake-ups, coalescing ratio, attribution layers |
+| `patrol watch` | live TUI: fleet board + message log across projects |
+| `patrol cockpit` | fold the fleet into one tmux window: focus pane + tiled previews |
+| `patrol dash` | open the command-center dashboard in your browser |
+| `patrol claim-port <id> [n]` | allocate n ports to a seat from the range |
+| `patrol claim <id> <path>...` | claim paths for a seat (advisory) |
+| `patrol claims [git-root]` | list current path claims |
+| `patrol release <id> [path...]` | release a seat's path claims |
+| `patrol worktree <seat> <branch> [--base <ref>]` | cut a task worktree for a seat |
+| `patrol checkpoint <seat> [--gate "<cmd>"] [--force]` | merge the branch back, remove the worktree |
 
 ## Architecture
 
@@ -331,9 +414,29 @@ CPU. 189 tests.
   spend.
 - **`patrol worktree` + `patrol checkpoint`**: the task-worktree loop as two verbs.
   `worktree` cuts a tracked task worktree for a seat; `checkpoint` merges it back to
-  main and removes it — integrating inside a throwaway worktree so it never mutates a
+  main and removes it, integrating inside a throwaway worktree so it never mutates a
   checkout another seat may be mid-build in (git's one-branch-one-worktree rule is the
   interlock; a conflict or a live trunk STOPs cleanly, losing nothing).
+
+**v0.2.7, shipped.** All 8 findings from a Codex adversarial review of 0.2.5/0.2.6
+(1 critical, 4 high, 3 medium), each verified against the code before fixing. The
+critical one: `GET /dashboard` was unauthenticated and embedded the full broker
+secret in the page. It is now nonce-gated behind a loopback Origin/Host check, and
+the nonce authenticates the read routes plus `/answer` only.
+
+**v0.2.8, shipped.** A second adversarial pass on the 0.2.7 fixes: three that were
+incomplete rather than closed, one regression 0.2.7 introduced (a recovery path
+could put two seats in one worktree). Checkpoint grew a third fence binding both the
+branch tip and symbolic HEAD.
+
+**v0.2.9, shipped.** Checkpoint stops racing the seat. Detection cannot win a race
+against a still-working agent. The final fence could not even read the seat's HEAD,
+because the worktree was already gone. So the seat is now **quiesced** instead:
+checkpoint takes a lease and writes a lease file, the seat's `PreToolUse` guard hook
+denies mutating tool calls while that file is live, checkpoint proves the branch tip
+has stopped moving, and only then merges. The hook fails open on every error path,
+because a wedged fleet is worse than a missed fence. A seat with no guard hook
+(`codex` and `headless` adapters) is refused unless you pass `--force`.
 
 **Command surface (held deliberately):** 19 verbs. The field's cautionary tale is a
 competitor whose own docs disagree on its tool count (87 / 171 / 210); Patrol's edge is
@@ -377,7 +480,7 @@ per-task cost tags; a Warp launch backend.
 
 ## Status and caveats
 
-**v0.2.8, 326 tests.** Cost attribution survives the case that broke it in v0.1:
+**v0.2.9, 356 tests.** Cost attribution survives the case that broke it in v0.1:
 several seats working in the same repo, split across three billing wallets, with a
 per-seat budget alert when one crosses its cap. History survives seat teardown and
 broker restarts. `/costs` reads from an incrementally indexed ledger instead of
@@ -391,7 +494,26 @@ broker request is validated.
 This is a tool I built for my own fleet and then opened up. It is used daily, but by
 one person on one machine, so expect sharp edges outside that path.
 
-- **Single-machine by design.** No cross-host coordination.
+- **Single-machine by design.** No cross-host coordination, no hosted backend, no
+  remote seats. This is not a limitation waiting to be lifted; it is the scope.
+- **`checkpoint` quiesces tool calls, not processes.** The lease works through the
+  seat's `PreToolUse` guard hook, so it stops the seat's next *tool call*. A tool
+  call already in flight when the lease lands still completes (checkpoint waits it
+  out and proves the tip has settled), and a background process the seat started
+  earlier (a dev server, a watcher, a long build) keeps running and can still
+  write. A seat with no guard hook cannot be quiesced at all, which is why
+  `checkpoint` refuses an adapter seat (`codex`, `headless`) unless you pass
+  `--force` and accept the older fences-only behavior.
+- **The dashboard is loopback-only, and its token is scoped.** `patrol dash` mints
+  a short-lived nonce that authenticates the read routes and `/answer`; every write
+  route still requires the full broker secret, and the page is refused without a
+  loopback `Origin`/`Host`. It is not an interface to expose off the machine.
+- **A codex seat shows `—` in the SPEND column, not `$0`.** Codex writes no Claude Code session log, so
+  there is no spend to attribute. The figure is absent rather than misattributed;
+  parsing codex's own usage is a v0.4 item.
+- **`ports:` in `patrol.yaml` is accepted but not yet delivered to the seat.** The
+  broker allocates from the range, but nothing exports the result into a seat's
+  environment. Use `patrol claim-port <seat> <n>` and pass the ports yourself.
 - **The `claude/channel` capability is a Claude Code research preview**
   (`--dangerously-load-development-channels`). If it changes, delivery degrades to
   the `check_messages` fallback rather than breaking.
@@ -409,7 +531,7 @@ the coverage I cannot give it myself.
 
 ```bash
 bun install
-bun test              # 326 tests
+bun test              # 356 tests
 bunx tsc --noEmit     # strict, must stay clean
 ```
 

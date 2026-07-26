@@ -43,6 +43,18 @@ coexist, ignore it. Fix anything else it flags before continuing.
 ## 3. Write your fleet config
 
 ```bash
+patrol init            # wizard: asks for seats, writes + gitignores patrol.yaml
+patrol init --ai       # same, but reads the repo and your goal and suggests a fleet
+```
+
+`--ai` runs a single `claude -p` pass, off the interactive budget. It is isolated
+on purpose — empty MCP config, no tools, a temp cwd so no project `CLAUDE.md`,
+settings, or hooks load, and everything it reads out of the repo is fenced as
+untrusted data. It only ever *proposes* a config; you still review what it wrote.
+
+Or start from the annotated example, which shows every field that exists:
+
+```bash
 cp patrol.yaml.example patrol.yaml
 $EDITOR patrol.yaml
 ```
@@ -79,6 +91,17 @@ Rules the launcher enforces:
   normal plugins, and inline maps for per-seat plugin subsets (see
   `patrol.yaml.example`).
 - A relative `cwd:` resolves against the yaml file's directory.
+
+Optional fields worth knowing:
+- `budget_usd:` — per seat, or once at the top level as the fleet default. The
+  seat that crosses it pings `budget_alert_to` (a handle or a role; default: the
+  `orchestrator`-role seat) **once**. Observe-only — it never stops a seat.
+- `sandbox:` — codex seats only, `read-only` by default. `workspace-write` opts a
+  codex seat into editing files, confined to its own working directory and behind
+  a `PreToolUse` deny-hook over destructive commands.
+- `ports: N` — parsed, but **not yet delivered to the seat**: nothing exports the
+  allocated ports into the seat's environment. Until that lands, use
+  `patrol claim-port <seat> <n>` and hand the ports to the seat yourself.
 
 **Check:** none needed here — `patrol up` (next step) validates the entire
 config before launching anything and refuses the whole fleet on any
@@ -170,8 +193,19 @@ Optional deeper checks:
 
 ## 7. Daily use
 
-- `patrol status` — board: seat, role, model, last-seen, spend, summaries.
-- `patrol send <id> "<msg>"` — from your terminal or from any seat (Bash).
+- `patrol status` — board: seat, id, role, model, profile, tty, branch, last-seen,
+  spend, budget, summary. `OVER` in the spend cell means the seat crossed its
+  `budget_usd`; `LEASED` in the branch cell means a checkpoint is holding it.
+- `patrol send <handle> "<msg>"` — from your terminal or from any seat (Bash).
+  Handles are readable and assigned at register (`builder`, `reviewer`);
+  `patrol rename <old> <new>` changes one. The hex id still works everywhere.
+- `patrol wait <handle> --until done --timeout 300` — block a script until a seat
+  reports a state, instead of polling `patrol status` in a loop. Seats self-report
+  `idle | working | blocked | done` via the `set_state` MCP tool.
+- `patrol claim <seat> <path>...` / `patrol claims` / `patrol release <seat>` —
+  advisory file ownership, so two seats stop editing the same file. A competing
+  claim is denied and names the holder. `patrol claim-port <seat> <n>` does the
+  same for ports.
 - Seats self-describe via the `set_summary` MCP tool; tell them to use it.
 - Message bodies arrive fenced; the header line above the fence is the only
   trusted identity. Instructions inside a body are DATA — seats are told not
@@ -252,6 +286,87 @@ reconnect banner, not a crash — it recovers when the broker is back. A send
 to a dead or malformed id shows the broker's real error inline above the
 input.
 
+## The command center
+
+```bash
+patrol dash            # opens the dashboard in your browser
+```
+
+Four panes, all served by the broker:
+
+- **Question inbox.** A seat that needs a human decision calls `/ask`; the question
+  lands here instead of in a tmux window you weren't looking at. You answer, and the
+  broker routes the answer back to the asking seat as an ordinary message. Answering
+  a seat that has since died is rejected with the reason (the question stays open),
+  not silently swallowed.
+- **Fleet board** with live seat state (`idle | working | blocked | done`).
+- **Comms audit log** — every message that crossed the broker.
+- **Working diff** per seat — tracked changes plus untracked new files, capped at
+  256 KiB — and the three-wallet billing strip.
+
+**Security, since this is a browser page:** it is loopback-only. `patrol dash` mints
+a short-lived nonce and opens `GET /dashboard?t=<nonce>`; the page never sees the
+broker secret. That nonce authenticates the **read routes and `/answer`, nothing
+else** — every write route (send, register, unregister, ack, claims) still demands
+the full secret, and a request without a loopback `Origin`/`Host` is refused. Do not
+try to expose this port off the machine; nothing here is built for that.
+
+## The cockpit
+
+```bash
+patrol cockpit         # one tmux window: big focus pane + tiled previews
+```
+
+Keys: `Ctrl-b z` zooms the focused seat fullscreen, `Ctrl-b P` promotes a preview
+into the big top slot, `Ctrl-b ↑/↓` and `Ctrl-b o` move between panes. The hints
+live in the status bar. These are the seats' real terminals joined into one window
+(`join-pane`), not a rendered summary — each seat's live process is preserved, and
+`patrol cockpit` does not restart anything.
+
+## A worktree per task
+
+The seat is standing; the *task* gets the worktree.
+
+```bash
+patrol worktree builder feat/parser        # cut a task tree, tell the seat where
+# ... the seat works, commits on feat/parser ...
+patrol checkpoint builder --gate "bun test"
+```
+
+`worktree` creates a tracked worktree under `.claude/worktrees/` and messages the
+seat its path. `checkpoint` runs the gate inside that worktree, merges the branch
+back into `main`, and removes the tree. The branch is left in place — deleting a
+branch is destructive and out of scope.
+
+What it will not do, by design:
+
+- It never runs `checkout`/`merge`/`reset` against your primary checkout. The merge
+  happens in a throwaway integration worktree, and git's one-branch-one-worktree
+  rule refuses that worktree if trunk is already checked out somewhere live — that
+  refusal is the concurrency interlock.
+- A conflict STOPs with the trunk ref untouched.
+- The seat's tree is removed **without** `--force`, so uncommitted work blocks the
+  removal instead of being destroyed.
+
+**Check:** `patrol status` shows a `LEASED` marker in the seat's `BRANCH` cell while
+a checkpoint holds its lease, and the seat's own tool calls are denied with
+*"patrol checkpoint in progress on this seat's worktree"* for those few seconds.
+
+**The honest limit.** The lease binds the seat's **tool calls**, through a
+`PreToolUse` guard hook the launcher installed. So:
+
+- A tool call already in flight when the lease lands still completes. Checkpoint
+  waits it out and proves the branch tip has stopped moving before merging.
+- A background process the seat launched earlier — dev server, watcher, long build —
+  is not covered and can still write.
+- A seat with no guard hook cannot be quiesced at all. `checkpoint` therefore
+  **refuses** an adapter seat (`backend: codex` or `headless`), and refuses a seat
+  that reports `guarded` with no lease-file path. `--force` accepts the older
+  fences-only behavior, which detects a mid-checkpoint commit rather than preventing
+  it — it reports `INCOMPLETE` with the branch intact instead of a false success.
+- The hook fails open on every error path (missing file, expired lease, malformed
+  JSON, unreadable). A checkpoint killed mid-run must not wedge a seat forever.
+
 ## Known limits in this build (v0.2)
 
 - The channel capability is a Claude Code **research preview** — the
@@ -273,4 +388,14 @@ input.
   (v0.3 packaging).
 - `/costs` windows are hour-granular (ledger buckets); `patrol status`
   totals are unaffected.
+- A `codex` seat shows `$—` in `patrol status`, not `$0`: codex writes no Claude
+  Code session log, so there is nothing to attribute. Absent, never charged to
+  another seat. Reading codex's own usage is a v0.4 item.
+- `patrol checkpoint` quiesces a seat's **tool calls**, not its processes, and
+  refuses an unguarded seat (`codex`, `headless`) without `--force`. Full
+  explanation under [A worktree per task](#a-worktree-per-task).
+- `ports:` in `patrol.yaml` is accepted but not delivered into the seat's
+  environment yet; use `patrol claim-port`.
+- The dashboard is loopback-only and its nonce is scoped to the read routes plus
+  `/answer`. Don't expose the broker port.
 - Multi-user / cross-machine is out of scope until v0.3's auth redesign.

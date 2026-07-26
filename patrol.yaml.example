@@ -1,8 +1,18 @@
 # patrol.yaml — a fleet of standing Claude Code seats.
 # Launch with: patrol up   (or: patrol up path/to/patrol.yaml)
+# Or generate one interactively: patrol init   (--ai to have a one-shot
+# `claude -p` read the repo and recommend the fleet).
 #
 # Every seat MUST name a model — a seat never boots on the default model
 # (that leaks the expensive Fable default; the launcher hard-errors on it).
+
+# Fleet-wide spend cap, in USD. A seat crossing it pings budget_alert_to ONCE.
+# Observe-only: Patrol reports spend, it never gates the model. A per-seat
+# budget_usd overrides this for that seat. Absent = no cap.
+budget_usd: 5.00
+# Who hears a crossing: a handle or a role. Default: the seat whose role is
+# "orchestrator".
+budget_alert_to: orchestrator
 
 seats:
   # Visible orchestrator in a tmux window. `full` = everything on (ccl full).
@@ -22,10 +32,47 @@ seats:
     profile:
       plugins: [caveman, ponytail]
       mcp: patrol
+    # Per-seat cap, overriding the fleet budget_usd above.
+    budget_usd: 2.00
 
   # Headless scout via `claude --bg`. `peer` = no plugins + patrol MCP only
   # (ccl peer), the lean coordinating seat.
+  # NOTE: a `bg` seat registers and reports spend but never wakes on push —
+  # the channel capability needs an interactive consent it cannot answer.
+  # Use tmux for anything message-driven.
   - name: scout
     model: sonnet
     backend: bg
     profile: peer
+
+  # --- other backends, uncomment to use ------------------------------------
+
+  # Headless adapter seat: a `claude -p --resume` daemon that polls and drives
+  # one turn per message, so unlike `bg` it DOES act on `patrol send`. Bills the
+  # Agent-SDK credit pool, reported as its own wallet, never summed with the
+  # interactive subscription.
+  # - name: analyst
+  #   model: sonnet
+  #   backend: headless
+  #   prompt: "You answer analysis questions from the fleet. Await tasks via patrol."
+
+  # Standing codex thread, messaged like any other seat. `sandbox` is codex-only
+  # and defaults to read-only: the seat cannot write files unless this yaml says
+  # so, and the flag is set by the launcher, so no message can escalate it.
+  # A write-enabled codex seat also runs a PreToolUse deny-hook over destructive
+  # commands. Codex writes no Claude Code session log, so this seat shows an
+  # absent spend in `patrol status` (absent, not misattributed).
+  # - name: cx
+  #   model: gpt-5.6-terra
+  #   backend: codex
+  #   sandbox: read-only        # or: workspace-write | danger-full-access
+  #   prompt: "You are the codex seat. Answer from the thread's accumulated context."
+
+  # `ports: N` is accepted by the config, but seat-side delivery is NOT wired
+  # yet: nothing exports the allocated ports into the seat's env. Until it is,
+  # allocate explicitly with `patrol claim-port <seat> <n>` and pass the result
+  # to the seat yourself.
+  # - name: web
+  #   model: sonnet
+  #   backend: tmux
+  #   ports: 2

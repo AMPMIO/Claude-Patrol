@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.2.9 — 2026-07-25
+
+Checkpoint stops racing the seat. Three adversarial reviews each found a way
+`checkpoint` could report success with a commit unmerged, and the third proved the
+last fence cannot even read the seat's HEAD (the worktree is gone by then).
+Detection cannot win a race against a still-working agent, so the seat is now
+quiesced instead. 356 tests.
+
+### Added
+- **Checkpoint lease + `PreToolUse` guard hook.** `patrol checkpoint` acquires a
+  lease on the seat's worktree and writes a lease file; the seat's guard hook
+  (`plugin/hooks/checkpoint-guard.ts`, matched on `Edit|Write|NotebookEdit|Bash`)
+  stats that file before every matched tool call and denies while the lease is
+  live. Checkpoint then proves the branch tip has stopped moving — two reads 300ms
+  apart — and only then merges. The old fences 1/2/3 are kept, but with a lease
+  they should never trip, so a trip is now a real signal (the hook failed) rather
+  than the primary defense.
+  - The hook **fails open on everything**: no env, no file, expired, malformed,
+    unreadable, any thrown error. A checkpoint killed between acquire and release
+    must not wedge a seat forever. The lease is released in a `finally` on every
+    exit path, including an exception.
+  - The launcher exports `CLAUDE_PATROL_LEASE_FILE` per seat and installs the hook
+    in that seat's settings overlay. Setting the env is also the seat's `guarded`
+    bit: it is set only where the hook was installed.
+- **`Seat.guarded` + `Seat.lease_file`**, reported by the seat at `/register`
+  (`RegisterRequest.lease_file`). Only the seat knows its own env, so deriving the
+  path from a shared convention would fail silently on any drift.
+- **`patrol checkpoint --force`.** Checkpoint refuses an unguarded seat — an
+  adapter seat (`codex`/`headless`) has no hook, so no lease can quiesce it — and
+  refuses a seat that reports `guarded` with no lease-file path, which is an
+  unquiesced seat wearing a guarded label. `--force` accepts the old fences-only
+  behavior. It skips only the guard requirement; a forced checkpoint still takes
+  the lease when it can, so two concurrent checkpoints still exclude each other.
+
+- **Broker side of the lease.** Additive `guarded` + `lease_file` columns on
+  `seats`, a `checkpoint_leases` table whose PRIMARY KEY on `path` *is* the mutual
+  exclusion, `/lease-worktree` + `/release-worktree`, expiry sweeping alongside the
+  stale-seat sweep, and lease reaping in `endSeat`. `/worktree-list` joins the
+  lease column, so `patrol status` can show a `LEASED` marker in the seat's
+  `BRANCH` cell.
+
+### Fixed
+- **Worktree path aliasing** (third-review finding, independent of the lease).
+  `worktreeAddTxn` compared raw path TEXT, so `/p/wt`, `/p/wt/`, `/p/x/../wt` and a
+  symlink to the same tree all registered as different worktrees, defeating the
+  0.2.8 one-worktree-per-seat check. Paths are canonicalized before they are
+  compared or stored, and `patrol checkpoint` canonicalizes before every path
+  comparison. Rows written by an earlier version are deliberately not auto-migrated;
+  a checkpoint that finds two seats on one tree STOPs and names them.
+
+### Known limit
+- The lease binds the seat's **tool calls**, not its processes. A tool call already
+  in flight when the lease lands still completes (hence the settle window), and a
+  background process the seat launched earlier is not covered at all.
+
 ## 0.2.8 — 2026-07-25
 
 A second adversarial review of the 0.2.7 fixes found 4 issues — three fixes that
