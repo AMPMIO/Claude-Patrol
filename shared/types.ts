@@ -72,6 +72,13 @@ export interface CostRow {
   // "external" for codex seats that have no transcript. Absent on pre-0.2.4
   // ledgers, which read as "subscription" downstream — never sum across sources.
   billing_source?: BillingSource;
+  // v0.3: the cache re-encode tax. A prompt cache expires while a seat sits idle (an
+  // orchestrator waiting on a worker is the classic case), and the NEXT turn re-encodes
+  // an unchanged history at the cache-WRITE rate instead of reading it back cheap. These
+  // count the writes that look like a rebuild rather than a first-time prefix — see
+  // REBUILD detection in costs.ts. Heuristic and directional, never ground truth.
+  cache_rebuilds?: number;
+  cache_rebuild_tokens?: number;
 }
 
 // --- Broker HTTP API (localhost only, POST + x-patrol-token; GET /health open) ---
@@ -416,6 +423,15 @@ export interface CostsResponse {
   // single-pool caller. total_usd stays the grand total, but a UI MUST show the
   // three pools separately — they are billed against different accounts.
   by_source?: Partial<Record<BillingSource, number>>;
+  // v0.3: fleet-wide cache re-encode tax. Reported in BOTH token units and dollars —
+  // tokens because they are what was actually measured, dollars because that is the
+  // decision unit. A fleet whose orchestrator waits on long-running seats can pay this
+  // repeatedly without any line item ever naming it.
+  cache_tax?: {
+    rebuilds: number;
+    rebuild_tokens: number;
+    tax_usd: number;
+  };
 }
 
 // --- v0.2 telemetry (/stats) — the evidence layer for the cost claims ---
