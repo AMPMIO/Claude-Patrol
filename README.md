@@ -9,7 +9,7 @@
 [Why](#why-standing-seats) · [Features](#what-patrol-does-that-raw-terminals-dont) · [Quickstart](#quickstart) · [Architecture](#architecture) · [Roadmap](#roadmap) · [Contributing](#contributing)
 
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square)](LICENSE)
-[![tests](https://img.shields.io/badge/tests-393%20passing-brightgreen?style=flat-square)](tests)
+[![tests](https://img.shields.io/badge/tests-505%20passing-brightgreen?style=flat-square)](tests)
 [![bun](https://img.shields.io/badge/Bun-1.2+-black?style=flat-square&logo=bun)](https://bun.sh)
 [![typescript](https://img.shields.io/badge/TypeScript-strict-3178C6?style=flat-square&logo=typescript&logoColor=white)](tsconfig.json)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-orange?style=flat-square)](#contributing)
@@ -275,7 +275,7 @@ patching it. Several Patrol features were prototyped there first.
 | Boot latency | LLM auto-summary API call (up to 3s, external dep) | opt-in only; seats self-describe |
 | Message table | grows forever | delivered messages purged after 7 days |
 | Packaging | manual clone + .mcp.json | Claude Code plugin (commands, skill, hook, MCP) + CLI/daemon |
-| Tests | none | 393 across broker, costs, launcher, CLI, codex adapter, integration |
+| Tests | none | 505 across broker, costs, launcher, CLI, codex adapter, integration |
 
 ## Quickstart
 
@@ -520,7 +520,7 @@ per-task cost tags; a Warp launch backend.
 
 ## Status and caveats
 
-**v0.3-dev, 393 tests.** Cost attribution survives the case that broke it in v0.1:
+**v0.3-dev, 505 tests.** Cost attribution survives the case that broke it in v0.1:
 several seats working in the same repo, split across three billing wallets, with a
 per-seat budget alert when one crosses its cap. History survives seat teardown and
 broker restarts. `/costs` reads from an incrementally indexed ledger instead of
@@ -599,7 +599,7 @@ the coverage I cannot give it myself.
 
 ```bash
 bun install
-bun test              # 393 tests
+bun test              # 505 tests
 bunx tsc --noEmit     # strict, must stay clean
 ```
 
