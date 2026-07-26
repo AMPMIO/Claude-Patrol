@@ -5,8 +5,9 @@
 // re-run re-applies the layout rather than erroring or duplicating.
 
 import { spawnSync } from "bun";
-import { TMUX_SESSION } from "../launcher/compose.ts";
 import { hasSession } from "../launcher/tmux.ts";
+import { detectFleet } from "../launcher/fleet-detect.ts";
+import { exactSession, sessionName } from "../launcher/fleet.ts";
 
 const COCKPIT_WINDOW = "cockpit";
 
@@ -34,8 +35,11 @@ const PANE_BORDER_FORMAT = " #{pane_index} #{@seat} ";
 // join) and the rest join into it; with a cockpit already present, nothing is
 // renamed and only straggler windows (usually none) are folded in — so a plain
 // re-run just re-applies layout + chrome.
-export function cockpitCommands(seatWindows: string[], cockpitExists: boolean): string[][] {
-  const S = TMUX_SESSION;
+// v0.3: `fleet` names the session to fold — cockpit is a view of ONE fleet, and
+// the caller's fleet is inferred exactly as `up`/`down` infer it. `=`-exact
+// targets throughout, so a cockpit never rearranges a neighbouring fleet.
+export function cockpitCommands(seatWindows: string[], cockpitExists: boolean, fleet: string): string[][] {
+  const S = exactSession(fleet);
   const target = `${S}:${COCKPIT_WINDOW}`;
   const cmds: string[][] = [];
 
@@ -82,14 +86,14 @@ function tmux(args: string[]): { ok: boolean; stdout: string; stderr: string } {
   return { ok: r.exitCode === 0, stdout: r.stdout?.toString() ?? "", stderr: r.stderr?.toString() ?? "" };
 }
 
-function listWindows(): string[] {
-  const r = tmux(["list-windows", "-t", TMUX_SESSION, "-F", "#{window_name}"]);
+function listWindows(fleet: string): string[] {
+  const r = tmux(["list-windows", "-t", exactSession(fleet), "-F", "#{window_name}"]);
   if (!r.ok) return [];
   return r.stdout.split("\n").map((s) => s.trim()).filter((s) => s.length > 0);
 }
 
-function paneCount(): number {
-  const r = tmux(["list-panes", "-t", `${TMUX_SESSION}:${COCKPIT_WINDOW}`, "-F", "#{pane_id}"]);
+function paneCount(fleet: string): number {
+  const r = tmux(["list-panes", "-t", `${exactSession(fleet)}:${COCKPIT_WINDOW}`, "-F", "#{pane_id}"]);
   if (!r.ok) return 0;
   return r.stdout.split("\n").filter((s) => s.trim().length > 0).length;
 }
@@ -98,7 +102,7 @@ export default async function cockpit(args: string[]): Promise<number> {
   if (args.includes("--help") || args.includes("-h")) {
     console.log(`patrol cockpit — fold the running fleet into one cockpit window
 
-Rearranges the live "patrol" tmux session so every seat is a PANE in a single
+Rearranges this fleet's live tmux session so every seat is a PANE in a single
 "cockpit" window instead of a full-screen window each: the focused seat big on
 top, the rest tiled below as labelled live previews. Running claude processes are
 moved, not restarted. Idempotent — re-run any time to re-apply the layout.
@@ -115,16 +119,17 @@ no default.`);
     return 0;
   }
 
-  if (!hasSession()) {
-    console.error("patrol cockpit: no patrol session — run `patrol up` first");
+  const fleet = detectFleet();
+  if (!hasSession(fleet)) {
+    console.error(`patrol cockpit: no session "${sessionName(fleet)}" — run \`patrol up\` first`);
     return 1;
   }
 
-  const windows = listWindows();
+  const windows = listWindows(fleet);
   const cockpitExists = windows.includes(COCKPIT_WINDOW);
   const seatWindows = windows.filter((w) => w !== COCKPIT_WINDOW);
 
-  for (const cmd of cockpitCommands(seatWindows, cockpitExists)) {
+  for (const cmd of cockpitCommands(seatWindows, cockpitExists, fleet)) {
     const r = tmux(cmd);
     // The structural moves are load-bearing; the chrome (borders, status, bind)
     // is cosmetic and must not abort a view whose seats are already folded in.
@@ -135,7 +140,7 @@ no default.`);
   }
 
   console.log(
-    `patrol cockpit: ${paneCount()} seat(s) in cockpit view — attach with \`tmux attach -t patrol\`\n  ${STATUS_HINTS.trim()}`
+    `patrol cockpit: ${paneCount(fleet)} seat(s) in cockpit view — attach with \`tmux attach -t ${sessionName(fleet)}\`\n  ${STATUS_HINTS.trim()}`
   );
   return 0;
 }

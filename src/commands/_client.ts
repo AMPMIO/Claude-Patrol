@@ -5,7 +5,9 @@
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { existsSync } from "node:fs";
+import { detectFleet } from "../launcher/fleet-detect.ts";
 export { secretPermsOk } from "../../shared/auth.ts";
+export { detectFleet };
 
 export function brokerBase(): string {
   const port = process.env.CLAUDE_PATROL_PORT || "7900";
@@ -32,32 +34,79 @@ export function seatLabel(seat: { handle?: string; id: string }): string {
   return seat.handle && seat.handle.length > 0 ? seat.handle : seat.id.slice(0, 8);
 }
 
-// Resolve a user-typed seat target (handle OR raw/prefix hex id) to a full seat id,
-// CLIENT-SIDE, via /list-seats. Precedence — the handle is the primary UX identifier:
+// A seat as far as resolution cares. `fleet` is v0.3 and additive: pre-0.3 rows,
+// and any broker that does not report it yet, leave it absent.
+export interface ResolvableSeat {
+  id: string;
+  handle?: string;
+  role: string | null;
+  fleet?: string | null;
+}
+
+// Split `fleet/handle` into its parts. Only the FIRST slash separates: handles
+// are slugs and never contain one, so anything after it stays with the target
+// and produces a clean "no live seat matches" instead of a silent mis-split.
+export function parseSeatTarget(target: string): { fleet: string | null; target: string } {
+  const slash = target.indexOf("/");
+  if (slash <= 0 || slash === target.length - 1) return { fleet: null, target };
+  return { fleet: target.slice(0, slash), target: target.slice(slash + 1) };
+}
+
+// Seats visible from `fleet`. A seat that reports NO fleet stays visible from
+// everywhere: it is a pre-0.3 or hand-launched seat that belongs to no fleet, and
+// hiding it would make it unaddressable rather than isolated. Only a seat that
+// explicitly reports a DIFFERENT fleet is filtered out — which is the leak this
+// closes, since two projects each running a `builder` used to be one namespace.
+export function filterByFleet<T extends { fleet?: string | null }>(seats: T[], fleet: string): T[] {
+  return seats.filter((s) => s.fleet == null || s.fleet === fleet);
+}
+
+// Resolve a user-typed seat target (handle OR raw/prefix hex id) to a full seat id.
+// Precedence — the handle is the primary UX identifier:
 //   1. exact handle match           (readable name wins)
 //   2. exact full id match           (raw hex id, unchanged — the fallback)
 //   3. unique id-prefix match
 // An ambiguous handle or prefix ERRORS with the candidates rather than routing to the
 // wrong seat. Nothing matched throws too, so a typo never silently hits a live seat.
+//
+// v0.3: matching happens WITHIN one fleet. Bare `builder` means the caller's own
+// fleet; `other/builder` reaches across explicitly. Pure so the whole precedence
+// table — including the fleet scoping — is testable without a broker.
+export function resolveSeatIn(seats: ResolvableSeat[], rawTarget: string, callerFleet: string): string {
+  const { fleet: askedFleet, target } = parseSeatTarget(rawTarget);
+  const fleet = askedFleet ?? callerFleet;
+  const scoped = filterByFleet(seats, fleet);
+  const cand = (s: ResolvableSeat) => `${s.id.slice(0, 8)}${s.role ? ` (${s.role})` : ""}`;
+
+  const byHandle = scoped.filter((s) => s.handle === target);
+  if (byHandle.length === 1) return byHandle[0]!.id;
+  if (byHandle.length > 1) throw new BrokerError(`ambiguous handle "${target}" in fleet "${fleet}" — matches ${byHandle.map(cand).join(", ")}; use the id`);
+
+  const exactId = scoped.find((s) => s.id === target);
+  if (exactId) return exactId.id;
+
+  const byPrefix = scoped.filter((s) => s.id.startsWith(target));
+  if (byPrefix.length === 1) return byPrefix[0]!.id;
+  if (byPrefix.length > 1) throw new BrokerError(`ambiguous id prefix "${target}" in fleet "${fleet}" — matches ${byPrefix.map(cand).join(", ")}`);
+
+  throw new BrokerError(
+    `no live seat matches "${target}" in fleet "${fleet}" — see \`patrol list\`` +
+      (askedFleet === null ? ` (another fleet's seat needs \`<fleet>/${target}\`)` : "")
+  );
+}
+
+// The I/O wrapper: fetch the machine's seats and resolve against them.
+// ListSeatsRequest.fleet is deliberately NOT sent here — a broker-side filter
+// would make `other/builder` unresolvable — so the scoping is the client-side
+// filter above, which also works against a broker that does not report `fleet`
+// yet. Views that only ever show one fleet should send the field instead.
 export async function resolveSeatTarget(target: string): Promise<string> {
-  const seats = await brokerPost<Array<{ id: string; handle?: string; role: string | null }>>(
+  const fleet = detectFleet();
+  const seats = await brokerPost<ResolvableSeat[]>(
     "/list-seats",
     { scope: "machine", cwd: process.cwd(), git_root: gitRoot() }
   );
-  const cand = (s: { id: string; role: string | null }) => `${s.id.slice(0, 8)}${s.role ? ` (${s.role})` : ""}`;
-
-  const byHandle = seats.filter((s) => s.handle === target);
-  if (byHandle.length === 1) return byHandle[0]!.id;
-  if (byHandle.length > 1) throw new BrokerError(`ambiguous handle "${target}" — matches ${byHandle.map(cand).join(", ")}; use the id`);
-
-  const exactId = seats.find((s) => s.id === target);
-  if (exactId) return exactId.id;
-
-  const byPrefix = seats.filter((s) => s.id.startsWith(target));
-  if (byPrefix.length === 1) return byPrefix[0]!.id;
-  if (byPrefix.length > 1) throw new BrokerError(`ambiguous id prefix "${target}" — matches ${byPrefix.map(cand).join(", ")}`);
-
-  throw new BrokerError(`no live seat matches "${target}" — see \`patrol list\``);
+  return resolveSeatIn(seats, target, fleet);
 }
 
 // timeoutMs defaults to 3s (a wedged broker must not hang the CLI). A long-poll

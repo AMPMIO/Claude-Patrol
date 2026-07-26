@@ -1,18 +1,29 @@
-// `patrol down` — tear down what `patrol up` started: kill the tmux "patrol"
-// session and stop bg seats. Seats deregister from the broker via the W1
-// SessionEnd hook within the broker's grace window; down only stops processes.
+// `patrol down [fleet] [--all] [--force]` — tear down what `patrol up` started:
+// kill a fleet's tmux session and stop its bg seats. Seats deregister from the
+// broker via the W1 SessionEnd hook within the broker's grace window; down only
+// stops processes.
+//
+// v0.3: down is FLEET-SCOPED. It used to kill the one global "patrol" session, so
+// running it in any project stopped every project's seats mid-task. With no
+// argument it now touches only the fleet inferred from cwd (via the same
+// resolver `patrol up` used); another fleet must be named; every fleet needs
+// --all.
 
-import { readFileSync, existsSync, rmSync } from "node:fs";
+import { readFileSync, existsSync, rmSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "bun";
 import { selectBgPidsToKill } from "../launcher/compose.ts";
-import { killSession } from "../launcher/tmux.ts";
+import { killSession, listSessionNames } from "../launcher/tmux.ts";
 import { listAgents } from "../launcher/bg.ts";
+import { detectFleet } from "../launcher/fleet-detect.ts";
+import {
+  fleetFromSession, fleetFromStateFileName, fleetStateFileName, selectFleetsToDown, sessionName,
+} from "../launcher/fleet.ts";
 import type { FleetState } from "./up.ts";
 
 const CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude");
-const FLEET_STATE = join(CONFIG_DIR, "patrol-profiles", "fleet.json");
+const PROFILE_DIR = join(CONFIG_DIR, "patrol-profiles");
 
 // Classify a recorded-fallback pid before signalling it. `claude agents` no
 // longer lists this agent, so the pid may have been recycled onto an unrelated
@@ -28,22 +39,43 @@ export function bgPidState(pid: number): "claude" | "other" | "gone" {
   return /claude/i.test(out) ? "claude" : "other";
 }
 
-export default async function down(args: string[]): Promise<number> {
-  const force = args.includes("--force");
+// Every fleet this machine knows about: live tmux sessions plus recorded state
+// files (a bg-only fleet has no session, and a leaked session has no state).
+function knownFleets(): string[] {
+  const fleets = new Set<string>();
+  for (const s of listSessionNames()) {
+    const f = fleetFromSession(s);
+    if (f) fleets.add(f);
+  }
+  try {
+    for (const entry of readdirSync(PROFILE_DIR)) {
+      const f = fleetFromStateFileName(entry);
+      if (f) fleets.add(f);
+    }
+  } catch {
+    /* no profile dir yet — nothing has ever launched */
+  }
+  return [...fleets];
+}
+
+function downOne(fleet: string, force: boolean): void {
+  const statePath = join(PROFILE_DIR, fleetStateFileName(fleet));
   let state: FleetState | null = null;
-  if (existsSync(FLEET_STATE)) {
+  if (existsSync(statePath)) {
     try {
-      state = JSON.parse(readFileSync(FLEET_STATE, "utf8"));
+      state = JSON.parse(readFileSync(statePath, "utf8"));
     } catch {
-      console.error("patrol down: fleet state file is corrupt — killing tmux session best-effort");
+      console.error(`patrol down: fleet state for "${fleet}" is corrupt — killing its tmux session best-effort`);
     }
   }
 
-  // tmux: kill the session if present (even without state, in case it leaked).
-  const killed = killSession();
-  if (killed) console.log(`patrol down: killed tmux session "patrol"`);
+  // tmux: kill this fleet's session if present (even without state, in case it
+  // leaked). killSession targets `=patrol-<fleet>`, so no other fleet can match.
+  const killed = killSession(fleet);
+  if (killed) console.log(`patrol down: killed tmux session "${sessionName(fleet)}"`);
 
-  // bg: stop recorded seats. Re-query live agents so we kill the right pids.
+  // bg: stop this fleet's recorded seats. Re-query live agents so we kill the
+  // right pids.
   if (state?.bg?.length) {
     const { verified, unverified } = selectBgPidsToKill(state.bg, listAgents());
     let stopped = 0;
@@ -68,12 +100,35 @@ export default async function down(args: string[]): Promise<number> {
       }
       sigterm(pid);
     }
-    console.log(`patrol down: stopped ${stopped}/${state.bg.length} bg seat(s)`);
+    console.log(`patrol down: stopped ${stopped}/${state.bg.length} bg seat(s) in fleet "${fleet}"`);
   }
 
-  if (existsSync(FLEET_STATE)) rmSync(FLEET_STATE);
+  if (existsSync(statePath)) rmSync(statePath);
   if (!killed && !state?.bg?.length) {
-    console.log("patrol down: nothing to tear down");
+    console.log(`patrol down: nothing to tear down in fleet "${fleet}"`);
   }
+}
+
+export default async function down(args: string[]): Promise<number> {
+  const force = args.includes("--force");
+  const all = args.includes("--all");
+  // The one positional is a fleet name; everything else is a flag read above.
+  const positional = args.filter((a) => !a.startsWith("-"));
+  if (positional.length > 1) {
+    console.error(`patrol down: expected at most one fleet name (got ${positional.join(", ")})`);
+    return 1;
+  }
+
+  const selection = selectFleetsToDown(
+    { explicit: positional[0] ?? null, all },
+    detectFleet(),
+    knownFleets()
+  );
+  if ("error" in selection) {
+    console.error(selection.error);
+    return 1;
+  }
+
+  for (const fleet of selection.fleets) downOne(fleet, force);
   return 0;
 }

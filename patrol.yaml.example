@@ -6,6 +6,19 @@
 # Every seat MUST name a model — a seat never boots on the default model
 # (that leaks the expensive Fable default; the launcher hard-errors on it).
 
+# The fleet this config launches. Optional — defaults to the git-root basename
+# (the directory basename outside a repo) — so an existing patrol.yaml keeps
+# working unchanged. A fleet is the isolation unit: its own tmux session
+# (`patrol-<fleet>`), its own handle namespace, its own teardown. `patrol down`
+# touches only the fleet you are standing in; another fleet must be named
+# (`patrol down other`), and every fleet needs `--all`.
+#
+# `tmux attach -t patrol` still works on a single-fleet machine (tmux resolves a
+# session target by prefix); with two fleets it is ambiguous, so attach to
+# `patrol-<fleet>`. Allowed characters are the same as a seat name: it becomes a
+# tmux session name and a file path segment.
+# fleet: acme
+
 # Fleet-wide spend cap, in USD. A seat crossing it pings budget_alert_to ONCE.
 # Observe-only: Patrol reports spend, it never gates the model. A per-seat
 # budget_usd overrides this for that seat. Absent = no cap.
