@@ -44,7 +44,7 @@ function livePid(): number {
 let deadPidSeq = 2_000_000_000;
 const deadPid = () => deadPidSeq++;
 
-type Reg = { id: string; seat_token?: string };
+type Reg = { id: string; capability_token?: string };
 async function register(extra: Record<string, unknown> = {}): Promise<Reg> {
   const res = await post("/register", {
     pid: livePid(), cwd: "/tmp/identity", git_root: null, tty: null, summary: "s",
@@ -98,12 +98,12 @@ afterAll(() => {
 describe("capability tokens", () => {
   test("register mints a cps- token and returns it exactly once", async () => {
     const a = await register();
-    expect(a.seat_token).toMatch(/^cps-[0-9a-f]{32}$/);
+    expect(a.capability_token).toMatch(/^cps-[0-9a-f]{32}$/);
   });
 
   test("the token is stored HASHED — the db never holds the value handed to the seat", async () => {
     const a = await register();
-    const token = a.seat_token!;
+    const token = a.capability_token!;
     const rows = peekDb((db) => db.query("SELECT token_hash, seat_id FROM seat_tokens WHERE seat_id = ?").all(a.id)) as {
       token_hash: string; seat_id: string;
     }[];
@@ -119,7 +119,7 @@ describe("capability tokens", () => {
   test("seat A's token is REFUSED on every seat-owned route of seat B", async () => {
     const a = await register();
     const b = await register();
-    const tok = a.seat_token!;
+    const tok = a.capability_token!;
 
     const foreign: Array<[string, unknown]> = [
       ["/set-state", { id: b.id, state: "working" }],
@@ -149,7 +149,7 @@ describe("capability tokens", () => {
 
   test("seat A's token is ACCEPTED on the same routes for itself", async () => {
     const a = await register();
-    const tok = a.seat_token!;
+    const tok = a.capability_token!;
 
     const own: Array<[string, unknown]> = [
       ["/set-state", { id: a.id, state: "working" }],
@@ -180,7 +180,7 @@ describe("capability tokens", () => {
 
     // The pid form resolves to B, so A's token must be refused on it — otherwise the identity
     // check would be trivially bypassable by naming a pid instead of an id.
-    const res = await post("/unregister", { pid: bPid }, a.seat_token!);
+    const res = await post("/unregister", { pid: bPid }, a.capability_token!);
     expect(res.status).toBe(403);
     const seats = (await (await sweep()).json()) as Array<{ id: string }>;
     expect(seats.some((s) => s.id === bId)).toBe(true);
@@ -189,9 +189,9 @@ describe("capability tokens", () => {
   test("/send-message at seat scope can only speak AS the token's seat", async () => {
     const a = await register();
     const b = await register();
-    const forged = await post("/send-message", { from_id: b.id, to_id: a.id, text: "from B, allegedly" }, a.seat_token!);
+    const forged = await post("/send-message", { from_id: b.id, to_id: a.id, text: "from B, allegedly" }, a.capability_token!);
     expect(forged.status).toBe(403);
-    const own = await post("/send-message", { from_id: a.id, to_id: b.id, text: "genuinely from A" }, a.seat_token!);
+    const own = await post("/send-message", { from_id: a.id, to_id: b.id, text: "genuinely from A" }, a.capability_token!);
     expect(own.status).toBe(200);
     expect(((await own.json()) as { ok: boolean }).ok).toBe(true);
   });
@@ -206,7 +206,7 @@ describe("capability tokens", () => {
       ["/answer", { question_id: 1, text: "no" }],
       ["/observe-session", { session_id: "s", transcript_path: "/tmp/t", cwd: "/tmp", claude_pid: 1 }],
     ] as Array<[string, unknown]>) {
-      const res = await post(path, body, a.seat_token!);
+      const res = await post(path, body, a.capability_token!);
       expect(`${path}:${res.status}`).toBe(`${path}:401`);
     }
   });
@@ -216,9 +216,9 @@ describe("capability tokens", () => {
       pid: deadPid(), cwd: "/tmp/identity", git_root: null, tty: null, summary: "doomed", role: null, model: null,
     });
     const dead = (await res.json()) as Reg;
-    expect((await post("/heartbeat", { id: dead.id }, dead.seat_token!)).status).toBe(200);
+    expect((await post("/heartbeat", { id: dead.id }, dead.capability_token!)).status).toBe(200);
     await sweep(); // reaps the dead pid, revoking its token
-    expect((await post("/heartbeat", { id: dead.id }, dead.seat_token!)).status).toBe(401);
+    expect((await post("/heartbeat", { id: dead.id }, dead.capability_token!)).status).toBe(401);
   });
 
   test("the shared secret still authorizes every route it did before", async () => {
@@ -321,7 +321,7 @@ describe("crash redelivery", () => {
     await post("/send-message", { from_id: "cli", to_id: first.id, text: "finish this" });
     // Poll (not ack): the message is LEASED and in flight when the seat dies — the exact
     // state that used to be unrecoverable.
-    const polled = (await (await post("/poll-messages", { id: first.id }, first.seat_token!)).json()) as {
+    const polled = (await (await post("/poll-messages", { id: first.id }, first.capability_token!)).json()) as {
       messages: Array<{ text: string }>;
     };
     expect(polled.messages.map((m) => m.text)).toContain("finish this");
@@ -336,7 +336,7 @@ describe("crash redelivery", () => {
     })).json()) as Reg;
     expect(second.id).not.toBe(first.id);
 
-    const redelivered = (await (await post("/poll-messages", { id: second.id }, second.seat_token!)).json()) as {
+    const redelivered = (await (await post("/poll-messages", { id: second.id }, second.capability_token!)).json()) as {
       messages: Array<{ text: string }>;
     };
     expect(redelivered.messages.map((m) => m.text)).toContain("finish this");
@@ -354,7 +354,7 @@ describe("crash redelivery", () => {
       pid: deadPid(), cwd: "/tmp/redel2", git_root: null, tty: null, summary: "o",
       role: null, model: null, fleet: "redel2", stable_key: "redel2/someone-else",
     })).json()) as Reg;
-    const got = (await (await post("/poll-messages", { id: other.id }, other.seat_token!)).json()) as {
+    const got = (await (await post("/poll-messages", { id: other.id }, other.capability_token!)).json()) as {
       messages: Array<{ text: string }>;
     };
     expect(got.messages).toHaveLength(0);
@@ -372,7 +372,7 @@ describe("crash redelivery", () => {
       pid: deadPid(), cwd: "/tmp/redel3", git_root: null, tty: null, summary: "x",
       role: null, model: null, fleet: "fleet-two", stable_key: "shared/name",
     })).json()) as Reg;
-    const got = (await (await post("/poll-messages", { id: crossFleet.id }, crossFleet.seat_token!)).json()) as {
+    const got = (await (await post("/poll-messages", { id: crossFleet.id }, crossFleet.capability_token!)).json()) as {
       messages: Array<{ text: string }>;
     };
     expect(got.messages).toHaveLength(0);
@@ -388,12 +388,12 @@ describe("crash redelivery", () => {
     const attacker = await register({ fleet: "live", stable_key: "live/worker", name: "attacker" });
     expect(attacker.id).not.toBe(victim.id);
 
-    const stolen = (await (await post("/poll-messages", { id: attacker.id }, attacker.seat_token!)).json()) as {
+    const stolen = (await (await post("/poll-messages", { id: attacker.id }, attacker.capability_token!)).json()) as {
       messages: Array<{ text: string }>;
     };
     expect(stolen.messages).toHaveLength(0);
 
-    const kept = (await (await post("/poll-messages", { id: victim.id }, victim.seat_token!)).json()) as {
+    const kept = (await (await post("/poll-messages", { id: victim.id }, victim.capability_token!)).json()) as {
       messages: Array<{ text: string }>;
     };
     expect(kept.messages.map((m) => m.text)).toContain("victim's work");

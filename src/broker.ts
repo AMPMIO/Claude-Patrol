@@ -984,7 +984,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   const capToken = genSeatCapToken();
   insertSeatToken.run(hashToken(capToken), id, now);
 
-  const res: RegisterResponse = { id, seat_token: capToken };
+  const res: RegisterResponse = { id, capability_token: capToken };
   if (rejected) res.session_id_rejected = true;
   return res;
 }

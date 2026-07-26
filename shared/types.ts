@@ -383,7 +383,14 @@ export interface RegisterResponse {
   // consecutive adversarial reviews kept returning. `body.id` becomes a claim the
   // token must match. The human's shared secret keeps full scope: the threat model
   // is seat-spoofs-seat, not the operator who owns the 0600 file.
-  seat_token?: string;
+  //
+  // NAMED `capability_token`, NOT `seat_token`, deliberately: RegisterRequest.seat_token
+  // is already taken by the v0.2 Layer-1 COST-ATTRIBUTION marker (`cp-…`), an entirely
+  // different credential. Shipping both under one name is how v0.3 landed a complete
+  // enforcement boundary that no production seat ever crossed — every client kept
+  // authenticating with the machine-wide secret, so the default-deny allowlist and the
+  // subject checks were dead code. Two credentials, two names.
+  capability_token?: string;
 }
 
 // v0.3 auth scopes, generalizing the v0.2.7 dash-nonce gate (which already resolved a
