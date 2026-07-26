@@ -1,4 +1,6 @@
-// patrol send <seat-id> <message> — thin broker call, from_id="cli".
+// patrol send <seat-id> <message> — thin broker call. from_id is "cli" for the operator and
+// the SEAT'S OWN id when a seat runs it (v0.3.1), which the broker verifies against the
+// presented capability token.
 //
 // There is deliberately no `--as <seat-id>` flag: it would be a one-flag
 // provenance-forgery primitive (anyone could speak as any seat), which contradicts
@@ -8,7 +10,7 @@
 import { existsSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import type { SendMessageRequest } from "../../shared/types.ts";
-import { brokerPost, BrokerError, resolveSeatTarget } from "./_client.ts";
+import { brokerPost, BrokerError, resolveSeatTarget, readCredential } from "./_client.ts";
 
 // `--brief <path>` hands over a POINTER instead of the brief's bytes. A pasted
 // brief enters the seat's context once and is then re-billed on every later turn of
@@ -75,7 +77,13 @@ export default async function send(args: string[]): Promise<number> {
     // full seat id the broker keys on. Ambiguous/unknown targets error here, before
     // anything is queued, so a message never lands on the wrong seat.
     const toId = await resolveSeatTarget(to);
-    const body: SendMessageRequest = { from_id: "cli", to_id: toId, text };
+    // from_id is an identity ASSERTION: the broker checks it against the capability token.
+    // "cli" is the operator's identity, and a seat presenting it is refused — so a seat must
+    // speak as itself. That is not a new privilege (the token proves it IS that seat); it is
+    // what makes `patrol send` work at all from inside a seat, and it stops a seat's message
+    // from rendering as though the human sent it.
+    const cred = await readCredential();
+    const body: SendMessageRequest = { from_id: cred?.seatId ?? "cli", to_id: toId, text };
     // The broker replies HTTP 200 with {ok:false, error} for app-level failures
     // (e.g. no such seat) — brokerPost only throws on transport/HTTP errors, so
     // a bare await here would report success on a message that was never queued.
@@ -84,7 +92,17 @@ export default async function send(args: string[]): Promise<number> {
       console.error(res.error ?? `send to ${to} failed`);
       return 1;
     }
-    console.log(briefAt !== -1 ? `sent brief pointer to ${to}` : `sent to ${to}`);
+    // Say WHICH identity spoke whenever it is not the operator's. The credential is found
+    // through the environment, so a human who attaches to a seat's tmux window inherits it and
+    // this command speaks as that seat — in the `[from ...]` header, which the trust model
+    // treats as authoritative. Silent would make that a provenance surprise; one line makes it
+    // visible at the moment it happens. The short id rather than the handle is deliberate: a
+    // handle costs a second /list-seats round trip on every send to print a nicer noun.
+    const asWho =
+      cred?.scope === "seat" && cred.seatId
+        ? ` (as seat ${cred.seatId.slice(0, 8)} — this shell carries that seat's credential, not the operator's)`
+        : "";
+    console.log((briefAt !== -1 ? `sent brief pointer to ${to}` : `sent to ${to}`) + asWho);
     return 0;
   } catch (e) {
     console.error(e instanceof BrokerError ? e.message : String(e));

@@ -7,6 +7,14 @@
 // claude process the seat-server registers. Best-effort: a dead broker must
 // never break session startup, so every failure path exits 0.
 // Self-contained on purpose (no cross-dir import) so it survives packaging.
+//
+// v0.3.1: this hook DELIBERATELY stays on the operator secret, unlike dereg.ts. Two independent
+// reasons, either one sufficient: (1) SessionStart fires before the seat-server has registered,
+// so no capability exists yet — that is the whole point of the route, binding a session the
+// broker does not know about; (2) /observe-session is absent from the broker's seat allowlist
+// on purpose (a hook's binding is not a seat action), so a capability would be refused 403.
+// Making this capability-authenticated would mean opening the route to seat scope, which is a
+// deliberate default-deny, so it is left alone rather than half-done.
 
 const port = process.env.CLAUDE_PATROL_PORT || "7900";
 const secretFile = process.env.CLAUDE_PATROL_SECRET_FILE || `${process.env.HOME}/.claude-patrol.secret`;

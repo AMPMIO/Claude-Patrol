@@ -411,9 +411,15 @@ test("briefMessage points at the path and never inlines the brief's bytes", () =
 });
 
 test("send --brief refuses a missing file before anything is queued", async () => {
+  // The exit code and the message are only half the claim — "before anything is queued" is
+  // the other half, and without this the test passes just as well if a message went out and
+  // the command failed afterwards. Reset first so a send captured by an earlier test cannot
+  // stand in for this one's silence.
+  lastSend = null;
   const r = await capture(() => send(["someseat", "--brief", "/no/such/brief.md"]));
   expect(r.code).toBe(1);
   expect(r.err).toContain("brief not found");
+  expect(lastSend).toBeNull();
 });
 
 // The brief form is <target> --brief <path> and nothing else. Taking [0] of the remainder
