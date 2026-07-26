@@ -9,7 +9,7 @@
 import { test, expect, beforeAll, afterAll, describe } from "bun:test";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -481,15 +481,52 @@ describe("fleet confinement at seat scope", () => {
   // puts in a /list-seats body) is a convenience, not an authorization boundary.
   let north: Reg;
   let south: Reg;
+  // REAL paths, under this suite's temp dir. `/tmp/south/wt` was a path that does not exist,
+  // and /worktree-add stats before it records — see the fixture assertions below for why that
+  // silently hollowed out three of these tests. The "south" segment is kept in the name
+  // because the /list-claims assertion matches on it.
+  const southDir = join(dir, "south");
+  const southWt = join(southDir, "wt");
+  const southSecret = join(southDir, "secret.ts");
 
   beforeAll(async () => {
-    north = await register({ fleet: "north", stable_key: "north/w", name: "northw", cwd: "/tmp/north" });
-    south = await register({ fleet: "south", stable_key: "south/w", name: "southw", cwd: "/tmp/south" });
+    mkdirSync(southWt, { recursive: true });
+    writeFileSync(southSecret, "// south's file\n");
+    north = await register({ fleet: "north", stable_key: "north/w", name: "northw", cwd: join(dir, "north") });
+    south = await register({ fleet: "south", stable_key: "south/w", name: "southw", cwd: southDir });
     // State in the SOUTH fleet for north to fail to reach.
-    await post("/send-message", { from_id: "cli", to_id: south.id, text: "south-only traffic" });
-    await post("/worktree-add", { id: south.id, path: "/tmp/south/wt", branch: "s", base_commit: "abc" }, south.capability_token!);
-    await post("/claim-path", { id: south.id, paths: ["/tmp/south/secret.ts"] }, south.capability_token!);
-    await post("/ask", { id: south.id, text: "south question" }, south.capability_token!);
+    //
+    // Every fixture write is ASSERTED, and the rows are then confirmed through the operator's
+    // own view before any confinement claim is made. Without this the suite has a silent
+    // failure mode that is worse than no test: if a write is rejected — these handlers
+    // canonicalize and stat paths, and /tmp/south/wt is never created on disk — then the
+    // "north cannot see south's row" assertions below hold because THERE IS NO ROW, and the
+    // filter they exist to exercise never runs. The path is named in each failure message so a
+    // rejection reads as a rejection instead of as a mystery.
+    const fixtures: Array<[string, unknown, string | undefined]> = [
+      ["/send-message", { from_id: "cli", to_id: south.id, text: "south-only traffic" }, undefined],
+      ["/worktree-add", { id: south.id, path: southWt, branch: "s", base_commit: "abc" }, south.capability_token],
+      ["/claim-path", { id: south.id, paths: [southSecret] }, south.capability_token],
+      ["/ask", { id: south.id, text: "south question" }, south.capability_token],
+    ];
+    for (const [path, body, token] of fixtures) {
+      const res = token === undefined ? await post(path, body) : await post(path, body, token);
+      const detail = await res.text();
+      expect(`${path} ${res.status} ${detail}`).toBe(`${path} 200 ${detail}`);
+      // A 200 is not enough on the routes that answer {ok:false, error} in-band.
+      if (detail.includes('"ok"')) expect(`${path} ${detail}`).toContain('"ok":true');
+    }
+
+    // The rows exist as far as the OPERATOR is concerned. This is the control: every
+    // confinement assertion below is only meaningful against state that is really there.
+    const trees = (await (await post("/worktree-list", {})).json()) as Array<{ seat_id: string }>;
+    expect(trees.some((w) => w.seat_id === south.id)).toBe(true);
+    const claims = (await (await post("/list-claims", {})).json()) as Array<{ owner_id: string }>;
+    expect(claims.some((c) => c.owner_id === south.id)).toBe(true);
+    const questions = (await (await post("/questions", {})).json()) as Array<{ from_id: string }>;
+    expect(questions.some((q) => q.from_id === south.id)).toBe(true);
+    const log = (await (await post("/log", {})).json()) as { messages: Array<{ text: string }> };
+    expect(log.messages.some((m) => m.text === "south-only traffic")).toBe(true);
   });
 
   test("/list-seats cannot enumerate another fleet, whatever fleet the body asks for", async () => {

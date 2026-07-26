@@ -16,7 +16,7 @@
  * maps to billing_source="agent-sdk" (verified against real `claude -p` output).
  */
 import { mkdirSync, writeFileSync } from "node:fs";
-import { getSecret, TOKEN_HEADER, adoptCapability } from "../shared/auth.ts";
+import { getSecret, TOKEN_HEADER, adoptCapability, credFilePath, writeCredFile, removeCredFile } from "../shared/auth.ts";
 import {
   type BrokerClient,
   budgetFieldsFromEnv,
@@ -400,7 +400,18 @@ async function main() {
   myId = reg.id;
   // Before the poll/heartbeat timers below exist: any of them firing on the shared secret
   // would put a `full`-scope request back on the wire.
-  credential = adoptCapability(reg, log);
+  credential = adoptCapability(reg);
+  // v0.3.1: the `claude -p` child this adapter drives inherits this process's environment, so
+  // a `patrol` it runs through Bash resolves the same credential file and authenticates as
+  // THIS seat rather than as the operator. Best-effort — an unwritable dir must not stop it.
+  const credFile = credFilePath();
+  if (credFile) {
+    try {
+      writeCredFile(credFile, { seat_id: reg.id, token: credential });
+    } catch (e) {
+      log(`WARNING: could not write the seat credential to ${credFile} (${e instanceof Error ? e.message : String(e)}) — \`patrol\` run by this seat will authenticate as the OPERATOR`);
+    }
+  }
   log(`Registered as seat ${myId} (cwd: ${config.cwd})`);
 
   const session = new ClaudeSession(config);
@@ -451,6 +462,7 @@ async function main() {
     cleaningUp = true;
     clearInterval(pollTimer);
     clearInterval(heartbeatTimer);
+    if (credFile) removeCredFile(credFile);
     if (myId) {
       try {
         await brokerFetch("/unregister", { id: myId });

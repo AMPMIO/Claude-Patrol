@@ -21,7 +21,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { accessSync, existsSync, mkdirSync, constants as FS } from "node:fs";
 import { dirname, isAbsolute } from "node:path";
-import { getSecret, TOKEN_HEADER, adoptCapability } from "../shared/auth.ts";
+import { getSecret, TOKEN_HEADER, adoptCapability, credFilePath, writeCredFile, removeCredFile } from "../shared/auth.ts";
 import { CHECKPOINT_GUARD, FLEET_ENV, STABLE_KEY_ENV } from "./launcher/compose.ts";
 import { SEAT_TOKEN_ENV, SEAT_TOKEN_RE, LEASE_FILE_ENV } from "../shared/types.ts";
 import type {
@@ -451,7 +451,20 @@ async function main() {
   // Take up the capability BEFORE anything else runs: the poll/heartbeat timers below and the
   // MCP tool handlers all go through brokerFetch, and any of them firing on the shared secret
   // would put a `full`-scope request back on the wire.
-  credential = adoptCapability(reg, log);
+  credential = adoptCapability(reg);
+  // v0.3.1: hand the same capability to the seat's OWN `patrol` CLI. This server's MCP
+  // instructions tell the seat to run `patrol send/list/status` through Bash, and until now
+  // that path read the operator secret — so the seat's normal action reached the broker at
+  // `full` scope and none of the checks above applied to it. Best-effort: an unwritable
+  // credential dir must not stop a seat from running, it only leaves the CLI on the old path.
+  const credFile = credFilePath();
+  if (credFile) {
+    try {
+      writeCredFile(credFile, { seat_id: reg.id, token: credential });
+    } catch (e) {
+      log(`WARNING: could not write the seat credential to ${credFile} (${e instanceof Error ? e.message : String(e)}) — \`patrol\` run by this seat will authenticate as the OPERATOR`);
+    }
+  }
   log(`Registered as seat ${myId} (cwd: ${cwd})`);
   if (reg.session_id_rejected) {
     log("session_id claim rejected (another live seat holds it) — this seat's costs will be unattributed");
@@ -474,6 +487,7 @@ async function main() {
   const cleanup = async () => {
     clearInterval(pollTimer);
     clearInterval(heartbeatTimer);
+    if (credFile) removeCredFile(credFile);
     if (myId) {
       try {
         await brokerFetch("/unregister", { id: myId });

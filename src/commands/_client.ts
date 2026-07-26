@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { existsSync } from "node:fs";
 import { detectFleet } from "../launcher/fleet-detect.ts";
+import { credFilePath, parseCredFile, checkSecretPerms } from "../../shared/auth.ts";
 export { secretPermsOk } from "../../shared/auth.ts";
 export { detectFleet };
 
@@ -25,6 +26,41 @@ export async function readToken(): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+// v0.3.1. Which authority this CLI invocation carries.
+//   seat     — a per-seat capability token, found via credFilePath(). The broker applies the
+//              per-seat route allowlist and confines the caller to its own fleet.
+//   operator — the machine-wide secret. This is the HUMAN running `patrol` from their own
+//              shell, and it must keep working in full: cross-fleet `other-fleet/handle`,
+//              `patrol checkpoint`, `patrol stats`, all of it.
+export interface Credential {
+  token: string;
+  scope: "seat" | "operator";
+  // The seat this CLI invocation IS, when it is a seat. Routes that assert an identity
+  // (/send-message's from_id) must use it; the broker checks it against the token.
+  seatId: string | null;
+}
+
+// Seat credential first, operator secret second. Deliberately NOT a fallback chain past the
+// first success: if a seat's credential file exists but the broker rejects the token (revoked,
+// stale after a crash), the call FAILS. Retrying on the operator secret would restore exactly
+// the silent escalation this closes — the seat would get `full` scope by letting its own
+// credential go bad. A malformed/unreadable file is different: nothing was presented, so the
+// operator path is still the right answer (the human's own shell can have a stale env var).
+export async function readCredential(): Promise<Credential | null> {
+  const path = credFilePath();
+  if (path) {
+    try {
+      checkSecretPerms(path); // same guard as the secret: never a symlink, never another uid
+      const cred = parseCredFile(await Bun.file(path).text());
+      if (cred) return { token: cred.token, scope: "seat", seatId: cred.seat_id };
+    } catch {
+      // no readable seat credential here — this process is not a seat, or is not one yet
+    }
+  }
+  const t = await readToken();
+  return t ? { token: t, scope: "operator", seatId: null } : null;
 }
 
 export class BrokerError extends Error {}
@@ -113,15 +149,15 @@ export async function resolveSeatTarget(target: string): Promise<string> {
 // route like /wait-for passes a larger value — it legitimately holds the response
 // open until the target reaches its state or the server-side timeout fires.
 export async function brokerPost<T>(path: string, body: unknown, timeoutMs = 3000): Promise<T> {
-  const token = await readToken();
-  if (!token) {
+  const cred = await readCredential();
+  if (!cred) {
     throw new BrokerError(`no patrol secret at ${secretPath()} — is the broker running? try: patrol up`);
   }
   let res: Response;
   try {
     res = await fetch(brokerBase() + path, {
       method: "POST",
-      headers: { "content-type": "application/json", "x-patrol-token": token },
+      headers: { "content-type": "application/json", "x-patrol-token": cred.token },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -138,8 +174,16 @@ export async function brokerPost<T>(path: string, body: unknown, timeoutMs = 300
         : ""),
       () => ""
     );
+    // A seat-scope caller refused on a route is the boundary WORKING, and the bare status
+    // reads like a bug. Name the authority actually used so the reader knows the fix is
+    // "run it from your own shell", not "the broker is broken".
+    const scopeHint =
+      cred.scope === "seat" && (res.status === 403 || res.status === 401)
+        ? `\n  (this ran as a SEAT, using its own capability — ${path} is an operator action. Run it from your own shell.)`
+        : "";
     throw new BrokerError(
-      detail ? `broker ${path} failed (${res.status}): ${detail}` : `broker ${path} failed: ${res.status} ${res.statusText}`
+      (detail ? `broker ${path} failed (${res.status}): ${detail}` : `broker ${path} failed: ${res.status} ${res.statusText}`) +
+        scopeHint
     );
   }
   return (await res.json()) as T;

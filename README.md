@@ -554,6 +554,24 @@ one person on one machine, so expect sharp edges outside that path.
   fences stay in place precisely as the detector for everything the lease cannot
   cover: if a fence trips, the lease failed, and you get `INCOMPLETE` rather than a
   false success.
+- **The per-seat capability boundary does NOT contain a compromised seat.** Every seat
+  authenticates with its own capability token, so the broker confines it to its own fleet
+  and to a per-seat route allowlist — and since v0.3.1 that holds on the path seats are
+  actually told to use, the `patrol` CLI they run through Bash. What that buys is real but
+  bounded: it stops accidental cross-fleet action, it constrains adapter seats and any
+  caller without a shell, and it makes a seat's messages provably come from that seat. It
+  is not containment. A seat with Bash can read `~/.claude-patrol.secret` directly — same
+  user, mode 0600 — and that secret is the operator credential, so a seat that wants
+  operator scope simply takes it. No amount of CLI plumbing changes that. Real containment
+  requires the secret to be unreadable by seats: per-seat OS users, or replacing the TCP
+  listener with a unix socket authenticated by peer credentials. Both are roadmapped
+  (v0.4); neither is shipped. Treat a seat as holding operator authority on this machine.
+- **Operator verbs now refuse when a seat runs them.** The flip side of the above: with the
+  CLI authenticating as the seat, `patrol checkpoint <other-seat>`, `patrol stats` and
+  `patrol dash` are refused for a seat, and `patrol status` renders its board with the spend
+  column blank (fleet-wide spend is the operator's view). The error names the cause and the
+  fix — run it from your own shell. `send`, `list`, `status`, and everything about the
+  seat's own row keep working unchanged.
 - **The dashboard is loopback-only, and its token is scoped.** `patrol dash` mints
   a short-lived nonce that authenticates the read routes and `/answer`; every write
   route still requires the full broker secret, and the page is refused without a

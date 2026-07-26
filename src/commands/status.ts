@@ -38,11 +38,16 @@ export default async function status(_args: string[]): Promise<number> {
   // Spend is best-effort: /costs scans session jsonl and can be slow or wedged.
   // A failed/slow cost call degrades to "spend unavailable" — it must never hide
   // or block the board (the old Promise.all did exactly that).
+  // v0.3.1: a SEAT is refused /costs outright — fleet-wide spend is the operator's view — so
+  // the two reasons the board has no spend must read differently. "did not respond" told a
+  // seat its broker was sick every single time.
   let costs: CostsResponse | null = null;
+  let costsRefused = false;
   try {
     costs = await brokerPost<CostsResponse>("/costs", {});
-  } catch {
+  } catch (e) {
     costs = null;
+    costsRefused = e instanceof BrokerError && /\((401|403)\)/.test(e.message);
   }
 
   // v0.2.6 active task branch per seat. Best-effort like /costs: a failed call just
@@ -109,7 +114,9 @@ export default async function status(_args: string[]): Promise<number> {
   }
 
   if (!costs) {
-    console.log("\nspend unavailable — broker /costs did not respond");
+    console.log(costsRefused
+      ? "\nspend hidden — fleet-wide spend is the operator's view; run `patrol status` from your own shell"
+      : "\nspend unavailable — broker /costs did not respond");
   } else {
     if (unattributed > 0) console.log(`\nunattributed: ${usd(unattributed)}`);
     // Three wallets, NEVER summed into one number — they bill different accounts.
