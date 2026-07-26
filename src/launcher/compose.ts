@@ -19,11 +19,24 @@ export const HEADLESS_SEAT = resolve(import.meta.dir, "../headless-seat.ts");
 export const CHECKPOINT_GUARD = resolve(import.meta.dir, "../../plugin/hooks/checkpoint-guard.ts");
 const EMPTY_MCP = '{"mcpServers":{}}';
 
-// Where a seat's checkpoint lease lives. Exported so anything that writes a lease
+// Where checkpoint leases live. Exported so the launcher can create it (0700) before
+// any seat boots — the first guarded checkpoint on a clean install used to throw ENOENT
+// writing into a directory nothing had made, AFTER it had already taken the lease.
+export const LEASE_DIR = join(homedir(), ".claude-patrol", "leases");
+
+// Where ONE seat's checkpoint lease lives. Exported so anything that writes a lease
 // derives the path the same way the seat's hook reads it — a drift here means a
 // checkpoint that quiesces nothing.
-export function leaseFile(seatName: string): string {
-  return join(homedir(), ".claude-patrol", "leases", `${seatName}.lock`);
+//
+// v0.2.9.1: `launchId` is REQUIRED and must be unique per seat launch. The path was
+// `<seatName>.lock` in a GLOBAL home directory, but seat names are only fleet-locally
+// unique — two fleets each running a seat called `builder` shared one lock file, so one
+// fleet's checkpoint could unlink the other's lease and silently un-quiesce an unrelated
+// seat mid-merge. Nothing in a seat NAME can fix that (names are user-chosen and
+// deliberately reusable), so uniqueness comes from a per-launch random id instead. The
+// name is kept in the filename purely so a human can tell whose lock they are looking at.
+export function leaseFile(seatName: string, launchId: string): string {
+  return join(LEASE_DIR, `${seatName}-${launchId}.lock`);
 }
 
 // A seat name becomes a filesystem path segment (per-seat overlay files) and a
@@ -124,6 +137,10 @@ export function planSeat(seat: SeatSpec, installedPlugins: Record<string, boolea
 export interface ComposePaths {
   settingsFile: string | null; // where the overlay was written; null if no overlay
   mcpConfigFile: string | null; // patrol seat-server config path; null unless mcp=patrol
+  // v0.2.9.1: this seat's checkpoint lease path, built by the LAUNCHER (leaseFile()
+  // above) because it needs a per-launch random id and composeSeat must stay pure.
+  // null for adapter seats, which have no Claude session to quiesce.
+  leaseFile: string | null;
 }
 
 export interface Composed {
@@ -229,13 +246,13 @@ export function composeSeat(
   const env: Record<string, string> = {
     CLAUDE_PATROL_ROLE: plan.role,
     CLAUDE_PATROL_MODEL: spec.model,
-    // v0.2.9: the lease file the guard hook stats before every mutating tool call.
-    // Per seat (SEAT_NAME_RE already guarantees the name is a safe path segment) so
-    // one seat's checkpoint never quiesces another. Setting it is also the seat's
-    // `guarded` bit at /register — the launcher only sets it where it installed the
-    // hook, which is exactly the settings overlay planSeat just built.
-    [LEASE_FILE_ENV]: leaseFile(spec.name),
   };
+  // v0.2.9: the lease file the guard hook stats before every tool call. v0.2.9.1: the
+  // path now carries a per-LAUNCH random id, so it is unique across fleets and not just
+  // within one (see leaseFile()). Setting it is also the seat's `guarded` bit at
+  // /register — the launcher only sets it where it installed the hook, which is exactly
+  // the settings overlay planSeat just built.
+  if (paths.leaseFile) env[LEASE_FILE_ENV] = paths.leaseFile;
   if (spec.profile !== undefined) {
     env.CLAUDE_PATROL_PROFILE = typeof spec.profile === "string" ? spec.profile : "custom";
   }

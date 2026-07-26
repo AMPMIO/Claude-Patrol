@@ -2,12 +2,13 @@ import { test, expect, describe } from "bun:test";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { parseYaml, parsePatrolConfig } from "../src/launcher/yaml.ts";
+import { genLaunchId } from "../src/commands/up.ts";
 import {
   resolveProfile, buildEnabledPlugins, buildSettingsOverlay, matchPlugin, NAMED_PROFILES, GUARD_MATCHER,
 } from "../src/profiles.ts";
 import {
   validateConfig, applyFleetBudget, planSeat, composeSeat, shQuote, seatShellLine, tmuxCommands, CODEX_SEAT, HEADLESS_SEAT,
-  CHECKPOINT_GUARD, leaseFile, selectBgPidsToKill, patrolMcpConfig, type SeatPlan, type ComposePaths,
+  CHECKPOINT_GUARD, leaseFile, LEASE_DIR, selectBgPidsToKill, patrolMcpConfig, type SeatPlan, type ComposePaths,
 } from "../src/launcher/compose.ts";
 import { seatMarker, SEAT_TOKEN_ENV, LEASE_FILE_ENV, type PatrolConfig, type SeatSpec } from "../shared/types.ts";
 
@@ -232,11 +233,17 @@ function plan(seat: SeatSpec): SeatPlan {
 }
 const SET = "/prof/x.settings.json";
 const MCP = "/prof/x.mcp.json";
+// A fixed stand-in for the per-launch random id materialize() generates, so argv/env
+// assertions stay exact. The randomness itself is asserted separately (genLaunchId).
+const LAUNCH = "0a1b2c3d";
 function pathsFor(p: SeatPlan): ComposePaths {
+  const adapter = p.backend === "codex" || p.backend === "headless";
   return {
     settingsFile: p.settingsOverlay ? SET : null,
     // materialize() writes the patrol mcp file for every seat except mcp:"none".
     mcpConfigFile: p.resolved?.mcp !== "none" ? MCP : null,
+    // adapter seats have no Claude session to quiesce, so no lease path at all.
+    leaseFile: adapter ? null : leaseFile(p.spec.name, LAUNCH),
   };
 }
 // Patrol mounted ADDITIVELY for full/no-profile seats (keeps global MCP servers).
@@ -273,7 +280,7 @@ describe("composeSeat argv+env", () => {
     expect(argv).toEqual(["claude", "--model", "opus", "--name", "orchestrator", ...ADD_MCP, ...CHAN, "--settings", SET, "--", "go"]);
     expect(env).toEqual({
       CLAUDE_PATROL_ROLE: "lead", CLAUDE_PATROL_MODEL: "opus", CLAUDE_PATROL_PROFILE: "full",
-      [LEASE_FILE_ENV]: leaseFile("orchestrator"),
+      [LEASE_FILE_ENV]: leaseFile("orchestrator", LAUNCH),
     });
   });
 
@@ -288,7 +295,7 @@ describe("composeSeat argv+env", () => {
     ]);
     expect(env).toEqual({
       CLAUDE_PATROL_ROLE: "executor", CLAUDE_PATROL_MODEL: "opus", CLAUDE_PATROL_PROFILE: "custom",
-      [LEASE_FILE_ENV]: leaseFile("executor"),
+      [LEASE_FILE_ENV]: leaseFile("executor", LAUNCH),
     });
   });
 
@@ -324,7 +331,7 @@ describe("composeSeat argv+env", () => {
     expect(argv).toEqual(["claude", "--model", "opus", "--name", "bare", ...ADD_MCP, ...CHAN, "--settings", SET]);
     expect(env).toEqual({
       CLAUDE_PATROL_ROLE: "bare", CLAUDE_PATROL_MODEL: "opus",
-      [LEASE_FILE_ENV]: leaseFile("bare"),
+      [LEASE_FILE_ENV]: leaseFile("bare", LAUNCH),
     });
   });
 });
@@ -343,7 +350,7 @@ describe("checkpoint guard wiring", () => {
       const p = plan({ name: `s-${backend}`, model: "opus", backend });
       expect(p.settingsOverlay!.hooks).toEqual(GUARD_HOOKS);
       const { env } = composeSeat(p, pathsFor(p));
-      expect(env[LEASE_FILE_ENV]).toBe(leaseFile(`s-${backend}`));
+      expect(env[LEASE_FILE_ENV]).toBe(leaseFile(`s-${backend}`, LAUNCH));
     });
   }
 
@@ -352,6 +359,27 @@ describe("checkpoint guard wiring", () => {
     const b = plan({ name: "b", model: "opus" });
     expect(composeSeat(a, pathsFor(a)).env[LEASE_FILE_ENV])
       .not.toBe(composeSeat(b, pathsFor(b)).env[LEASE_FILE_ENV]);
+  });
+
+  // v0.2.9.1 fix 5. Lease files live in ONE global home directory but seat names are only
+  // unique WITHIN a fleet, so two fleets each running a `builder` shared
+  // ~/.claude-patrol/leases/builder.lock — one fleet's checkpoint could unlink the other's
+  // lease and silently un-quiesce an unrelated seat mid-merge. Nothing in a name can fix
+  // that (names are user-chosen and meant to be reusable), so uniqueness comes from a
+  // per-LAUNCH random id instead.
+  test("two fleets running a same-named seat get DIFFERENT lease files", () => {
+    const fleetA = leaseFile("builder", genLaunchId());
+    const fleetB = leaseFile("builder", genLaunchId());
+    expect(fleetA).not.toBe(fleetB);
+    // Still readable at a glance — the name is in there, it just isn't the whole identity.
+    expect(fleetA).toContain("builder-");
+    expect(fleetA.startsWith(LEASE_DIR + "/")).toBe(true);
+  });
+
+  test("genLaunchId is random enough that a fleet-sized batch never collides", () => {
+    const ids = new Set(Array.from({ length: 500 }, genLaunchId));
+    expect(ids.size).toBe(500);
+    for (const id of ids) expect(id).toMatch(/^[0-9a-f]{8}$/);
   });
 
   // Adapter seats are not Claude sessions: nothing to hook, nothing to quiesce.

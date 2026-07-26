@@ -62,12 +62,21 @@ export function buildEnabledPlugins(
   return out;
 }
 
-// Tool names the checkpoint guard is matched against — the mutating set. The hook
-// itself inspects neither tool nor path: path/command matching is how the earlier
-// deny-hook earned six proven bypasses (a `cd` defeats it), so matching stops at
-// the tool name and the lease decides the rest. Kept in step with the same matcher
-// in plugin/hooks/hooks.json (that copy guards MANUAL, non-launcher sessions).
-export const GUARD_MATCHER = "Edit|Write|NotebookEdit|Bash";
+// MATCH EVERY TOOL. "*" is Claude Code's match-all matcher (equivalent to omitting
+// the key); it is spelled explicitly so an absent matcher can't be misread as a bug.
+//
+// This was "Edit|Write|NotebookEdit|Bash" through v0.2.9, and enumerating names is the
+// same bypass class that earned the earlier deny-hook six proven escapes. A full-profile
+// seat keeps its global MCP servers, so ANY MCP file-writing tool (a serena-style
+// `replace_content`, an editor MCP, a future built-in) is write-capable and matched none
+// of those four — it wrote freely while the seat read as "leased". The set of
+// write-capable tool names is open-ended and not ours to enumerate, so we stop trying:
+// match all, and let the lease alone decide. The hook still inspects neither tool name
+// nor path, so the cost is one stat+read per tool call while no lease is held.
+//
+// Kept in step with the same matcher in plugin/hooks/hooks.json (that copy guards
+// MANUAL, non-launcher sessions).
+export const GUARD_MATCHER = "*";
 
 // The full --settings overlay object. ALWAYS non-null for a Claude seat as of
 // v0.2.9: the overlay is what carries the checkpoint-guard PreToolUse hook, and a

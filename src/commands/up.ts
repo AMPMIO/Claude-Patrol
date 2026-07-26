@@ -12,7 +12,7 @@ import { randomBytes } from "node:crypto";
 import { SEAT_TOKEN_RE } from "../../shared/types.ts";
 import { parsePatrolConfig } from "../launcher/yaml.ts";
 import {
-  validateConfig, applyFleetBudget, planSeat, composeSeat, patrolMcpConfig,
+  validateConfig, applyFleetBudget, planSeat, composeSeat, patrolMcpConfig, leaseFile, LEASE_DIR,
   type ComposePaths, type SeatPlan, type TmuxSeat, type RecordedBgSeat,
 } from "../launcher/compose.ts";
 import { hasSession, launchTmux } from "../launcher/tmux.ts";
@@ -41,6 +41,14 @@ function genSeatToken(): string {
   return token;
 }
 
+// Per-LAUNCH lease id: 8 hex chars, enough that two fleets booting a same-named seat
+// never collide on one lock file. Deliberately NOT the Layer-1 seat token — a `silent`
+// seat has no seat token but still needs a lease path, and a lease id that doubled as
+// the cost-attribution marker would leak into the seat's prompt.
+export function genLaunchId(): string {
+  return randomBytes(4).toString("hex");
+}
+
 function readInstalledPlugins(): Record<string, boolean> {
   const path = join(CONFIG_DIR, "settings.json");
   if (!existsSync(path)) return {};
@@ -59,7 +67,9 @@ function readInstalledPlugins(): Record<string, boolean> {
 function materialize(plan: SeatPlan): ComposePaths {
   // A codex/headless adapter has no Claude settings or MCP surface. Avoid even
   // writing unused per-seat MCP files so its launch stays entirely adapter-owned.
-  if (plan.backend === "codex" || plan.backend === "headless") return { settingsFile: null, mcpConfigFile: null };
+  if (plan.backend === "codex" || plan.backend === "headless") {
+    return { settingsFile: null, mcpConfigFile: null, leaseFile: null };
+  }
   let settingsFile: string | null = null;
   if (plan.settingsOverlay) {
     settingsFile = join(PROFILE_DIR, `${plan.spec.name}.settings.json`);
@@ -74,7 +84,10 @@ function materialize(plan: SeatPlan): ComposePaths {
     mcpConfigFile = join(PROFILE_DIR, `${plan.spec.name}.mcp.json`);
     writeFileSync(mcpConfigFile, patrolMcpConfig(SEAT_SERVER));
   }
-  return { settingsFile, mcpConfigFile };
+  // v0.2.9.1: one lease path per seat LAUNCH, not per seat name. Two fleets each with a
+  // seat called `builder` previously shared ~/.claude-patrol/leases/builder.lock, so one
+  // fleet's checkpoint could unlink the other's lease and un-quiesce an unrelated seat.
+  return { settingsFile, mcpConfigFile, leaseFile: leaseFile(plan.spec.name, genLaunchId()) };
 }
 
 export default async function up(args: string[]): Promise<number> {
@@ -109,6 +122,12 @@ export default async function up(args: string[]): Promise<number> {
   }
 
   mkdirSync(PROFILE_DIR, { recursive: true });
+  // v0.2.9.1: the lease dir must exist BEFORE any seat boots. checkpoint used to write
+  // the lock straight into it, so on a clean install the first guarded checkpoint threw
+  // ENOENT *after* acquiring the broker lease — a seat quiesced in the broker's record
+  // while nothing on disk was actually guarding it. 0700 because the file's presence is
+  // what freezes a seat: another user must not be able to drop one in.
+  mkdirSync(LEASE_DIR, { recursive: true, mode: 0o700 });
 
   // Compose everything before launching so a compose error aborts cleanly.
   // One fresh token per non-silent seat; silent seats pass null (Layer-3 only).

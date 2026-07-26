@@ -138,11 +138,20 @@ function sh(cmd: string[], cwd?: string, env?: Record<string, string>): { code: 
   return { code: r.exitCode ?? 1, out: r.stdout?.toString() ?? "", err: r.stderr?.toString() ?? "" };
 }
 function git(cwd: string, ...args: string[]) {
+  // An empty cwd makes `git -C ""` operate on the TEST RUNNER's own repo. Every call site
+  // here passes a path parsed out of CLI stdout, so a CLI failure yields "" and a
+  // `git commit` lands in this checkout instead of the fixture — which is how a stray
+  // "seat work" commit once appeared on the working branch. Fail loudly instead.
+  if (!cwd) throw new Error(`git(): empty cwd for \`git ${args.join(" ")}\` — the command that produced it failed`);
   return sh(["git", "-C", cwd, ...args]);
 }
 
 // Resolved BEFORE any PATH shim exists, so a shim can delegate to the real binary.
 const REAL_GIT = sh(["sh", "-c", "command -v git"]).out.trim();
+
+// The seat-side half of the lease. Run directly against a captured lease file to prove a
+// renewal kept the seat DENIED, not merely that a broker row survived.
+const GUARD_HOOK = new URL("../plugin/hooks/checkpoint-guard.ts", import.meta.url).pathname;
 
 // A throwaway git repo with one commit on `main`. `detachPrimary` frees the trunk so
 // checkpoint can advance it (the correct worktree-per-task layout: nobody camps main).
@@ -385,9 +394,18 @@ describe("path canonicalization (v0.2.9)", () => {
 // --- v0.2.9 checkpoint lease --------------------------------------------------
 
 describe("/lease-worktree + /release-worktree", () => {
-  async function lease(id: string, path: string) {
-    return (await (await post("/lease-worktree", { id, path })).json()) as { ok: boolean; expires_at?: string; error?: string };
+  // token omitted = fresh acquire; token present = renewal of that exact lease.
+  async function lease(id: string, path: string, token?: string) {
+    const body = token === undefined ? { id, path } : { id, path, token };
+    return (await (await post("/lease-worktree", body)).json()) as {
+      ok: boolean; expires_at?: string; token?: string; error?: string;
+    };
   }
+  async function release(id: string, path: string, token: string) {
+    return (await (await post("/release-worktree", { id, path, token })).json()) as { ok: boolean };
+  }
+  // A syntactically valid token that was never issued — for the "someone else's" cases.
+  const FOREIGN = "cpl-" + "f".repeat(32);
 
   test("acquire → renew → release round-trips; the row is visible while held", async () => {
     const seat = await registerSeat();
@@ -397,28 +415,68 @@ describe("/lease-worktree + /release-worktree", () => {
     const first = await lease(seat, p);
     expect(first.ok).toBe(true);
     expect(first.expires_at).toBeTruthy();
+    expect(first.token).toMatch(/^cpl-[0-9a-f]{32}$/); // v0.2.9.1: minted per acquire
     expect(Date.parse(first.expires_at!)).toBeGreaterThan(Date.now()); // TTL is in the future
     expect(leaseRow(p)).not.toBeNull();
 
-    // Re-leasing by the HOLDER renews rather than refusing — a checkpoint that re-acquires
-    // must not deadlock against itself.
-    const renew = await lease(seat, p);
+    // Renewing WITH our token pushes expiry out in place and keeps the same token — this
+    // is the call checkpoint's renewal timer makes for the whole run.
+    const renew = await lease(seat, p, first.token);
     expect(renew.ok).toBe(true);
+    expect(renew.token).toBe(first.token!);
     expect(Date.parse(renew.expires_at!)).toBeGreaterThanOrEqual(Date.parse(first.expires_at!));
     expect(leaseRow(p)!.seat_id).toBe(seat);
 
-    expect(((await (await post("/release-worktree", { id: seat, path: p })).json()) as { ok: boolean }).ok).toBe(true);
+    expect((await release(seat, p, first.token!)).ok).toBe(true);
     expect(leaseRow(p)).toBeNull();
     // Idempotent: releasing a lease nobody holds is a clean no-op (checkpoint releases
     // from a `finally`, including paths where the acquire never succeeded).
-    expect(((await (await post("/release-worktree", { id: seat, path: p })).json()) as { ok: boolean }).ok).toBe(true);
+    expect((await release(seat, p, first.token!)).ok).toBe(true);
+  });
+
+  // THE v0.2.9.1 FIX. Ownership used to be keyed on seat_id alone, so a second checkpoint
+  // of the SAME seat was treated as a renewal: both processes believed they held the tree,
+  // and either could release it while the other was mid-merge.
+  test("a second acquire on the SAME seat is REFUSED, not treated as a renewal", async () => {
+    const seat = await registerSeat({ name: "lease-selfrace" });
+    const p = wtDir("lease-same-seat");
+    const first = await lease(seat, p);
+    expect(first.ok).toBe(true);
+
+    const second = await lease(seat, p); // no token => a different checkpoint run
+    expect(second.ok).toBe(false);
+    expect(second.token).toBeUndefined();
+    expect(second.error).toContain("leased until");
+    // The winner's row is untouched: same token, so its renew and release still work.
+    expect(leaseRow(p)!.seat_id).toBe(seat);
+    expect((await lease(seat, p, first.token)).ok).toBe(true);
+  });
+
+  test("a renewal with a token that isn't the stored one is refused", async () => {
+    const seat = await registerSeat();
+    const p = wtDir("lease-renew-wrong-token");
+    expect((await lease(seat, p)).ok).toBe(true);
+    const bad = await lease(seat, p, FOREIGN);
+    expect(bad.ok).toBe(false);
+    expect(bad.error).toContain("no longer ours");
+  });
+
+  test("a renewal after the lease expired is refused (never silently re-taken)", async () => {
+    const seat = await registerSeat();
+    const p = wtDir("lease-renew-expired");
+    const first = await lease(seat, p);
+    expireLease(p); // the seat has already resumed writing by now
+    const stale = await lease(seat, p, first.token);
+    expect(stale.ok).toBe(false);
+    expect(stale.error).toContain("no longer ours");
   });
 
   test("a SECOND seat is refused while the lease is held, and the holder is named", async () => {
     const a = await registerSeat({ name: "lease-holder" });
     const b = await registerSeat({ name: "lease-rival" });
     const p = wtDir("lease-contested");
-    expect((await lease(a, p)).ok).toBe(true);
+    const held = await lease(a, p);
+    expect(held.ok).toBe(true);
 
     const denied = await lease(b, p);
     expect(denied.ok).toBe(false);
@@ -427,17 +485,21 @@ describe("/lease-worktree + /release-worktree", () => {
     expect(leaseRow(p)!.seat_id).toBe(a); // the holder's row is untouched
 
     // Released by the owner → the rival can take it.
-    await post("/release-worktree", { id: a, path: p });
+    await release(a, p, held.token!);
     expect((await lease(b, p)).ok).toBe(true);
     expect(leaseRow(p)!.seat_id).toBe(b);
   });
 
-  test("release is owner-scoped: a non-holder cannot release someone else's lease", async () => {
+  // v0.2.9.1: scoped by TOKEN, not seat_id. The seat_id form let a second checkpoint of
+  // one seat delete the first's row mid-merge, which is the release half of the same hole.
+  test("release is token-scoped: neither another seat NOR the same seat can drop a lease it didn't mint", async () => {
     const a = await registerSeat();
     const b = await registerSeat();
     const p = wtDir("lease-owner-scope");
     await lease(a, p);
-    await post("/release-worktree", { id: b, path: p }); // b is not the holder
+    await release(b, p, FOREIGN); // another seat, a token it was never issued
+    expect(leaseRow(p)!.seat_id).toBe(a); // still held
+    await release(a, p, FOREIGN); // the RIGHT seat, the WRONG run
     expect(leaseRow(p)!.seat_id).toBe(a); // still held
   });
 
@@ -470,7 +532,12 @@ describe("/lease-worktree + /release-worktree", () => {
     expect(unknown.ok).toBe(false);
     expect((await post("/lease-worktree", { id: "bad", path: p })).status).toBe(400);
     expect((await post("/lease-worktree", { id: "zzzzzzzz", path: "" })).status).toBe(400);
-    expect((await post("/release-worktree", { id: "bad", path: p })).status).toBe(400);
+    expect((await post("/release-worktree", { id: "bad", path: p, token: FOREIGN })).status).toBe(400);
+    // v0.2.9.1: a malformed token is never quietly downgraded to "no token" — that would
+    // turn a renewal into a fresh acquire and hand back a lease the caller's file can't match.
+    expect((await post("/lease-worktree", { id: "zzzzzzzz", path: p, token: "nope" })).status).toBe(400);
+    // A release must PRESENT the token; omitting it must not fall through to a wildcard delete.
+    expect((await post("/release-worktree", { id: "zzzzzzzz", path: p })).status).toBe(400);
   });
 });
 
@@ -1080,13 +1147,17 @@ describe("end-to-end (real git repo, real CLI subprocess)", () => {
   test("a checkpoint that THROWS after acquiring still releases the lease (the finally)", async () => {
     const repo = makeRepo(true);
     const env = { CLAUDE_PATROL_PORT: String(PORT), CLAUDE_PATROL_SECRET_FILE: SECRET_FILE };
-    // An unwritable lease-file path makes writeLeaseFile throw AFTER the broker lease is
-    // taken — a real exception on a real path, which is exactly what the `finally` is for.
+    // A lease path whose PARENT is a regular file: mkdirSync fails ENOTDIR, so writeLeaseFile
+    // still throws AFTER the broker lease is taken — a real exception on a real path, which
+    // is exactly what the `finally` is for. (A merely MISSING parent no longer throws as of
+    // v0.2.9.1 — checkpoint creates the lease dir; that is the clean-install case below.)
+    const blocker = join(WT_ROOT, "lease-parent-is-a-file");
+    writeFileSync(blocker, "not a directory");
     const seat = await registerSeat({
       cwd: repo,
       git_root: repo,
       guarded: true,
-      lease_file: join(WT_ROOT, "no-such-dir", "lease.json"),
+      lease_file: join(blocker, "lease.json"),
     });
     try {
       const wtPath = sh(["bun", CLI, "worktree", seat, "throws", "--base", "main"], repo, env).out.trim();
@@ -1099,6 +1170,218 @@ describe("end-to-end (real git repo, real CLI subprocess)", () => {
       // write until the TTL burns down.
       expect(leaseRow(wtPath)).toBeNull();
       expect(await listWorktrees(seat)).toHaveLength(1); // nothing was deregistered
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  // v0.2.9.1: the guard hook binds its deny to the worktree the lease names, so a seat
+  // sitting somewhere unrelated would get NO deny — and silently, because the hook fails
+  // open. Refuse loudly rather than merge behind a guard that cannot fire.
+  test("checkpoint REFUSES a seat whose cwd is outside the worktree being checked in", async () => {
+    const repo = makeRepo(true);
+    const elsewhere = mkdtempSync(join(tmpdir(), "patrol-elsewhere-"));
+    const env = { CLAUDE_PATROL_PORT: String(PORT), CLAUDE_PATROL_SECRET_FILE: SECRET_FILE };
+    const seat = await registerSeat({
+      cwd: elsewhere, git_root: repo, guarded: true, lease_file: join(WT_ROOT, "unbindable.lock"),
+    });
+    const mainBefore = git(repo, "rev-parse", "main").out.trim();
+    try {
+      const wtPath = sh(["bun", CLI, "worktree", seat, "unbound", "--base", "main"], repo, env).out.trim();
+      sh(["sh", "-c", `echo work > "${wtPath}/f.txt"`]);
+      git(wtPath, "commit", "-qam", "seat work");
+      const tip = git(wtPath, "rev-parse", "HEAD").out.trim();
+
+      const refused = sh(["bun", CLI, "checkpoint", seat], repo, env);
+      expect(refused.code).not.toBe(0);
+      expect(refused.err).toContain("outside the worktree being checked in");
+      expect(git(repo, "rev-parse", "main").out.trim()).toBe(mainBefore); // nothing merged
+      expect(await listWorktrees(seat)).toHaveLength(1);
+
+      // --force still waives it, and SAYS SO — the success line must never imply a lease
+      // held when none did.
+      const forced = sh(["bun", CLI, "checkpoint", seat, "--force"], repo, env);
+      expect(forced.code).toBe(0);
+      expect(git(repo, "rev-parse", "main").out.trim()).toBe(tip);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(elsewhere, { recursive: true, force: true });
+    }
+  });
+
+  // The success line is user-facing and was the place the old design overclaimed.
+  test("the --force success line says plainly that it ran WITHOUT a lease", async () => {
+    const repo = makeRepo(true);
+    const env = { CLAUDE_PATROL_PORT: String(PORT), CLAUDE_PATROL_SECRET_FILE: SECRET_FILE };
+    const seat = await registerSeat({ cwd: repo, git_root: repo }); // unguarded
+    try {
+      const wtPath = sh(["bun", CLI, "worktree", seat, "forcedmsg", "--base", "main"], repo, env).out.trim();
+      sh(["sh", "-c", `echo work > "${wtPath}/f.txt"`]);
+      git(wtPath, "commit", "-qam", "seat work");
+
+      const forced = sh(["bun", CLI, "checkpoint", seat, "--force"], repo, env);
+      expect(forced.code).toBe(0);
+      // An unguarded seat has no lease FILE, so even though --force still takes the broker
+      // row, nothing quiesced the seat — and the line must not pretend otherwise.
+      expect(forced.out).toContain("WITHOUT a lease");
+      expect(forced.out).toContain("NOT paused");
+      expect(forced.out).not.toContain("lease held throughout"); // never the guarded wording
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  // --- v0.2.9.1: the lease must OUTLIVE whatever runs under it -------------------
+  //
+  // The v0.2.9 lease file was written once and a `--gate` then ran to completion under a
+  // 120s TTL past which the hook fails open. Any ordinary test suite therefore un-quiesced
+  // the seat MID-CHECKPOINT while checkpoint carried on to merge and remove — the exact
+  // race the lease exists to remove, reintroduced by the lease's own timeout.
+  //
+  // CLAUDE_PATROL_CHECKPOINT_RENEW_MS shrinks the renewal CADENCE (never the TTL) so this
+  // is a one-second test rather than a two-minute one.
+  test("a gate that outlives the renewal window: the lease is RENEWED and the seat stays denied throughout", async () => {
+    const repo = makeRepo(true);
+    const leaseDir = join(WT_ROOT, "renew-live");
+    mkdirSync(leaseDir, { recursive: true });
+    const leaseFile = join(leaseDir, "seat.lock");
+    const env = {
+      CLAUDE_PATROL_PORT: String(PORT), CLAUDE_PATROL_SECRET_FILE: SECRET_FILE,
+      CLAUDE_PATROL_CHECKPOINT_RENEW_MS: "150",
+    };
+    const seat = await registerSeat({ cwd: repo, git_root: repo, guarded: true, lease_file: leaseFile });
+    try {
+      const wtPath = sh(["bun", CLI, "worktree", seat, "renewed", "--base", "main"], repo, env).out.trim();
+      sh(["sh", "-c", `echo work > "${wtPath}/f.txt"`]);
+      git(wtPath, "commit", "-qam", "seat work");
+      const tip = git(wtPath, "rev-parse", "HEAD").out.trim();
+      const canonical = realpathSync(wtPath); // resolve BEFORE checkpoint removes the tree
+
+      // Snapshot the live lease at both ends of a gate several renewal periods long.
+      const early = join(leaseDir, "early.json");
+      const late = join(leaseDir, "late.json");
+      const cp = sh(["bun", CLI, "checkpoint", seat, "--gate",
+        `cp "${leaseFile}" "${early}"; sleep 1.2; cp "${leaseFile}" "${late}"`], repo, env);
+      expect(cp.code).toBe(0);
+      expect(cp.out).toContain("background processes"); // the honest success line
+
+      const a = JSON.parse(readFileSync(early, "utf8"));
+      const b = JSON.parse(readFileSync(late, "utf8"));
+      // Renewed in place: expiry pushed out, same lease (same token), same tree.
+      expect(Date.parse(b.expires_at)).toBeGreaterThan(Date.parse(a.expires_at));
+      expect(b.token).toBe(a.token);
+      expect(b.path).toBe(canonical);
+
+      // And the guard hook would still have DENIED off the late snapshot — the point of
+      // renewing is that the seat never stopped being quiesced, not that a row survived.
+      const hook = Bun.spawn(["bun", GUARD_HOOK], {
+        env: { ...process.env, CLAUDE_PATROL_LEASE_FILE: late },
+        stdin: new TextEncoder().encode(JSON.stringify({ cwd: b.path, tool_name: "Edit", hook_event_name: "PreToolUse" })),
+        stdout: "pipe", stderr: "ignore",
+      });
+      expect(await new Response(hook.stdout).text()).toContain('"deny"');
+
+      expect(git(repo, "rev-parse", "main").out.trim()).toBe(tip); // and it did merge
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test("a FAILED renewal aborts the checkpoint: the gate is killed and nothing is merged", async () => {
+    const repo = makeRepo(true);
+    const leaseDir = join(WT_ROOT, "renew-doomed");
+    mkdirSync(leaseDir, { recursive: true });
+    const leaseFile = join(leaseDir, "seat.lock");
+    const env = {
+      CLAUDE_PATROL_PORT: String(PORT), CLAUDE_PATROL_SECRET_FILE: SECRET_FILE,
+      CLAUDE_PATROL_CHECKPOINT_RENEW_MS: "150",
+    };
+    const seat = await registerSeat({ cwd: repo, git_root: repo, guarded: true, lease_file: leaseFile });
+    const mainBefore = git(repo, "rev-parse", "main").out.trim();
+    try {
+      const wtPath = sh(["bun", CLI, "worktree", seat, "doomed", "--base", "main"], repo, env).out.trim();
+      sh(["sh", "-c", `echo work > "${wtPath}/f.txt"`]);
+      git(wtPath, "commit", "-qam", "seat work");
+
+      // Replace the lease DIRECTORY with a regular file mid-gate: the next renewal's
+      // mkdir fails ENOTDIR, so the lease can no longer be refreshed on disk. `sleep 30`
+      // is never waited out — the abort path kills the gate — so this test is fast.
+      const cp = sh(["bun", CLI, "checkpoint", seat, "--gate",
+        `rm -rf "${leaseDir}"; touch "${leaseDir}"; sleep 30`], repo, env);
+      expect(cp.code).not.toBe(0);
+      expect(cp.err).toContain("ABORTED");
+      expect(cp.err).toContain("could not be renewed");
+      // The load-bearing assertions: a lapsed lease means the seat is writing again, so
+      // NOTHING may be integrated and the tree must survive.
+      expect(git(repo, "rev-parse", "main").out.trim()).toBe(mainBefore);
+      expect(existsSync(wtPath)).toBe(true);
+      expect(await listWorktrees(seat)).toHaveLength(1); // still tracked
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  // v0.2.9.1 fix 2, end to end. Lease ownership was keyed on seat_id, so a second
+  // checkpoint of the SAME seat read as a renewal: both processes ran believing they held
+  // the tree, and whichever finished first released the lease (and unlinked the file) out
+  // from under the other, un-quiescing the seat mid-merge.
+  test("two checkpoint processes racing the SAME seat: one holds the lease, the loser refuses", async () => {
+    const repo = makeRepo(true);
+    const leaseDir = join(WT_ROOT, "race-same-seat");
+    mkdirSync(leaseDir, { recursive: true });
+    const leaseFile = join(leaseDir, "seat.lock");
+    const env = { ...process.env, CLAUDE_PATROL_PORT: String(PORT), CLAUDE_PATROL_SECRET_FILE: SECRET_FILE };
+    const seat = await registerSeat({ cwd: repo, git_root: repo, guarded: true, lease_file: leaseFile });
+    try {
+      const wtPath = sh(["bun", CLI, "worktree", seat, "raced", "--base", "main"],
+        repo, { CLAUDE_PATROL_PORT: String(PORT), CLAUDE_PATROL_SECRET_FILE: SECRET_FILE }).out.trim();
+      sh(["sh", "-c", `echo work > "${wtPath}/f.txt"`]);
+      git(wtPath, "commit", "-qam", "seat work");
+      const tip = git(wtPath, "rev-parse", "HEAD").out.trim();
+
+      // A holds the lease across a 2s gate; B starts while A is still inside it.
+      const a = Bun.spawn(["bun", CLI, "checkpoint", seat, "--gate", "sleep 2"],
+        { cwd: repo, env, stdout: "pipe", stderr: "pipe" });
+      await new Promise((r) => setTimeout(r, 700));
+      const b = Bun.spawn(["bun", CLI, "checkpoint", seat, "--gate", "true"],
+        { cwd: repo, env, stdout: "pipe", stderr: "pipe" });
+
+      const bErr = await new Response(b.stderr).text();
+      expect(await b.exited).not.toBe(0); // the loser refuses rather than merging too
+      expect(bErr).toContain("could not lease");
+
+      await new Response(a.stdout).text();
+      expect(await a.exited).toBe(0); // and the winner is unaffected by the loser's exit
+      expect(git(repo, "rev-parse", "main").out.trim()).toBe(tip);
+      // The winner's release wasn't clobbered by the loser: the row is gone, cleanly.
+      expect(leaseRow(wtPath)).toBeNull();
+      expect(existsSync(leaseFile)).toBe(false);
+      expect(await listWorktrees(seat)).toHaveLength(0);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  // v0.2.9.1 fix 6. checkpoint wrote the lock straight into a directory nothing had
+  // created, so the FIRST guarded checkpoint on a clean install threw ENOENT — after it
+  // had already taken the broker lease. A seat recorded as quiesced, guarded by nothing.
+  test("a clean install with NO lease directory: the first guarded checkpoint still works", async () => {
+    const repo = makeRepo(true);
+    const env = { CLAUDE_PATROL_PORT: String(PORT), CLAUDE_PATROL_SECRET_FILE: SECRET_FILE };
+    const freshDir = join(WT_ROOT, "never-created-leases", "nested");
+    expect(existsSync(freshDir)).toBe(false);
+    const seat = await registerSeat({
+      cwd: repo, git_root: repo, guarded: true, lease_file: join(freshDir, "seat.lock"),
+    });
+    try {
+      const wtPath = sh(["bun", CLI, "worktree", seat, "cleaninstall", "--base", "main"], repo, env).out.trim();
+      sh(["sh", "-c", `echo work > "${wtPath}/f.txt"`]);
+      git(wtPath, "commit", "-qam", "seat work");
+
+      const cp = sh(["bun", CLI, "checkpoint", seat], repo, env);
+      expect(cp.code).toBe(0);
+      expect(existsSync(freshDir)).toBe(true); // created on the way, 0700
+      expect(leaseRow(wtPath)).toBeNull(); // and released cleanly afterwards
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }
