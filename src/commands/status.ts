@@ -14,6 +14,14 @@ type SeatWithBudget = Seat & { budget_usd?: number | null };
 // stopped working until the TTL burns down.
 type WorktreeWithLease = Worktree & { lease_expires_at?: string | null };
 
+// Token counts in the tax line are read at a glance, not audited — "412k" beats
+// "412,318" for a figure whose input is a heuristic. Exact tokens stay in /costs.
+function ktok(n: number): string {
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${Math.round(n / 1e3)}k`;
+  return String(n);
+}
+
 export default async function status(_args: string[]): Promise<number> {
   const cwd = process.cwd();
 
@@ -110,6 +118,18 @@ export default async function status(_args: string[]): Promise<number> {
       `\nby wallet:  subscription ${usd(sub)}   agent-sdk ${usd(sdk)}   external $—`
     );
     console.log(`total spend: ${usd(costs.total_usd)}  (subscription + agent-sdk; external billed separately)`);
+    // Fleet-level, not a seat column: the tax is a property of how the fleet waits, and
+    // a per-seat number would invite comparing seats on a heuristic. Silent at zero —
+    // a fleet with nothing to report should not be told about a metric it doesn't have.
+    // "took the write path" is deliberate: this is a heuristic over transcripts, which
+    // record how tokens were billed but never why, so a legitimately new prefix (model
+    // switch, changed tool set, a compaction) counts here too. Not "money you lost".
+    const tax = costs.cache_tax;
+    if (tax && tax.rebuilds > 0) {
+      console.log(
+        `cache tax:   ${tax.rebuilds} rebuild${tax.rebuilds === 1 ? "" : "s"} · ${ktok(tax.rebuild_tokens)} tokens · ${usd(tax.tax_usd)} (idle cache re-encodes; heuristic)`
+      );
+    }
   }
   return 0;
 }

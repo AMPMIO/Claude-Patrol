@@ -23,6 +23,7 @@ import {
   resolveTokenToSession,
   findSessionIdByHeuristic,
   billingSourceFromEntrypoint,
+  classifyCacheRebuild,
 } from "./costs.ts";
 import { randomBytes } from "node:crypto";
 import { SEAT_TOKEN_RE, LEASE_TTL_SECONDS, LEASE_TOKEN_RE } from "../shared/types.ts";
@@ -249,7 +250,15 @@ db.run(`CREATE INDEX IF NOT EXISTS idx_ledger_bucket ON cost_ledger(bucket_ts)`)
 // Additive+default so pre-0.2.4 rows read as "subscription" — the interactive
 // majority — until re-indexed. A session's rows only ever UPGRADE to agent-sdk
 // (never downgrade), so an entrypoint-less line landing first can't mis-bill it.
-for (const col of ["billing_source TEXT NOT NULL DEFAULT 'subscription'"]) {
+// v0.3 cache tax: how much of this bucket's cache_write looked like a re-encode of an
+// ALREADY-established prefix rather than a first-time one (costs.ts classifyCacheRebuild).
+// Additive+default 0 so pre-0.3 rows read as "no rebuilds measured" — which is honest:
+// they were never classified, and a zero here is "unknown", not "clean".
+for (const col of [
+  "billing_source TEXT NOT NULL DEFAULT 'subscription'",
+  "cache_rebuilds INTEGER NOT NULL DEFAULT 0",
+  "cache_rebuild_tokens INTEGER NOT NULL DEFAULT 0",
+]) {
   try {
     db.run(`ALTER TABLE cost_ledger ADD COLUMN ${col}`);
   } catch {
@@ -301,7 +310,14 @@ db.run(`
 // parsed content — so a rewrite-to-empty, or a file whose session_id changed,
 // still drops its prior contribution instead of orphaning stale (double-countable)
 // rows. NULL for rows written before this column existed.
-for (const col of ["anchor_hash TEXT", "session_ids TEXT"]) {
+//
+// max_cache_read: JSON {sessionId: largest cache_read seen so far}. The rebuild
+// classifier needs "has this session already read a substantial prefix back?", and the
+// indexer sees a session's records a few at a time across ticks — so that running max
+// has to survive between ticks. Keyed by session because one file can carry more than
+// one (a leaked max would fake a rebuild in the other session). Cleared on a reset,
+// where the file is reparsed from byte 0 and the max is rebuilt from scratch.
+for (const col of ["anchor_hash TEXT", "session_ids TEXT", "max_cache_read TEXT"]) {
   try {
     db.run(`ALTER TABLE session_index ADD COLUMN ${col}`);
   } catch {
@@ -517,13 +533,15 @@ const insertSeatRun = db.prepare(`
 `);
 const insertDelivery = db.prepare(`INSERT INTO delivery_log (to_id, batch_size, delivered_at) VALUES (?, ?, ?)`);
 const upsertLedger = db.prepare(`
-  INSERT INTO cost_ledger (session_id, attr_session_id, model, bucket_ts, input, output, cache_write, cache_read, billing_source)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO cost_ledger (session_id, attr_session_id, model, bucket_ts, input, output, cache_write, cache_read, billing_source, cache_rebuilds, cache_rebuild_tokens)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   ON CONFLICT(session_id, model, bucket_ts) DO UPDATE SET
     input = input + excluded.input,
     output = output + excluded.output,
     cache_write = cache_write + excluded.cache_write,
     cache_read = cache_read + excluded.cache_read,
+    cache_rebuilds = cache_rebuilds + excluded.cache_rebuilds,
+    cache_rebuild_tokens = cache_rebuild_tokens + excluded.cache_rebuild_tokens,
     attr_session_id = excluded.attr_session_id,
     -- UPGRADE-ONLY: once any record proves a session is agent-sdk it stays so; a
     -- later entrypoint-less line must never downgrade it back to subscription.
@@ -531,8 +549,8 @@ const upsertLedger = db.prepare(`
 `);
 const seenGet = db.prepare(`SELECT 1 FROM seen_msgs WHERE session_id = ? AND msg_id = ?`);
 const seenIns = db.prepare(`INSERT OR IGNORE INTO seen_msgs (session_id, msg_id) VALUES (?, ?)`);
-const idxGet = db.prepare(`SELECT bytes_parsed, mtime_ms, anchor_hash, session_ids FROM session_index WHERE file_path = ?`);
-const idxSet = db.prepare(`INSERT OR REPLACE INTO session_index (file_path, parent_session_id, bytes_parsed, mtime_ms, anchor_hash, session_ids) VALUES (?, ?, ?, ?, ?, ?)`);
+const idxGet = db.prepare(`SELECT bytes_parsed, mtime_ms, anchor_hash, session_ids, max_cache_read FROM session_index WHERE file_path = ?`);
+const idxSet = db.prepare(`INSERT OR REPLACE INTO session_index (file_path, parent_session_id, bytes_parsed, mtime_ms, anchor_hash, session_ids, max_cache_read) VALUES (?, ?, ?, ?, ?, ?, ?)`);
 const selectAllSeats = db.prepare(`SELECT * FROM seats`);
 const selectSeatsByDirectory = db.prepare(`SELECT * FROM seats WHERE cwd = ?`);
 const selectSeatsByGitRoot = db.prepare(`SELECT * FROM seats WHERE git_root = ?`);
@@ -1075,6 +1093,8 @@ interface LedgerTally {
   output: number;
   cache_write: number;
   cache_read: number;
+  cache_rebuilds: number;
+  cache_rebuild_tokens: number;
   billing_source: BillingSource;
 }
 
@@ -1113,16 +1133,19 @@ function readLedgerWindow(body: { since?: string; until?: string }): {
   const ledger = (
     untilBucket !== null
       ? db.query(
-          `SELECT session_id, attr_session_id, model, input, output, cache_write, cache_read, billing_source
+          `SELECT session_id, attr_session_id, model, input, output, cache_write, cache_read, billing_source,
+                  cache_rebuilds, cache_rebuild_tokens
            FROM cost_ledger WHERE bucket_ts >= ? AND bucket_ts <= ?`
         ).all(sinceBucket, untilBucket)
       : db.query(
-          `SELECT session_id, attr_session_id, model, input, output, cache_write, cache_read, billing_source
+          `SELECT session_id, attr_session_id, model, input, output, cache_write, cache_read, billing_source,
+                  cache_rebuilds, cache_rebuild_tokens
            FROM cost_ledger WHERE bucket_ts >= ?`
         ).all(sinceBucket)
   ) as {
     session_id: string; attr_session_id: string; model: string;
     input: number; output: number; cache_write: number; cache_read: number; billing_source: BillingSource | null;
+    cache_rebuilds: number | null; cache_rebuild_tokens: number | null;
   }[];
 
   // collapse hour buckets into one tally per (session, model).
@@ -1131,13 +1154,17 @@ function readLedgerWindow(body: { since?: string; until?: string }): {
     const key = `${r.session_id}\0${r.model}`;
     let t = tally.get(key);
     if (!t) {
-      t = { session_id: r.session_id, attr_session_id: r.attr_session_id, model: r.model, input: 0, output: 0, cache_write: 0, cache_read: 0, billing_source: "subscription" };
+      t = { session_id: r.session_id, attr_session_id: r.attr_session_id, model: r.model, input: 0, output: 0, cache_write: 0, cache_read: 0, cache_rebuilds: 0, cache_rebuild_tokens: 0, billing_source: "subscription" };
       tally.set(key, t);
     }
     t.input += r.input;
     t.output += r.output;
     t.cache_write += r.cache_write;
     t.cache_read += r.cache_read;
+    // NULL on a pre-0.3 row (never classified) reads as 0 — an under-count, not a
+    // fabricated clean bill.
+    t.cache_rebuilds += r.cache_rebuilds ?? 0;
+    t.cache_rebuild_tokens += r.cache_rebuild_tokens ?? 0;
     // Upgrade-only, defensive: any agent-sdk bucket makes the tally agent-sdk (a NULL
     // from a pre-0.2.4 row reads as subscription). Mirrors the ledger's ON CONFLICT.
     if (r.billing_source === "agent-sdk") t.billing_source = "agent-sdk";
@@ -1157,6 +1184,12 @@ function handleCosts(body: CostsRequest): CostsResponse {
   // bill different accounts. Codex "external" spend has NO ledger row (no transcript),
   // so it never appears here; `patrol status` renders it "$—", not a fabricated 0.
   const bySource: Partial<Record<BillingSource, number>> = {};
+  // Fleet-level cache tax. Priced per model at that model's CACHE-WRITE rate (PRICES
+  // index 2) and summed — the rates differ 5x across the table, so an average would be
+  // wrong in both directions depending on the mix.
+  let rebuilds = 0;
+  let rebuildTokens = 0;
+  let taxUsd = 0;
   for (const t of tallies.sort((a, b) => a.session_id.localeCompare(b.session_id))) {
     const cost = costOf(t);
     bySource[t.billing_source] = (bySource[t.billing_source] ?? 0) + cost;
@@ -1170,7 +1203,12 @@ function handleCosts(body: CostsRequest): CostsResponse {
       cache_read: t.cache_read,
       cost_usd: round4(cost),
       billing_source: t.billing_source,
+      cache_rebuilds: t.cache_rebuilds,
+      cache_rebuild_tokens: t.cache_rebuild_tokens,
     });
+    rebuilds += t.cache_rebuilds;
+    rebuildTokens += t.cache_rebuild_tokens;
+    taxUsd += (t.cache_rebuild_tokens * priceFor(t.model)[2]) / 1e6;
   }
   // total_usd = sum of the ROUNDED buckets, so the status pool columns always add
   // up to the displayed total (no independent-rounding sub-cent gap).
@@ -1179,7 +1217,12 @@ function handleCosts(body: CostsRequest): CostsResponse {
     bySource[k] = round4(bySource[k]!);
     roundedTotal += bySource[k]!;
   }
-  return { rows, total_usd: round4(roundedTotal), by_source: bySource };
+  return {
+    rows,
+    total_usd: round4(roundedTotal),
+    by_source: bySource,
+    cache_tax: { rebuilds, rebuild_tokens: rebuildTokens, tax_usd: round4(taxUsd) },
+  };
 }
 
 // The v0.2 evidence layer. Same window + same priced tallies as /costs, but
@@ -1784,6 +1827,23 @@ function parseSessionIds(raw: string | null): string[] {
   }
 }
 
+// Same defensive shape for the per-session running cache_read max. A legacy NULL or a
+// malformed value degrades to "no prefix established yet", which can only UNDER-count
+// rebuilds — the safe direction for a number we publish.
+function parseMaxCacheRead(raw: string | null): Map<string, number> {
+  const m = new Map<string, number>();
+  if (!raw) return m;
+  try {
+    const o = JSON.parse(raw);
+    if (o && typeof o === "object" && !Array.isArray(o)) {
+      for (const [k, v] of Object.entries(o)) if (typeof v === "number" && Number.isFinite(v)) m.set(k, v);
+    }
+  } catch {
+    // malformed -> empty
+  }
+  return m;
+}
+
 // Index one file: skip if (size,mtime) unchanged; resume from the saved cursor;
 // full reparse when the file shrank (size < cursor) OR was rewritten in place
 // (changed without shrinking AND the anchor bytes no longer match). A plain
@@ -1798,7 +1858,7 @@ function indexFile(file: string, parentSessionId: string | null) {
   }
   const size = st.size;
   const mtime = Math.floor(st.mtimeMs);
-  const prev = idxGet.get(file) as { bytes_parsed: number; mtime_ms: number; anchor_hash: string | null; session_ids: string | null } | null;
+  const prev = idxGet.get(file) as { bytes_parsed: number; mtime_ms: number; anchor_hash: string | null; session_ids: string | null; max_cache_read: string | null } | null;
   let fromByte = prev?.bytes_parsed ?? 0;
   let reset = false;
   // A row written before the session_ids column existed (additive migration) has
@@ -1866,7 +1926,10 @@ function indexFile(file: string, parentSessionId: string | null) {
       if (billingSourceFromEntrypoint(r.entrypoint) === "agent-sdk") sessionSrc.set(r.sessionId, "agent-sdk");
     }
     // aggregate this batch's deltas, deduping resume-rewrites via seen_msgs
-    const agg = new Map<string, { sid: string; attr: string; model: string; bucket: number; i: number; o: number; cw: number; cr: number }>();
+    const agg = new Map<string, { sid: string; attr: string; model: string; bucket: number; i: number; o: number; cw: number; cr: number; rb: number; rbt: number }>();
+    // Carried across ticks so a session's prefix history isn't forgotten between them; a
+    // reset starts clean because the file is being reparsed from byte 0.
+    const maxCacheRead = reset ? new Map<string, number>() : parseMaxCacheRead(prev?.max_cache_read ?? null);
     for (const r of records) {
       if (r.msgId) {
         if (seenGet.get(r.sessionId, r.msgId)) continue; // already counted
@@ -1877,16 +1940,24 @@ function indexFile(file: string, parentSessionId: string | null) {
       const key = `${r.sessionId}\0${r.model}\0${bucket}`;
       let a = agg.get(key);
       if (!a) {
-        a = { sid: r.sessionId, attr, model: r.model, bucket, i: 0, o: 0, cw: 0, cr: 0 };
+        a = { sid: r.sessionId, attr, model: r.model, bucket, i: 0, o: 0, cw: 0, cr: 0, rb: 0, rbt: 0 };
         agg.set(key, a);
       }
       a.i += r.input;
       a.o += r.output;
       a.cw += r.cache_write;
       a.cr += r.cache_read;
+      // Records arrive in file order, which is session order — the classifier depends on
+      // that, so this must stay inside the same in-order walk as the token tallies.
+      const cls = classifyCacheRebuild(r.cache_write, r.cache_read, maxCacheRead.get(r.sessionId) ?? 0);
+      maxCacheRead.set(r.sessionId, cls.maxCacheRead);
+      if (cls.rebuild) {
+        a.rb += 1;
+        a.rbt += r.cache_write;
+      }
     }
-    for (const a of agg.values()) upsertLedger.run(a.sid, a.attr, a.model, a.bucket, a.i, a.o, a.cw, a.cr, sessionSrc.get(a.sid) ?? "subscription");
-    idxSet.run(file, parentSessionId, bytesParsed, mtime, anchor, JSON.stringify([...storedIds]));
+    for (const a of agg.values()) upsertLedger.run(a.sid, a.attr, a.model, a.bucket, a.i, a.o, a.cw, a.cr, sessionSrc.get(a.sid) ?? "subscription", a.rb, a.rbt);
+    idxSet.run(file, parentSessionId, bytesParsed, mtime, anchor, JSON.stringify([...storedIds]), JSON.stringify(Object.fromEntries(maxCacheRead)));
   })();
 }
 
