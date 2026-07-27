@@ -73,6 +73,17 @@ Same dual shape cc-fleet proved. Marketplace distributes the plugin;
 tool has it; messaging and roles are table-stakes — agmsg has roles and
 971★). Coalescing near-unique. Ship 1–3 before any polish.
 
+> **CORRECTION, 2026-07-27.** The parenthetical above is false and was false
+> when written — the r1/r2 sweeps missed the tools that have it. `coder/mux`,
+> `agent-deck`, `claude-flow` and Claude Swarm all track cost; `overstory`
+> (now archived) tracked it per-agent *with* subagent rollup, the same shape
+> as ours. The differentiator survives only in its narrow form: cost bound to
+> a **named standing seat**, with subagent rollup and the three-wallet split.
+> Left in place rather than edited away, because a design record that quietly
+> deletes its wrong calls is worth nothing. See
+> `research/r4-competitive-landscape-2026-07.md` (REVISION) and
+> [README → Where Patrol sits](README.md#where-patrol-sits).
+
 NOT in v0.1: cross-machine transport, Warp backend (second-tier, needs
 generated launch YAML — v0.2 candidate), GUI board, voice, bundling
 rtk/caveman/ponytail (they stay OPTIONAL documented recipes — all public
